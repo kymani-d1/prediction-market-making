@@ -1,0 +1,9 @@
+{
+  "trade_id": "f0f2397a-ephemeral-fixture",
+  "ticker": "KXBTC-26AUG11-T100000",
+  "yes_price_dollars": "0.4200",
+  "yes_price": 41,
+  "count_fp": "12.500",
+  "taker_outcome_side": "yes",
+  "ts_ms": 1786456801230
+}

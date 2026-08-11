@@ -1,0 +1,8 @@
+{
+  "event_type": "future_message_type",
+  "market": "0xunknown",
+  "asset_id": "unknown-token",
+  "timestamp": "1757908892451",
+  "payload_version": 99,
+  "future_field": {"must_be_preserved": true}
+}

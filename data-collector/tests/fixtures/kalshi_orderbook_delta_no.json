@@ -1,0 +1,11 @@
+{
+  "type": "orderbook_delta",
+  "seq": 42,
+  "msg": {
+    "market_ticker": "KXBTC-26AUG11-T100000",
+    "side": "no",
+    "price_dollars": "0.45",
+    "delta_fp": "-1.500",
+    "ts_ms": 1786456801240
+  }
+}

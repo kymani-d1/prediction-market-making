@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.pytest-tmp/
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+*.egg-info/

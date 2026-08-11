@@ -1,0 +1,2 @@
+"""Kalshi public-data integration."""
+

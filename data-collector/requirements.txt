@@ -1,0 +1,7 @@
+cryptography>=45,<47
+httpx>=0.28,<1
+psycopg[binary,pool]>=3.2.6,<4
+python-dotenv>=1.1,<2
+websockets>=15,<17
+pytest>=8.4,<10
+pytest-asyncio>=1.0,<2
