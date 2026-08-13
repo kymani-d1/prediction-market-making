@@ -6,6 +6,7 @@ import logging
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,30 @@ LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from prediction_collector.writer import WriteItem
+
+
+@dataclass(slots=True)
+class MetadataSyncDiagnostics:
+    stale_lifecycle_states_preserved: int = 0
+    unresolved_multivariate_leg_markets: int = 0
+    unresolved_multivariate_leg_outcomes: int = 0
+
+    def as_log_fields(self) -> dict[str, int]:
+        return {
+            "stale_lifecycle_states_preserved": (
+                self.stale_lifecycle_states_preserved
+            ),
+            "unresolved_multivariate_legs": (
+                self.unresolved_multivariate_leg_markets
+                + self.unresolved_multivariate_leg_outcomes
+            ),
+            "unresolved_multivariate_leg_markets": (
+                self.unresolved_multivariate_leg_markets
+            ),
+            "unresolved_multivariate_leg_outcomes": (
+                self.unresolved_multivariate_leg_outcomes
+            ),
+        }
 
 
 def _json(value: Any) -> Jsonb:
@@ -182,6 +207,29 @@ def _preserve_newer_market_state(
         ]
     merged["raw_data"] = incoming_raw
     return merged, True
+
+
+def _debug_preserved_newer_market_state(
+    *,
+    value: Mapping[str, Any],
+    current: Mapping[str, Any],
+    incoming_timestamp: datetime | None,
+    diagnostics: MetadataSyncDiagnostics | None,
+) -> None:
+    if diagnostics is not None:
+        diagnostics.stale_lifecycle_states_preserved += 1
+    LOGGER.debug(
+        "Preserved newer market lifecycle state over stale metadata",
+        extra={
+            "exchange": value["exchange"],
+            "market": value["external_id"],
+            "incoming_timestamp": incoming_timestamp,
+            "current_timestamp": (
+                current["metadata_source_timestamp"]
+                or current["metadata_exchange_timestamp"]
+            ),
+        },
+    )
 
 
 def _fee_configuration_digest(
@@ -531,7 +579,12 @@ class Database:
         await self.metrics.rows("market_groups")
         return int(row["id"])
 
-    async def upsert_market(self, value: Mapping[str, Any]) -> int:
+    async def upsert_market(
+        self,
+        value: Mapping[str, Any],
+        *,
+        diagnostics: MetadataSyncDiagnostics | None = None,
+    ) -> int:
         value = dict(value)
         value.setdefault("observed_at", utc_now())
         history_rows = 0
@@ -567,17 +620,11 @@ class Database:
                     incoming_timestamp = _market_metadata_upstream_timestamp(value)
                     value, stale_state = _preserve_newer_market_state(value, existing)
                     if stale_state:
-                        LOGGER.info(
-                            "Preserved newer market lifecycle state over stale metadata",
-                            extra={
-                                "exchange": value["exchange"],
-                                "market": value["external_id"],
-                                "incoming_timestamp": incoming_timestamp,
-                                "current_timestamp": (
-                                    existing["metadata_source_timestamp"]
-                                    or existing["metadata_exchange_timestamp"]
-                                ),
-                            },
+                        _debug_preserved_newer_market_state(
+                            value=value,
+                            current=existing,
+                            incoming_timestamp=incoming_timestamp,
+                            diagnostics=diagnostics,
                         )
                 raw_value = value.get("raw_data")
                 raw = dict(raw_value) if isinstance(raw_value, Mapping) else {}
@@ -679,6 +726,7 @@ class Database:
                     market_id=market_id,
                     value=value,
                     observed_at=utc_now(),
+                    diagnostics=diagnostics,
                 )
         await self.metrics.rows("markets")
         if history_rows:
@@ -1048,6 +1096,7 @@ class Database:
         market_id: int,
         value: Mapping[str, Any],
         observed_at: datetime,
+        diagnostics: MetadataSyncDiagnostics | None = None,
     ) -> None:
         raw = value.get("raw_data") if isinstance(value.get("raw_data"), dict) else {}
         exchange = str(value["exchange"])
@@ -1335,6 +1384,7 @@ class Database:
                         exchange=exchange,
                         observed_at=observed_at,
                         raw=raw,
+                        diagnostics=diagnostics,
                     )
 
     async def _record_multivariate_legs(
@@ -1347,6 +1397,7 @@ class Database:
         exchange: str,
         observed_at: datetime,
         raw: Mapping[str, Any],
+        diagnostics: MetadataSyncDiagnostics | None = None,
     ) -> None:
         legs = raw.get("mve_selected_legs")
         if not isinstance(legs, list):
@@ -1388,7 +1439,9 @@ class Database:
             ).fetchone()
             if target is None:
                 complete = False
-                LOGGER.warning(
+                if diagnostics is not None:
+                    diagnostics.unresolved_multivariate_leg_markets += 1
+                LOGGER.debug(
                     "Kalshi multivariate leg market is not available yet",
                     extra={
                         "market": market_external_id,
@@ -1412,7 +1465,9 @@ class Database:
             )
             if outcome_external_id and target_outcome_id is None:
                 complete = False
-                LOGGER.warning(
+                if diagnostics is not None:
+                    diagnostics.unresolved_multivariate_leg_outcomes += 1
+                LOGGER.debug(
                     "Kalshi multivariate leg outcome is not available yet",
                     extra={
                         "market": market_external_id,

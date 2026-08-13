@@ -16,7 +16,7 @@ from prediction_collector.common.utils import (
     request_parameters,
     utc_now,
 )
-from prediction_collector.database import Database
+from prediction_collector.database import Database, MetadataSyncDiagnostics
 from prediction_collector.polymarket.parser import (
     normalise_event,
     normalise_market,
@@ -48,6 +48,7 @@ class PolymarketService:
 
     async def sync_metadata(self, *, include_closed: bool = True) -> dict[str, int]:
         counts = {"series": 0, "events": 0, "markets": 0, "outcomes": 0, "tags": 0}
+        diagnostics = MetadataSyncDiagnostics()
         try:
             async for items, result in self.rest.iter_series():
                 await self._raw_page("gamma", "/series", "series", items, result)
@@ -105,7 +106,9 @@ class PolymarketService:
                     market["observed_at"] = (
                         getattr(result, "requested_at", None) or utc_now()
                     )
-                    market_id = await self.database.upsert_market(market)
+                    market_id = await self.database.upsert_market(
+                        market, diagnostics=diagnostics
+                    )
                     counts["markets"] += 1
                     for outcome in outcomes:
                         await self.database.upsert_outcome(market_id, outcome)
@@ -118,13 +121,17 @@ class PolymarketService:
                     timestamp=utc_now(),
                     metadata={"records": counts["markets"]},
                 )
-        LOGGER.info("Polymarket metadata sync complete", extra=counts)
+        LOGGER.info(
+            "Polymarket metadata sync complete",
+            extra={**counts, **diagnostics.as_log_fields()},
+        )
         return counts
 
     async def discover_live(
         self, *, reconcile_absent: bool = True
     ) -> list[MarketCandidate]:
         candidates: list[MarketCandidate] = []
+        diagnostics = MetadataSyncDiagnostics()
         async for items, result, cursor in self.rest.iter_markets(closed=False):
             await self._raw_page(
                 "gamma", "/markets/keyset", "markets", items, result, external_key=cursor
@@ -138,19 +145,34 @@ class PolymarketService:
                 market["observed_at"] = (
                     getattr(result, "requested_at", None) or utc_now()
                 )
-                market_id = await self.database.upsert_market(market)
+                market_id = await self.database.upsert_market(
+                    market, diagnostics=diagnostics
+                )
                 for outcome in outcomes:
                     await self.database.upsert_outcome(market_id, outcome)
         if not candidates:
             raise RuntimeError("Polymarket complete open-market discovery returned zero markets")
         if reconcile_absent:
-            await self.reconcile_absent_live(candidates)
+            await self.reconcile_absent_live(
+                candidates,
+                diagnostics=diagnostics,
+                emit_summary=False,
+            )
+        LOGGER.info(
+            "Polymarket live metadata sync complete",
+            extra={"markets": len(candidates), **diagnostics.as_log_fields()},
+        )
         return candidates
 
     async def reconcile_absent_live(
-        self, candidates: list[MarketCandidate]
+        self,
+        candidates: list[MarketCandidate],
+        *,
+        diagnostics: MetadataSyncDiagnostics | None = None,
+        emit_summary: bool = True,
     ) -> None:
         """Enrich markets absent from a complete open pass without blocking sockets."""
+        diagnostics = diagnostics or MetadataSyncDiagnostics()
         absent = await self.database.absent_active_markets(
             exchange="polymarket",
             discovered_external_ids=(candidate.external_id for candidate in candidates),
@@ -179,7 +201,9 @@ class PolymarketService:
                 market["observed_at"] = (
                     getattr(result, "requested_at", None) or utc_now()
                 )
-                market_id = await self.database.upsert_market(market)
+                market_id = await self.database.upsert_market(
+                    market, diagnostics=diagnostics
+                )
                 for outcome in outcomes:
                     await self.database.upsert_outcome(market_id, outcome)
                 new_status = str(market.get("status") or "unknown")
@@ -246,6 +270,14 @@ class PolymarketService:
                         "raw_data": payload,
                     },
                 )
+            )
+        if emit_summary:
+            LOGGER.info(
+                "Polymarket market-state metadata reconciliation complete",
+                extra={
+                    "markets_reconciled": len(absent),
+                    **diagnostics.as_log_fields(),
+                },
             )
 
     async def backfill_trades(self) -> dict[str, int]:

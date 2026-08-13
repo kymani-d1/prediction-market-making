@@ -86,7 +86,7 @@ class PolymarketRestClient:
                     f"Polymarket {entity} full keyset page omitted next_cursor"
                 )
             page_number += 1
-            LOGGER.info(
+            LOGGER.debug(
                 "Fetched Polymarket page",
                 extra={"entity": entity, "page": page_number, "records": len(items)},
             )

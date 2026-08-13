@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -123,10 +124,16 @@ class FakeDatabase:
         self.events.append(value)
         return len(self.events)
 
-    async def upsert_market(self, value: dict[str, Any]) -> int:
+    async def upsert_market(
+        self, value: dict[str, Any], *, diagnostics: Any = None
+    ) -> int:
         self.market_external_ids.append(value["external_id"])
         if value["external_id"] == "MVE-COMBO":
             assert value["event_external_id"] == "MVE-EVENT"
+            assert diagnostics is not None
+            diagnostics.stale_lifecycle_states_preserved += 1
+            diagnostics.unresolved_multivariate_leg_markets += 2
+            diagnostics.unresolved_multivariate_leg_outcomes += 1
         return len(self.market_external_ids)
 
     async def upsert_outcome(self, market_id: int, value: dict[str, Any]) -> int:
@@ -150,7 +157,10 @@ NOW = datetime(2026, 8, 11, 14, 0, tzinfo=UTC)
 
 
 @pytest.mark.asyncio
-async def test_metadata_sync_upserts_multivariate_events_markets_and_collections() -> None:
+async def test_metadata_sync_upserts_multivariate_events_markets_and_collections(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="prediction_collector.kalshi.service")
     rest = FakeRest()
     database = FakeDatabase()
     service = KalshiService(
@@ -182,3 +192,14 @@ async def test_metadata_sync_upserts_multivariate_events_markets_and_collections
         "multivariate_events",
         "multivariate_event_collections",
     ]
+    summaries = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Kalshi metadata sync complete"
+    ]
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary.stale_lifecycle_states_preserved == 1
+    assert summary.unresolved_multivariate_legs == 3
+    assert summary.unresolved_multivariate_leg_markets == 2
+    assert summary.unresolved_multivariate_leg_outcomes == 1

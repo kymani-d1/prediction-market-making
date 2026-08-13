@@ -57,7 +57,7 @@ class KalshiRestClient:
             items = extract_items(payload, key, *alternate_keys)
             next_cursor = payload.get("cursor") or payload.get("next_cursor")
             page_number += 1
-            LOGGER.info(
+            LOGGER.debug(
                 "Fetched Kalshi page",
                 extra={"entity": key, "page": page_number, "records": len(items)},
             )

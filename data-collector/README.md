@@ -560,6 +560,18 @@ The default interval is 60 seconds. Change `METRICS_LOG_INTERVAL_SECONDS` only i
 the observation window needs to differ. Measure these values before introducing
 a cap; setting an arbitrary cap first defeats the point of the instrumentation.
 
+Normal full-market metadata collection keeps INFO logging bounded by syncs, not
+by records or REST pages. Each completed metadata sync emits one INFO summary
+with `stale_lifecycle_states_preserved`, `unresolved_multivariate_legs`,
+`unresolved_multivariate_leg_markets`, and
+`unresolved_multivariate_leg_outcomes`. The corresponding per-market and
+per-leg diagnostics, as well as pagination progress, are DEBUG-only. WebSocket
+connects/disconnects, exchange-confirmed subscriptions, sequence gaps, errors,
+and periodic throughput metrics remain visible at INFO or WARN as appropriate.
+This prevents ordinary comprehensive discovery from producing log volume that
+grows linearly with the number of markets or multivariate legs; genuine faults
+remain intentionally visible and can still produce incident-time bursts.
+
 Useful PostgreSQL queries:
 
 ```sql

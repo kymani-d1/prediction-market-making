@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
-from prediction_collector.database import Database, _write_query
+from prediction_collector.database import (
+    Database,
+    MetadataSyncDiagnostics,
+    _debug_preserved_newer_market_state,
+    _write_query,
+)
 
 
 class FakeCursor:
@@ -46,6 +52,8 @@ class FakeConnection:
                 return FakeCursor({"market_id": 11, "outcome_id": 111})
             if leg_ticker == "LEG-C":
                 return FakeCursor({"market_id": 33, "outcome_id": 333})
+            if leg_ticker == "LEG-NO-OUTCOME":
+                return FakeCursor({"market_id": 55, "outcome_id": None})
             return FakeCursor(None)
         if compact_sql.startswith("SELECT id, market_id, outcome_id, valid_from"):
             return FakeCursor(rows=self.existing_members)
@@ -182,3 +190,78 @@ def test_reference_and_sports_writes_resolve_normalized_parent_rows() -> None:
     assert "reference_instrument_id" in reference_sql
     assert "INSERT INTO sports_events" in sports_sql
     assert "sports_event_id" in sports_sql
+
+
+@pytest.mark.asyncio
+async def test_unresolved_multivariate_legs_are_debug_and_aggregated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(
+        logging.DEBUG,
+        logger="prediction_collector.database",
+    )
+    database = Database.__new__(Database)
+    diagnostics = MetadataSyncDiagnostics()
+
+    await database._record_multivariate_legs(
+        FakeConnection(),
+        group_id=7,
+        market_id=22,
+        market_external_id="MVE-COMBO",
+        exchange="kalshi",
+        observed_at=datetime(2026, 8, 11, 15, 0, tzinfo=UTC),
+        raw={
+            "mve_collection_ticker": "COLLECTION-A",
+            "mve_selected_legs": [
+                {"market_ticker": "NOT-SYNCED-YET", "side": "yes"},
+                {"market_ticker": "LEG-NO-OUTCOME", "side": "yes"},
+            ],
+        },
+        diagnostics=diagnostics,
+    )
+
+    assert diagnostics.as_log_fields() == {
+        "stale_lifecycle_states_preserved": 0,
+        "unresolved_multivariate_legs": 2,
+        "unresolved_multivariate_leg_markets": 1,
+        "unresolved_multivariate_leg_outcomes": 1,
+    }
+    noisy_records = [
+        record
+        for record in caplog.records
+        if "is not available yet" in record.getMessage()
+    ]
+    assert len(noisy_records) == 2
+    assert all(record.levelno == logging.DEBUG for record in noisy_records)
+
+
+def test_stale_lifecycle_preservation_is_debug_and_aggregated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(
+        logging.DEBUG,
+        logger="prediction_collector.database",
+    )
+    diagnostics = MetadataSyncDiagnostics()
+
+    _debug_preserved_newer_market_state(
+        value={"exchange": "kalshi", "external_id": "MARKET-A"},
+        current={
+            "metadata_source_timestamp": None,
+            "metadata_exchange_timestamp": datetime(
+                2026, 8, 11, 15, 0, tzinfo=UTC
+            ),
+        },
+        incoming_timestamp=datetime(2026, 8, 11, 14, 59, tzinfo=UTC),
+        diagnostics=diagnostics,
+    )
+
+    matching = [
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "Preserved newer market lifecycle state over stale metadata"
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.DEBUG
+    assert diagnostics.stale_lifecycle_states_preserved == 1

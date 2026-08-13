@@ -16,7 +16,7 @@ from prediction_collector.common.utils import (
     request_parameters,
     utc_now,
 )
-from prediction_collector.database import Database
+from prediction_collector.database import Database, MetadataSyncDiagnostics
 from prediction_collector.kalshi.parser import (
     normalise_event,
     normalise_market,
@@ -57,6 +57,7 @@ class KalshiService:
             "outcomes": 0,
             "market_groups": 0,
         }
+        diagnostics = MetadataSyncDiagnostics()
         async for items, result, cursor in self.rest.iter_series():
             await self._raw("/series", "series", items, result, cursor)
             for raw in items:
@@ -98,7 +99,9 @@ class KalshiService:
                     market["observed_at"] = (
                         getattr(result, "requested_at", None) or utc_now()
                     )
-                    market_id = await self.database.upsert_market(market)
+                    market_id = await self.database.upsert_market(
+                        market, diagnostics=diagnostics
+                    )
                     counts["markets"] += 1
                     for outcome in outcomes:
                         await self.database.upsert_outcome(market_id, outcome)
@@ -144,7 +147,9 @@ class KalshiService:
                     market["observed_at"] = (
                         getattr(result, "requested_at", None) or utc_now()
                     )
-                    market_id = await self.database.upsert_market(market)
+                    market_id = await self.database.upsert_market(
+                        market, diagnostics=diagnostics
+                    )
                     counts["markets"] += 1
                     for outcome in outcomes:
                         await self.database.upsert_outcome(market_id, outcome)
@@ -184,7 +189,10 @@ class KalshiService:
                 timestamp=utc_now(),
                 metadata={"records": counts["market_groups"]},
             )
-        LOGGER.info("Kalshi metadata sync complete", extra=counts)
+        LOGGER.info(
+            "Kalshi metadata sync complete",
+            extra={**counts, **diagnostics.as_log_fields()},
+        )
         return counts
 
     async def sync_fees_and_incentives(self) -> dict[str, int]:
@@ -303,6 +311,7 @@ class KalshiService:
         self, *, reconcile_absent: bool = True
     ) -> list[MarketCandidate]:
         candidates: list[MarketCandidate] = []
+        diagnostics = MetadataSyncDiagnostics()
         async for items, result, cursor in self.rest.iter_markets(status="open"):
             await self._raw("/markets", "markets", items, result, cursor)
             for raw in items:
@@ -313,19 +322,34 @@ class KalshiService:
                 market["observed_at"] = (
                     getattr(result, "requested_at", None) or utc_now()
                 )
-                market_id = await self.database.upsert_market(market)
+                market_id = await self.database.upsert_market(
+                    market, diagnostics=diagnostics
+                )
                 for outcome in outcomes:
                     await self.database.upsert_outcome(market_id, outcome)
         if not candidates:
             raise RuntimeError("Kalshi complete open-market discovery returned zero markets")
         if reconcile_absent:
-            await self.reconcile_absent_live(candidates)
+            await self.reconcile_absent_live(
+                candidates,
+                diagnostics=diagnostics,
+                emit_summary=False,
+            )
+        LOGGER.info(
+            "Kalshi live metadata sync complete",
+            extra={"markets": len(candidates), **diagnostics.as_log_fields()},
+        )
         return candidates
 
     async def reconcile_absent_live(
-        self, candidates: list[MarketCandidate]
+        self,
+        candidates: list[MarketCandidate],
+        *,
+        diagnostics: MetadataSyncDiagnostics | None = None,
+        emit_summary: bool = True,
     ) -> None:
         """Enrich markets absent from a complete open pass without blocking sockets."""
+        diagnostics = diagnostics or MetadataSyncDiagnostics()
         absent = await self.database.absent_active_markets(
             exchange="kalshi",
             discovered_external_ids=(candidate.external_id for candidate in candidates),
@@ -359,7 +383,9 @@ class KalshiService:
                 market["observed_at"] = (
                     getattr(result, "requested_at", None) or utc_now()
                 )
-                market_id = await self.database.upsert_market(market)
+                market_id = await self.database.upsert_market(
+                    market, diagnostics=diagnostics
+                )
                 for outcome in outcomes:
                     await self.database.upsert_outcome(market_id, outcome)
                 new_status = str(market.get("status") or "unknown")
@@ -429,6 +455,14 @@ class KalshiService:
                         "raw_data": payload,
                     },
                 )
+            )
+        if emit_summary:
+            LOGGER.info(
+                "Kalshi market-state metadata reconciliation complete",
+                extra={
+                    "markets_reconciled": len(absent),
+                    **diagnostics.as_log_fields(),
+                },
             )
 
     async def backfill_trades(self) -> int:
