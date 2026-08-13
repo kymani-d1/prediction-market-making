@@ -186,13 +186,20 @@ icacls C:\Users\your-user\.secrets\kalshi-collector.pem /inheritance:r
 icacls C:\Users\your-user\.secrets\kalshi-collector.pem /grant:r "$($env:USERNAME):(R)"
 ```
 
-Then validate public APIs, migrate, backfill, and start live collection:
+Then validate public APIs, migrate, and start live collection immediately:
 
 ```powershell
 & .\.venv\Scripts\python.exe -m prediction_collector smoke --exchange all
 & .\.venv\Scripts\python.exe -m prediction_collector migrate
-& .\.venv\Scripts\python.exe -m prediction_collector backfill --exchange all
 & .\.venv\Scripts\python.exe -m prediction_collector run --exchange all
+```
+
+Run the historical backfill in another terminal after the permanent live
+collector is connected. REST history can be recovered later; missed WebSocket
+microstructure generally cannot:
+
+```powershell
+& .\.venv\Scripts\python.exe -m prediction_collector backfill --exchange all
 ```
 
 Use another terminal for status:
@@ -200,6 +207,14 @@ Use another terminal for status:
 ```powershell
 & .\.venv\Scripts\python.exe -m prediction_collector status
 ```
+
+`status` exits non-zero when migrations are pending/inconsistent or when an
+enabled live exchange is degraded. Its `live.<exchange>` object reports
+`discovery_state`, active connections, selected markets, exchange-confirmed
+memberships, latest WebSocket receipt time, and open discovery gaps. A populated
+catalog with zero live connections/messages is therefore not reported healthy.
+The command performs only reads; it never creates the migration table or
+applies schema changes.
 
 Stop live collection with `Ctrl+C`; shutdown drains queued database writes.
 
@@ -232,13 +247,14 @@ Run the collector:
 ```bash
 .venv/bin/python -m prediction_collector smoke --exchange all
 .venv/bin/python -m prediction_collector migrate
-.venv/bin/python -m prediction_collector backfill --exchange all
 .venv/bin/python -m prediction_collector run --exchange all
 ```
 
-In another terminal:
+In another terminal, start the recoverable historical work only after the live
+collector is running, and inspect status independently:
 
 ```bash
+.venv/bin/python -m prediction_collector backfill --exchange all
 .venv/bin/python -m prediction_collector status
 ```
 
@@ -294,8 +310,9 @@ docker compose logs -f collector
 
 The database health check must pass and the migration service must complete
 successfully before the collector starts. The collector health check runs the
-database `status` command. That command also verifies migration checksums and
-applies a pending migration if one exists.
+database `status` command. `status` is strictly read-only: it verifies migration
+checksums and reports pending migrations but never applies them. Use the
+one-shot `migrate` service or normal collector startup to change schema state.
 
 ### Public-only fallback
 
@@ -458,10 +475,41 @@ application settings.
 All connections reconnect with bounded exponential backoff and retain their
 attempt/reason history.
 
-A complete open-market discovery returns the desired subscription set before
-performing potentially large stale-row cleanup. Exact status enrichment for
-markets absent from the open response runs asynchronously, so a restored
-database with many stale active rows cannot delay current live subscriptions.
+### Failure-tolerant bootstrap and discovery
+
+Live startup has no all-exchanges REST barrier. The writer, Polymarket RTDS,
+Polymarket sports, Kalshi lifecycle/reference feeds, metrics, and other
+discovery-independent supervisors start immediately. Polymarket and Kalshi each
+have an independent market-discovery loop. A slow or failed Kalshi crawl cannot
+delay Polymarket subscriptions, and vice versa.
+
+Each failed discovery attempt logs the concrete exception and retry delay,
+opens one `rest:market_discovery` data gap for the outage, and retries forever
+with jittered exponential backoff capped at 60 seconds. A successful complete
+crawl resets the backoff, resolves that gap, persists the complete coverage
+decision, and schedules stale-market reconciliation. No Railway redeploy is
+required after a transient Gamma or Kalshi REST outage.
+
+Polymarket live discovery follows the documented active-event relation:
+`/events/keyset?closed=false`, whose events include nested markets. Returned
+events and markets are filtered by their authoritative `active`/`closed`
+fields. This avoids traversing the much larger direct market relation before
+subscribing. Cursor repetition, missing cursors on full pages, malformed
+wrappers, and HTTP exhaustion fail visibly; isolated malformed nested objects
+are retained in raw REST evidence and aggregated into a schema-quality gap.
+
+When `MAX_LIVE_MARKETS=0`, no minimum thresholds are active, and there are no
+allow/block lists, each completed REST page is merged into the desired universe
+and its eligible markets are added to stable WebSocket shards immediately.
+Complete pagination continues in the background and still converges on every
+eligible market. Configurations requiring global ranking wait for the complete
+exchange crawl before applying the cap. Kalshi discovers ordinary open markets
+first, then its multivariate event relation, so the large MVE universe does not
+block ordinary market capture while eventual unrestricted coverage is retained.
+
+Exact status enrichment for markets absent from a complete open response runs
+asynchronously, so a restored database with many stale active rows cannot delay
+current live subscriptions.
 
 ### Live economics refresh
 
@@ -650,6 +698,21 @@ Run historical ingestion as a separate one-shot Railway service from the same
 root/image with start command `backfill --exchange all`, then disable or remove
 that service after it exits successfully. Do not configure it with an always-on
 restart policy.
+
+From a linked Railway project, deploy and verify the permanent worker with:
+
+```bash
+railway up ./data-collector --service <live-service> --environment production
+railway logs --service <live-service> --environment production --since 15m
+railway ssh --service <live-service> --environment production -- \
+  python -m prediction_collector status
+```
+
+`railway up` streams the deployment by default and returns a nonzero exit code
+if the deployment fails. Use `--detach` only when another process will poll the
+deployment status. The SSH status command is read-only and should report each
+enabled exchange as ready only after complete discovery and confirmed live
+subscriptions.
 
 Current Railway references:
 

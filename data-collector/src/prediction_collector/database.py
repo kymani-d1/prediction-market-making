@@ -24,7 +24,7 @@ from prediction_collector.common.utils import (
 )
 from prediction_collector.config import Settings
 from prediction_collector.logging_config import ThroughputMetrics
-from prediction_collector.migrations import migrate_database
+from prediction_collector.migrations import migrate_database, verify_database_migrations
 
 
 LOGGER = logging.getLogger(__name__)
@@ -378,6 +378,9 @@ class Database:
 
     async def migrate(self) -> list[str]:
         return await migrate_database(self.settings.database_dsn)
+
+    async def verify_migrations(self) -> dict[str, object]:
+        return await verify_database_migrations(self.settings.database_dsn)
 
     async def ping(self) -> bool:
         try:
@@ -2777,7 +2780,9 @@ class Database:
         cursor = await connection.execute(query, params)
         return max(cursor.rowcount, 0)
 
-    async def status(self) -> dict[str, Any]:
+    async def status(
+        self, *, migration_status: Mapping[str, object] | None = None
+    ) -> dict[str, Any]:
         tables = [
             "series",
             "events",
@@ -2792,7 +2797,11 @@ class Database:
             "data_gaps",
             "collector_write_failures",
         ]
-        result: dict[str, Any] = {"database_connected": await self.ping(), "counts": {}}
+        result: dict[str, Any] = {
+            "database_connected": await self.ping(),
+            "migrations": dict(migration_status or {}),
+            "counts": {},
+        }
         async with self.pool.connection() as connection:
             for table in tables:
                 row = await (await connection.execute(f"SELECT count(*) AS count FROM {table}")).fetchone()
@@ -2818,6 +2827,107 @@ class Database:
                 )
             ).fetchall()
             result["checkpoints"] = [dict(row) for row in checkpoints]
+            live_run = await (
+                await connection.execute(
+                    """
+                    SELECT id, started_at, metadata
+                    FROM collector_runs
+                    WHERE job_type = 'live' AND status = 'running'
+                    ORDER BY started_at DESC LIMIT 1
+                    """
+                )
+            ).fetchone()
+            live: dict[str, Any] = {}
+            if live_run:
+                metadata = dict(live_run.get("metadata") or {})
+                for exchange in ("polymarket", "kalshi"):
+                    enabled = bool(metadata.get(f"{exchange}_enabled"))
+                    if not enabled:
+                        continue
+                    row = await (
+                        await connection.execute(
+                            """
+                            WITH latest_decision AS (
+                                SELECT max(evaluated_at) AS evaluated_at
+                                FROM live_market_subscription_decisions
+                                WHERE collector_run_id = %s AND exchange = %s
+                            )
+                            SELECT
+                                (SELECT count(*) FROM collector_connections
+                                 WHERE collector_run_id = %s AND exchange = %s
+                                   AND status = 'connected' AND disconnected_at IS NULL)
+                                    AS connections_active,
+                                (SELECT count(DISTINCT ccm.market_external_id)
+                                 FROM collector_connections cc
+                                 JOIN collector_connection_markets ccm
+                                   ON ccm.connection_id = cc.id
+                                 WHERE cc.collector_run_id = %s AND cc.exchange = %s
+                                   AND cc.status = 'connected'
+                                   AND cc.disconnected_at IS NULL
+                                   AND ccm.unsubscribed_at IS NULL)
+                                    AS markets_confirmed_subscribed,
+                                (SELECT count(*)
+                                 FROM live_market_subscription_decisions d,
+                                      latest_decision latest
+                                 WHERE d.collector_run_id = %s AND d.exchange = %s
+                                   AND d.evaluated_at = latest.evaluated_at
+                                   AND d.is_eligible AND d.exclusion_reason IS NULL)
+                                    AS markets_selected,
+                                (SELECT max(r.received_at)
+                                 FROM raw_ws_messages r
+                                 JOIN collector_connections cc
+                                   ON cc.id = r.collector_connection_id
+                                 WHERE cc.collector_run_id = %s AND cc.exchange = %s)
+                                    AS latest_ws_message,
+                                (SELECT max(d.evaluated_at)
+                                 FROM live_market_subscription_decisions d
+                                 WHERE d.collector_run_id = %s AND d.exchange = %s)
+                                    AS latest_complete_discovery,
+                                (SELECT count(*) FROM data_gaps g
+                                 WHERE g.collector_run_id = %s AND g.exchange = %s
+                                   AND g.channel = 'rest:market_discovery'
+                                   AND g.status IN ('open', 'reconciling'))
+                                    AS open_discovery_gaps
+                            """,
+                            tuple(
+                                value
+                                for _ in range(7)
+                                for value in (live_run["id"], exchange)
+                            ),
+                        )
+                    ).fetchone()
+                    state = dict(row or {})
+                    if int(state.get("open_discovery_gaps") or 0):
+                        state["discovery_state"] = "retrying"
+                    elif state.get("latest_complete_discovery") is not None:
+                        state["discovery_state"] = "ready"
+                    else:
+                        state["discovery_state"] = "pending"
+                    requires_market_ws = exchange == "polymarket" or bool(
+                        metadata.get("kalshi_websocket_configured")
+                    )
+                    state["healthy"] = (
+                        not requires_market_ws
+                        or (
+                            state["discovery_state"] == "ready"
+                            and
+                            int(state.get("connections_active") or 0) > 0
+                            and int(state.get("markets_confirmed_subscribed") or 0) > 0
+                            and state.get("latest_ws_message") is not None
+                        )
+                    )
+                    live[exchange] = state
+                result["live_run"] = {
+                    "id": live_run["id"],
+                    "started_at": live_run["started_at"],
+                }
+            result["live"] = live
+            result["healthy"] = bool(
+                result["database_connected"]
+                and bool((migration_status or {}).get("current", True))
+                and live
+                and all(state.get("healthy") for state in live.values())
+            )
         return result
 
 
@@ -2828,8 +2938,9 @@ def _lookup_prefix() -> str:
             FROM markets m
             LEFT JOIN outcomes o
               ON o.market_id = m.id
-             AND (%(outcome_external_id)s IS NOT NULL)
-             AND (o.external_id = %(outcome_external_id)s OR o.token_id = %(outcome_external_id)s)
+             AND (%(outcome_external_id)s::TEXT IS NOT NULL)
+             AND (o.external_id = %(outcome_external_id)s::TEXT
+                  OR o.token_id = %(outcome_external_id)s::TEXT)
             WHERE m.exchange = %(exchange)s AND
                   (m.external_id = %(market_external_id)s OR m.condition_id = %(market_external_id)s OR m.ticker = %(market_external_id)s)
             ORDER BY CASE WHEN m.external_id = %(market_external_id)s THEN 0 ELSE 1 END
@@ -2941,19 +3052,14 @@ def _write_query(kind: str, value: Mapping[str, Any]) -> tuple[str, Mapping[str,
                  source_timestamp, exchange_timestamp, source_timestamp_raw,
                  exchange_timestamp_raw, received_at, received_monotonic_ns,
                  sequence_number, book_hash, payload)
-            SELECT %(exchange)s, %(connection_id)s, %(channel)s, market_id, outcome_id,
-                   %(market_external_id)s, %(outcome_external_id)s, %(message_type)s,
-                   %(source_timestamp)s, %(exchange_timestamp)s,
-                   %(source_timestamp_raw)s, %(exchange_timestamp_raw)s, %(received_at)s,
-                   %(received_monotonic_ns)s, %(sequence_number)s, %(book_hash)s, %(payload)s
-            FROM resolved
-            UNION ALL
-            SELECT %(exchange)s, %(connection_id)s, %(channel)s, NULL, NULL,
-                   %(market_external_id)s, %(outcome_external_id)s, %(message_type)s,
-                   %(source_timestamp)s, %(exchange_timestamp)s,
-                   %(source_timestamp_raw)s, %(exchange_timestamp_raw)s, %(received_at)s,
-                   %(received_monotonic_ns)s, %(sequence_number)s, %(book_hash)s, %(payload)s
-            WHERE NOT EXISTS (SELECT 1 FROM resolved)
+            VALUES
+                (%(exchange)s, %(connection_id)s, %(channel)s,
+                 (SELECT market_id FROM resolved), (SELECT outcome_id FROM resolved),
+                 %(market_external_id)s, %(outcome_external_id)s, %(message_type)s,
+                 %(source_timestamp)s, %(exchange_timestamp)s,
+                 %(source_timestamp_raw)s, %(exchange_timestamp_raw)s,
+                 %(received_at)s, %(received_monotonic_ns)s,
+                 %(sequence_number)s, %(book_hash)s, %(payload)s)
             """,
             data,
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -128,30 +129,115 @@ class PolymarketService:
         return counts
 
     async def discover_live(
-        self, *, reconcile_absent: bool = True
+        self,
+        *,
+        reconcile_absent: bool = True,
+        on_page: Callable[[list[MarketCandidate]], Awaitable[None]] | None = None,
     ) -> list[MarketCandidate]:
-        candidates: list[MarketCandidate] = []
+        candidates_by_id: dict[str, MarketCandidate] = {}
         diagnostics = MetadataSyncDiagnostics()
-        async for items, result, cursor in self.rest.iter_markets(closed=False):
+        malformed_markets = 0
+        malformed_events = 0
+        malformed_samples: list[dict[str, Any]] = []
+        async for items, result, cursor in self.rest.iter_live_events():
             await self._raw_page(
-                "gamma", "/markets/keyset", "markets", items, result, external_key=cursor
+                "gamma", "/events/keyset", "events", items, result, external_key=cursor
             )
-            for raw in items:
-                candidate = parse_market_candidate(raw)
-                candidates.append(candidate)
-                market, outcomes = normalise_market(raw)
-                market["exchange_timestamp"] = result.response_timestamp
-                market["exchange_timestamp_is_transport"] = True
-                market["observed_at"] = (
-                    getattr(result, "requested_at", None) or utc_now()
+            page_candidates: list[MarketCandidate] = []
+            for raw_event in items:
+                if not bool(raw_event.get("active")) or bool(raw_event.get("closed")):
+                    continue
+                event = normalise_event(raw_event)
+                await self.database.upsert_event(event)
+                nested_markets = raw_event.get("markets")
+                if not isinstance(nested_markets, list):
+                    malformed_events += 1
+                    if len(malformed_samples) < 10:
+                        malformed_samples.append(
+                            {
+                                "event_id": raw_event.get("id"),
+                                "reason": "nested_markets_missing",
+                            }
+                        )
+                    continue
+                for raw in nested_markets:
+                    if not isinstance(raw, dict):
+                        malformed_markets += 1
+                        if len(malformed_samples) < 10:
+                            malformed_samples.append(
+                                {
+                                    "event_id": raw_event.get("id"),
+                                    "reason": "market_not_object",
+                                }
+                            )
+                        continue
+                    candidate = parse_market_candidate(raw)
+                    if not candidate.external_id:
+                        malformed_markets += 1
+                        if len(malformed_samples) < 10:
+                            malformed_samples.append(
+                                {
+                                    "event_id": raw_event.get("id"),
+                                    "market_slug": raw.get("slug"),
+                                    "reason": "market_identity_missing",
+                                }
+                        )
+                        continue
+                    if not candidate.active:
+                        continue
+                    market, outcomes = normalise_market(
+                        raw, event_external_id=event["external_id"]
+                    )
+                    market["exchange_timestamp"] = result.response_timestamp
+                    market["exchange_timestamp_is_transport"] = True
+                    market["observed_at"] = (
+                        getattr(result, "requested_at", None) or utc_now()
+                    )
+                    market_id = await self.database.upsert_market(
+                        market, diagnostics=diagnostics
+                    )
+                    for outcome in outcomes:
+                        await self.database.upsert_outcome(market_id, outcome)
+                    candidates_by_id[candidate.external_id] = candidate
+                    page_candidates.append(candidate)
+            if on_page is not None and page_candidates:
+                await on_page(page_candidates)
+        candidates = list(candidates_by_id.values())
+        if malformed_events or malformed_markets:
+            LOGGER.warning(
+                "Polymarket live discovery skipped malformed metadata",
+                extra={
+                    "malformed_events": malformed_events,
+                    "malformed_markets": malformed_markets,
+                    "samples": malformed_samples,
+                },
+            )
+            try:
+                await self.database.record_gap(
+                    run_id=self.writer.run_id,
+                    connection_id=None,
+                    exchange="polymarket",
+                    channel="rest:market_discovery",
+                    market_external_id=None,
+                    outcome_external_id=None,
+                    gap_type="market_metadata_schema_failure",
+                    reconnect_reason=(
+                        "Gamma active-event payload contained malformed nested metadata"
+                    ),
+                    details={
+                        "malformed_events": malformed_events,
+                        "malformed_markets": malformed_markets,
+                        "samples": malformed_samples,
+                    },
                 )
-                market_id = await self.database.upsert_market(
-                    market, diagnostics=diagnostics
+            except Exception:
+                LOGGER.exception(
+                    "Failed to persist Polymarket metadata schema gap"
                 )
-                for outcome in outcomes:
-                    await self.database.upsert_outcome(market_id, outcome)
         if not candidates:
-            raise RuntimeError("Polymarket complete open-market discovery returned zero markets")
+            raise RuntimeError(
+                "Polymarket complete active-event discovery returned zero markets"
+            )
         if reconcile_absent:
             await self.reconcile_absent_live(
                 candidates,

@@ -95,6 +95,10 @@ def parse_market_candidate(raw: dict[str, Any]) -> MarketCandidate:
 
 
 def normalise_event(raw: dict[str, Any]) -> dict[str, Any]:
+    start_time = parse_timestamp(first_present(raw, "startDate", "startTime"))
+    end_time = parse_timestamp(first_present(raw, "endDate", "endTime"))
+    if start_time is not None and end_time is not None and end_time < start_time:
+        end_time = None
     return {
         "exchange": "polymarket",
         "external_id": str(raw.get("id") or raw.get("slug") or ""),
@@ -111,8 +115,8 @@ def normalise_event(raw: dict[str, Any]) -> dict[str, Any]:
             if _bool(raw.get("active"))
             else "inactive"
         ),
-        "start_time": parse_timestamp(first_present(raw, "startDate", "startTime")),
-        "end_time": parse_timestamp(first_present(raw, "endDate", "endTime")),
+        "start_time": start_time,
+        "end_time": end_time,
         "created_time": parse_timestamp(
             first_present(raw, "creationDate", "createdAt", "created_at")
         ),
@@ -139,6 +143,13 @@ def normalise_market(
     raw: dict[str, Any], *, event_external_id: str | None = None
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     candidate = parse_market_candidate(raw)
+    open_time = parse_timestamp(first_present(raw, "startDate", "startTime"))
+    close_time = parse_timestamp(first_present(raw, "endDate", "endTime"))
+    # Gamma occasionally carries a stale event end date on a newly opened
+    # market. Preserve it in raw_data, but do not normalize an impossible
+    # close-before-open interval that violates the lifecycle contract.
+    if open_time is not None and close_time is not None and close_time < open_time:
+        close_time = None
     market = {
         "exchange": "polymarket",
         "external_id": candidate.external_id,
@@ -156,8 +167,8 @@ def normalise_market(
         "market_type": raw.get("marketType") or "binary",
         "is_active": candidate.active,
         "is_tradable": candidate.tradable,
-        "open_time": parse_timestamp(first_present(raw, "startDate", "startTime")),
-        "close_time": parse_timestamp(first_present(raw, "endDate", "endTime")),
+        "open_time": open_time,
+        "close_time": close_time,
         "settlement_time": parse_timestamp(
             first_present(raw, "settlementTime", "settledAt", "settled_at")
         ),

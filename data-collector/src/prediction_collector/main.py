@@ -5,6 +5,8 @@ import asyncio
 import json
 import logging
 import signal
+import selectors
+import sys
 from dataclasses import asdict
 from typing import Any
 
@@ -59,12 +61,19 @@ def main(argv: list[str] | None = None) -> None:
     settings = Settings.from_env()
     configure_logging(settings.log_level, json_logs=settings.json_logs)
     try:
-        asyncio.run(_dispatch(args, settings))
+        loop_factory = (
+            (lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()))
+            if sys.platform == "win32"
+            else None
+        )
+        exit_code = asyncio.run(_dispatch(args, settings), loop_factory=loop_factory)
+        if exit_code:
+            raise SystemExit(exit_code)
     except KeyboardInterrupt:
         LOGGER.info("Interrupted; shutdown complete")
 
 
-async def _dispatch(args: argparse.Namespace, settings: Settings) -> None:
+async def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
     metrics = ThroughputMetrics()
     database = Database(settings, metrics)
     if args.command == "migrate":
@@ -73,22 +82,45 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> None:
             "Database migrations complete",
             extra={"applied": applied, "applied_count": len(applied)},
         )
-        return
+        return 0
     if args.command == "smoke":
         await _smoke(settings, args.exchange)
-        return
+        return 0
+
+    if args.command == "status":
+        migration_status = await database.verify_migrations()
+        if not bool(migration_status.get("current")):
+            print(
+                json.dumps(
+                    {
+                        "database_connected": True,
+                        "migrations": migration_status,
+                        "healthy": False,
+                        "status_error": "pending or inconsistent migrations",
+                    },
+                    default=str,
+                    indent=2,
+                )
+            )
+            return 1
+        await database.open()
+        try:
+            status = await database.status(migration_status=migration_status)
+            print(json.dumps(status, default=str, indent=2))
+            return 0 if status.get("healthy") else 1
+        finally:
+            await database.close()
 
     await database.migrate()
     await database.open()
     try:
-        if args.command == "status":
-            print(json.dumps(await database.status(), default=str, indent=2))
-        elif args.command == "backfill":
+        if args.command == "backfill":
             await _backfill(database, metrics, settings, args.exchange)
         elif args.command == "run":
             await _live(database, metrics, settings, args.exchange)
     finally:
         await database.close()
+    return 0
 
 
 def _writer(database: Database, settings: Settings) -> BatchWriter:
@@ -222,7 +254,10 @@ async def _live(
         def request_stop(*_: object) -> None:
             loop.call_soon_threadsafe(collector.stop.set)
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        shutdown_signals = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGBREAK"):
+            shutdown_signals.append(signal.SIGBREAK)
+        for sig in shutdown_signals:
             try:
                 signal.signal(sig, request_stop)
             except (ValueError, OSError):
@@ -244,9 +279,18 @@ async def _smoke(settings: Settings, exchange: str) -> None:
                 data_url=settings.polymarket_data_url,
                 clob_url=settings.polymarket_clob_url,
             )
-            async for items, _, cursor in client.iter_markets(active=True, closed=False):
+            async for items, _, cursor in client.iter_live_events():
+                nested_markets = sum(
+                    len(item.get("markets") or [])
+                    for item in items
+                    if item.get("active") and not item.get("closed")
+                )
                 result["polymarket"] = {
-                    "market_page_records": len(items),
+                    "active_event_page_records": sum(
+                        bool(item.get("active")) and not bool(item.get("closed"))
+                        for item in items
+                    ),
+                    "nested_market_page_records": nested_markets,
                     "has_next_cursor": bool(cursor),
                 }
                 break

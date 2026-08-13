@@ -52,3 +52,47 @@ async def migrate_database(dsn: str, directory: Path | None = None) -> list[str]
             applied.append(path.name)
     return applied
 
+
+async def verify_database_migrations(
+    dsn: str, directory: Path | None = None
+) -> dict[str, object]:
+    """Verify migration state without creating or modifying database objects."""
+    migration_dir = directory or migrations_directory()
+    files = sorted(migration_dir.glob("*.sql"))
+    expected = {
+        path.name: hashlib.sha256(
+            path.read_text(encoding="utf-8").encode("utf-8")
+        ).hexdigest()
+        for path in files
+    }
+    async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as connection:
+        exists = await (
+            await connection.execute(
+                "SELECT to_regclass(current_schema() || '.schema_migrations')"
+            )
+        ).fetchone()
+        if not exists or exists[0] is None:
+            return {
+                "current": False,
+                "applied": [],
+                "pending": list(expected),
+                "checksum_mismatches": [],
+            }
+        rows = await (
+            await connection.execute(
+                "SELECT filename, checksum FROM schema_migrations ORDER BY filename"
+            )
+        ).fetchall()
+    applied = {str(row[0]): str(row[1]) for row in rows}
+    pending = [name for name in expected if name not in applied]
+    mismatches = [
+        name
+        for name, checksum in expected.items()
+        if name in applied and applied[name] != checksum
+    ]
+    return {
+        "current": not pending and not mismatches,
+        "applied": sorted(applied),
+        "pending": pending,
+        "checksum_mismatches": mismatches,
+    }

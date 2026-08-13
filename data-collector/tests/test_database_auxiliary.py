@@ -192,6 +192,53 @@ def test_reference_and_sports_writes_resolve_normalized_parent_rows() -> None:
     assert "sports_event_id" in sports_sql
 
 
+def test_nullable_lookup_and_raw_websocket_sql_have_explicit_types() -> None:
+    raw_sql, _ = _write_query(
+        "raw_ws_messages",
+        {
+            "exchange": "polymarket",
+            "connection_id": 1,
+            "channel": "rtds:test",
+            "market_external_id": None,
+            "outcome_external_id": None,
+            "message_type": "price",
+            "source_timestamp": None,
+            "exchange_timestamp": None,
+            "received_at": datetime(2026, 8, 13, tzinfo=UTC),
+            "received_monotonic_ns": 1,
+            "sequence_number": None,
+            "book_hash": None,
+            "payload": {},
+        },
+    )
+    snapshot_sql, _ = _write_query(
+        "orderbook_snapshots",
+        {
+            "exchange": "polymarket",
+            "market_external_id": "MARKET-A",
+            "outcome_external_id": None,
+            "connection_id": 1,
+            "snapshot_type": "book",
+            "source_timestamp": None,
+            "exchange_timestamp": None,
+            "received_at": datetime(2026, 8, 13, tzinfo=UTC),
+            "received_monotonic_ns": 1,
+            "sequence_number": None,
+            "book_hash": None,
+            "bids": [],
+            "asks": [],
+            "best_bid": None,
+            "best_ask": None,
+            "is_reconciliation": False,
+            "raw_data": {},
+        },
+    )
+
+    assert "UNION ALL" not in raw_sql
+    assert "(SELECT market_id FROM resolved)" in raw_sql
+    assert "%(outcome_external_id)s::TEXT IS NOT NULL" in snapshot_sql
+
+
 @pytest.mark.asyncio
 async def test_unresolved_multivariate_legs_are_debug_and_aggregated(
     caplog: pytest.LogCaptureFixture,

@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 from prediction_collector.polymarket.parser import (
+    normalise_event,
     normalise_market,
     parse_book,
     parse_market_candidate,
@@ -70,6 +71,36 @@ def test_normalised_market_preserves_condition_event_and_outcome_index_mapping(
         Decimal("0.4200"),
         Decimal("0.5800"),
     ]
+
+
+def test_normalised_market_does_not_emit_close_before_open(
+    load_fixture: FixtureLoader,
+) -> None:
+    raw = load_fixture("polymarket_market.json")
+    raw["startDate"] = "2026-07-01T00:00:00Z"
+    raw["endDate"] = "2025-12-31T12:00:00Z"
+
+    market, _ = normalise_market(raw)
+
+    assert market["open_time"] == datetime(2026, 7, 1, tzinfo=UTC)
+    assert market["close_time"] is None
+    assert market["raw_data"]["endDate"] == "2025-12-31T12:00:00Z"
+
+
+def test_normalised_event_does_not_emit_end_before_start() -> None:
+    raw = {
+        "id": "EVENT-A",
+        "title": "Event",
+        "active": True,
+        "startDate": "2026-07-01T00:00:00Z",
+        "endDate": "2025-12-31T12:00:00Z",
+    }
+
+    event = normalise_event(raw)
+
+    assert event["start_time"] == datetime(2026, 7, 1, tzinfo=UTC)
+    assert event["end_time"] is None
+    assert event["raw_data"]["endDate"] == "2025-12-31T12:00:00Z"
 
 
 def test_book_parser_sorts_levels_and_preserves_hash_and_receive_clock(

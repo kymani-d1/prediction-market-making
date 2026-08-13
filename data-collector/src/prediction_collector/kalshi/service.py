@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -308,14 +309,24 @@ class KalshiService:
         return counts
 
     async def discover_live(
-        self, *, reconcile_absent: bool = True
+        self,
+        *,
+        reconcile_absent: bool = True,
+        on_page: Callable[[list[MarketCandidate]], Awaitable[None]] | None = None,
     ) -> list[MarketCandidate]:
-        candidates: list[MarketCandidate] = []
+        candidates_by_id: dict[str, MarketCandidate] = {}
         diagnostics = MetadataSyncDiagnostics()
-        async for items, result, cursor in self.rest.iter_markets(status="open"):
+        # Ordinary markets are subscribed first. The much larger MVE relation
+        # is consumed separately below so it cannot delay ordinary capture.
+        async for items, result, cursor in self.rest.iter_markets(
+            status="open", mve_filter="exclude"
+        ):
             await self._raw("/markets", "markets", items, result, cursor)
+            page_candidates: list[MarketCandidate] = []
             for raw in items:
-                candidates.append(parse_market_candidate(raw))
+                candidate = parse_market_candidate(raw)
+                candidates_by_id[candidate.external_id] = candidate
+                page_candidates.append(candidate)
                 market, outcomes = normalise_market(raw)
                 market["exchange_timestamp"] = result.response_timestamp
                 market["exchange_timestamp_is_transport"] = True
@@ -327,6 +338,46 @@ class KalshiService:
                 )
                 for outcome in outcomes:
                     await self.database.upsert_outcome(market_id, outcome)
+            if on_page is not None and page_candidates:
+                await on_page(page_candidates)
+
+        async for items, result, cursor in self.rest.iter_multivariate_events(
+            with_nested_markets=True
+        ):
+            await self._raw(
+                "/events/multivariate", "multivariate_events", items, result, cursor
+            )
+            page_candidates = []
+            for raw_event in items:
+                event = normalise_event(raw_event)
+                await self.database.upsert_event(event)
+                nested_markets = raw_event.get("markets")
+                if not isinstance(nested_markets, list):
+                    continue
+                for raw in nested_markets:
+                    if not isinstance(raw, dict):
+                        raise RuntimeError(
+                            "Kalshi multivariate event contained malformed market rows"
+                        )
+                    candidate = parse_market_candidate(raw)
+                    candidates_by_id[candidate.external_id] = candidate
+                    page_candidates.append(candidate)
+                    market, outcomes = normalise_market(raw)
+                    if not market.get("event_external_id"):
+                        market["event_external_id"] = event["external_id"]
+                    market["exchange_timestamp"] = result.response_timestamp
+                    market["exchange_timestamp_is_transport"] = True
+                    market["observed_at"] = (
+                        getattr(result, "requested_at", None) or utc_now()
+                    )
+                    market_id = await self.database.upsert_market(
+                        market, diagnostics=diagnostics
+                    )
+                    for outcome in outcomes:
+                        await self.database.upsert_outcome(market_id, outcome)
+            if on_page is not None and page_candidates:
+                await on_page(page_candidates)
+        candidates = list(candidates_by_id.values())
         if not candidates:
             raise RuntimeError("Kalshi complete open-market discovery returned zero markets")
         if reconcile_absent:

@@ -10,6 +10,7 @@ from typing import Any
 
 from prediction_collector.common.coverage import select_live_markets
 from prediction_collector.common.records import book_snapshot_item
+from prediction_collector.common.retry import RetryPolicy
 from prediction_collector.common.types import LiveSelection, MarketCandidate
 from prediction_collector.common.utils import utc_now
 from prediction_collector.config import Settings
@@ -82,6 +83,22 @@ class LiveCollector:
         self.kalshi_service = kalshi_service
         self.coverage = LiveCoverageState()
         self._last_discovery_by_exchange: dict[str, list[MarketCandidate]] = {}
+        self._discovery_gaps: dict[str, list[int]] = {}
+        self.discovery_state: dict[str, str] = {
+            exchange: "pending"
+            for exchange, service in (
+                ("polymarket", polymarket_service),
+                ("kalshi", kalshi_service),
+            )
+            if service is not None
+        }
+        self._selection_lock = asyncio.Lock()
+        self._discovery_retry_policy = RetryPolicy(
+            max_attempts=1,
+            base_delay_seconds=1.0,
+            max_delay_seconds=60.0,
+            jitter_ratio=0.25,
+        )
         self._economics_gaps: dict[tuple[str, str], list[int]] = {}
         self.stop = asyncio.Event()
         self.run_id: int | None = None
@@ -132,8 +149,8 @@ class LiveCollector:
         if self.writer.task is not None:
             self._watch_task(self.writer.task)
         try:
-            await self._refresh_selection(restart=False)
-            await self._start_market_tasks()
+            # Discovery-independent feeds and telemetry must start before any
+            # potentially slow or unavailable REST catalog traversal.
             await self._start_background_tasks()
             stop_waiter = asyncio.create_task(self.stop.wait(), name="collector-stop-waiter")
             assert self._task_failure is not None
@@ -189,6 +206,7 @@ class LiveCollector:
     async def _discover(self) -> list[MarketCandidate]:
         candidates: list[MarketCandidate] = []
         missing_without_cache: list[str] = []
+        initial_errors: dict[str, str] = {}
         if self.polymarket_service:
             try:
                 discovered = await self.polymarket_service.discover_live(
@@ -204,6 +222,7 @@ class LiveCollector:
                 cached = self._last_discovery_by_exchange.get("polymarket")
                 if cached is None:
                     missing_without_cache.append("polymarket")
+                    initial_errors["polymarket"] = f"{type(exc).__name__}: {exc}"
                 else:
                     candidates.extend(cached)
                 await self.database.record_gap(
@@ -232,6 +251,7 @@ class LiveCollector:
                 cached = self._last_discovery_by_exchange.get("kalshi")
                 if cached is None:
                     missing_without_cache.append("kalshi")
+                    initial_errors["kalshi"] = f"{type(exc).__name__}: {exc}"
                 else:
                     candidates.extend(cached)
                 await self.database.record_gap(
@@ -247,8 +267,11 @@ class LiveCollector:
                 )
         if missing_without_cache:
             raise RuntimeError(
-                "Initial live discovery failed for enabled exchange(s): "
-                + ", ".join(missing_without_cache)
+                "Initial live discovery failed: "
+                + "; ".join(
+                    f"{exchange}: {initial_errors.get(exchange, 'unknown error')}"
+                    for exchange in missing_without_cache
+                )
             )
         if not candidates:
             raise RuntimeError("Live discovery returned no markets from enabled exchanges")
@@ -302,6 +325,37 @@ class LiveCollector:
 
     async def _refresh_selection(self, *, restart: bool) -> None:
         candidates = await self._discover()
+        await self._apply_selection(
+            candidates,
+            restart=restart,
+            persist_decisions=True,
+            log_summary=True,
+        )
+
+    async def _apply_selection(
+        self,
+        candidates: list[MarketCandidate],
+        *,
+        restart: bool,
+        persist_decisions: bool,
+        log_summary: bool,
+    ) -> None:
+        async with self._selection_lock:
+            await self._apply_selection_locked(
+                candidates,
+                restart=restart,
+                persist_decisions=persist_decisions,
+                log_summary=log_summary,
+            )
+
+    async def _apply_selection_locked(
+        self,
+        candidates: list[MarketCandidate],
+        *,
+        restart: bool,
+        persist_decisions: bool,
+        log_summary: bool,
+    ) -> None:
         selection = select_live_markets(
             candidates,
             max_markets=self.settings.max_live_markets,
@@ -328,24 +382,27 @@ class LiveCollector:
             (item.exchange, item.external_id): item.reason for item in selection.excluded
         }
         self.coverage = LiveCoverageState(candidates=candidates, selection=selection)
-        confirmed_subscriptions = await self.database.active_subscribed_market_ids(
-            self.run_id
-        )
-        await self.database.record_live_selection(
-            self.run_id, candidates, confirmed_subscriptions, reasons
-        )
-        LOGGER.info(
-            "Live market coverage",
-            extra={
-                "discovered_markets": selection.discovered,
-                "active_markets": selection.active,
-                "tradable_markets": selection.tradable,
-                "markets_selected_for_subscription": len(selection.subscribed),
-                "excluded_markets": len(selection.excluded),
-                "exclusion_reasons": selection.excluded_counts,
-                "max_live_markets": self.settings.max_live_markets,
-            },
-        )
+        if persist_decisions:
+            confirmed_subscriptions = await self.database.active_subscribed_market_ids(
+                self.run_id
+            )
+            await self.database.record_live_selection(
+                self.run_id, candidates, confirmed_subscriptions, reasons
+            )
+        if log_summary:
+            LOGGER.info(
+                "Live market coverage",
+                extra={
+                    "discovered_markets": selection.discovered,
+                    "active_markets": selection.active,
+                    "tradable_markets": selection.tradable,
+                    "markets_selected_for_subscription": len(selection.subscribed),
+                    "excluded_markets": len(selection.excluded),
+                    "exclusion_reasons": selection.excluded_counts,
+                    "max_live_markets": self.settings.max_live_markets,
+                    "discovery_state": dict(self.discovery_state),
+                },
+            )
         for excluded in selection.excluded:
             LOGGER.debug(
                 "Live market excluded",
@@ -610,9 +667,24 @@ class LiveCollector:
                             name=f"kalshi-{channel}",
                         )
                     )
+        if self.polymarket_service:
+            self.background_tasks.append(
+                self._create_watched_task(
+                    self._exchange_discovery_loop(
+                        "polymarket", self.polymarket_service
+                    ),
+                    name="polymarket-market-discovery",
+                )
+            )
+        if self.kalshi_service:
+            self.background_tasks.append(
+                self._create_watched_task(
+                    self._exchange_discovery_loop("kalshi", self.kalshi_service),
+                    name="kalshi-market-discovery",
+                )
+            )
         self.background_tasks.extend(
             [
-                self._create_watched_task(self._discovery_loop(), name="market-discovery"),
                 self._create_watched_task(
                     self._economics_loop(), name="economics-refresh"
                 ),
@@ -641,15 +713,134 @@ class LiveCollector:
 
         task.add_done_callback(completed)
 
-    async def _discovery_loop(self) -> None:
+    async def _exchange_discovery_loop(
+        self,
+        exchange: str,
+        service: PolymarketService | KalshiService,
+    ) -> None:
+        """Retry one exchange forever without blocking any other live feed."""
+        attempt = 0
         while not self.stop.is_set():
-            await _sleep(self.stop, self.settings.metadata_sync_interval_seconds)
-            if self.stop.is_set():
-                return
             try:
-                await self._refresh_selection(restart=True)
+                self.discovery_state[exchange] = "discovering"
+                incremental = self.settings.max_live_markets == 0
+
+                async def on_page(page: list[MarketCandidate]) -> None:
+                    if incremental:
+                        await self._merge_discovery_page(exchange, page)
+
+                discovered = await service.discover_live(
+                    reconcile_absent=False,
+                    on_page=on_page if incremental else None,
+                )
+                self._last_discovery_by_exchange[exchange] = discovered
+                self.discovery_state[exchange] = "ready"
+                await self._apply_selection(
+                    self._combined_candidates(),
+                    restart=True,
+                    persist_decisions=True,
+                    log_summary=True,
+                )
+                self._schedule_absent_reconciliation(exchange, service, discovered)
+                await self._resolve_discovery_gaps(exchange)
+                attempt = 0
+                await _sleep(self.stop, self.settings.metadata_sync_interval_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempt += 1
+                self.discovery_state[exchange] = "retrying"
+                delay = self._discovery_retry_policy.delay(min(attempt, 32))
+                LOGGER.exception(
+                    f"{exchange.capitalize()} live discovery failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    extra={
+                        "exchange": exchange,
+                        "attempt": attempt,
+                        "retry_delay_seconds": round(delay, 3),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+                await self._record_discovery_gap(exchange, exc, attempt, delay)
+                await _sleep(self.stop, delay)
+
+    async def _merge_discovery_page(
+        self, exchange: str, page: list[MarketCandidate]
+    ) -> None:
+        existing = {
+            market.external_id: market
+            for market in self._last_discovery_by_exchange.get(exchange, [])
+        }
+        for market in page:
+            existing[market.external_id] = market
+        self._last_discovery_by_exchange[exchange] = list(existing.values())
+        await self._apply_selection(
+            self._combined_candidates(),
+            restart=True,
+            persist_decisions=False,
+            log_summary=False,
+        )
+
+    def _combined_candidates(self) -> list[MarketCandidate]:
+        return [
+            market
+            for exchange in sorted(self._last_discovery_by_exchange)
+            for market in self._last_discovery_by_exchange[exchange]
+        ]
+
+    async def _record_discovery_gap(
+        self,
+        exchange: str,
+        exc: Exception,
+        attempt: int,
+        delay: float,
+    ) -> None:
+        # One open gap describes one outage. Repeated retries remain visible in
+        # logs without creating an unbounded row per attempt.
+        if self._discovery_gaps.get(exchange):
+            return
+        try:
+            gap_id = await self.database.record_gap(
+                run_id=self.run_id,
+                connection_id=None,
+                exchange=exchange,
+                channel="rest:market_discovery",
+                market_external_id=None,
+                outcome_external_id=None,
+                gap_type="discovery_refresh_failed",
+                reconnect_reason=f"{type(exc).__name__}: {exc}",
+                details={
+                    "attempt": attempt,
+                    "retry_delay_seconds": round(delay, 3),
+                    "retained_partial_markets": len(
+                        self._last_discovery_by_exchange.get(exchange, [])
+                    ),
+                },
+            )
+            self._discovery_gaps[exchange] = [gap_id]
+        except Exception:
+            LOGGER.exception(
+                "Failed to persist market-discovery data gap",
+                extra={"exchange": exchange},
+            )
+
+    async def _resolve_discovery_gaps(self, exchange: str) -> None:
+        gap_ids = self._discovery_gaps.pop(exchange, [])
+        unresolved: list[int] = []
+        for gap_id in gap_ids:
+            try:
+                await self.database.resolve_gap(
+                    gap_id, action="successful_complete_market_discovery"
+                )
             except Exception:
-                LOGGER.exception("Periodic live market discovery failed")
+                unresolved.append(gap_id)
+                LOGGER.exception(
+                    "Failed to resolve recovered market-discovery gap",
+                    extra={"exchange": exchange, "gap_id": gap_id},
+                )
+        if unresolved:
+            self._discovery_gaps[exchange] = unresolved
 
     async def _economics_loop(self) -> None:
         while not self.stop.is_set():

@@ -88,6 +88,10 @@ class PolymarketMarketWebSocket:
                     close_timeout=10,
                     open_timeout=30,
                     max_queue=2048,
+                    # Full-market shards can receive multi-megabyte initial
+                    # book dumps. The library's 1 MiB default disconnects a
+                    # healthy comprehensive subscription with close code 1009.
+                    max_size=16 * 1024 * 1024,
                 ) as websocket:
                     connection_id = await self.database.create_connection(
                         run_id=run_id,

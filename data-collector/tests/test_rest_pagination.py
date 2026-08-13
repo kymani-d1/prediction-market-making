@@ -60,6 +60,33 @@ async def test_polymarket_keyset_uses_after_cursor_and_no_offset() -> None:
 
 
 @pytest.mark.asyncio
+async def test_polymarket_live_events_use_documented_keyset_pages() -> None:
+    http = FakeHttp(
+        [
+            {"events": [{"id": "1", "markets": []}], "next_cursor": "next"},
+            {"events": [{"id": "2", "markets": []}]},
+        ]
+    )
+    client = PolymarketRestClient(
+        http,  # type: ignore[arg-type]
+        gamma_url="https://gamma.test",
+        data_url="https://data.test",
+        clob_url="https://clob.test",
+    )
+
+    pages = [page async for page in client.iter_live_events()]
+
+    assert [[event["id"] for event in page[0]] for page in pages] == [["1"], ["2"]]
+    assert http.calls == [
+        ("https://gamma.test/events/keyset", {"closed": "false", "limit": 100}),
+        (
+            "https://gamma.test/events/keyset",
+            {"closed": "false", "limit": 100, "after_cursor": "next"},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_polymarket_keyset_repeated_cursor_fails_instead_of_looping() -> None:
     http = FakeHttp(
         [
