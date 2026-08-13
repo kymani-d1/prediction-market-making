@@ -122,27 +122,39 @@ class OrderBook:
     def ask_depth(self) -> Decimal:
         return sum(self.asks.values(), Decimal("0"))
 
+    @property
+    def bid_depth_top(self) -> Decimal:
+        return self.bids.get(self.best_bid, Decimal("0")) if self.best_bid is not None else Decimal("0")
+
+    @property
+    def ask_depth_top(self) -> Decimal:
+        return self.asks.get(self.best_ask, Decimal("0")) if self.best_ask is not None else Decimal("0")
+
+    @property
+    def bid_depth_1pct(self) -> Decimal:
+        midpoint = self.midpoint
+        if midpoint is None:
+            return Decimal("0")
+        floor = midpoint * Decimal("0.99")
+        return sum((size for price, size in self.bids.items() if price >= floor), Decimal("0"))
+
+    @property
+    def ask_depth_1pct(self) -> Decimal:
+        midpoint = self.midpoint
+        if midpoint is None:
+            return Decimal("0")
+        ceiling = midpoint * Decimal("1.01")
+        return sum((size for price, size in self.asks.items() if price <= ceiling), Decimal("0"))
+
+    @property
+    def imbalance(self) -> Decimal | None:
+        total = self.bid_depth + self.ask_depth
+        if total <= 0:
+            return None
+        return (self.bid_depth - self.ask_depth) / total
+
     def serialise_bids(self) -> list[list[str]]:
         return [[str(price), str(self.bids[price])] for price in sorted(self.bids, reverse=True)]
 
     def serialise_asks(self) -> list[list[str]]:
         return [[str(price), str(self.asks[price])] for price in sorted(self.asks)]
-
-
-def kalshi_yes_book(
-    yes_bids: Iterable[Any], no_bids: Iterable[Any]
-) -> tuple[list[list[str]], list[list[str]]]:
-    """Derive a YES bid/ask book while retaining raw YES/NO levels elsewhere.
-
-    A NO bid at q implies a YES ask at 1-q. Prices must already be in dollars.
-    """
-    bids = _levels(yes_bids)
-    raw_no_bids = _levels(no_bids)
-    asks: dict[Decimal, Decimal] = {}
-    for no_price, size in raw_no_bids.items():
-        yes_ask = Decimal("1") - no_price
-        asks[yes_ask] = asks.get(yes_ask, Decimal("0")) + size
-    return (
-        [[str(price), str(bids[price])] for price in sorted(bids, reverse=True)],
-        [[str(price), str(asks[price])] for price in sorted(asks)],
-    )

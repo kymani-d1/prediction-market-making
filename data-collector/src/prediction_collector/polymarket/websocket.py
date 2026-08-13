@@ -33,6 +33,7 @@ from prediction_collector.polymarket.parser import (
     parse_trade,
 )
 from prediction_collector.writer import BatchWriter, WriteItem
+from prediction_collector.tiering import CollectionTier, TierManager
 
 
 LOGGER = logging.getLogger(__name__)
@@ -46,16 +47,18 @@ class PolymarketMarketWebSocket:
         writer: BatchWriter,
         database: Database,
         metrics: ThroughputMetrics,
-        store_raw: bool,
+        tier_manager: TierManager,
     ) -> None:
         self.url = url
         self.writer = writer
         self.database = database
         self.metrics = metrics
-        self.store_raw = store_raw
+        self.tier_manager = tier_manager
         self.books: dict[str, OrderBook] = {}
         self.last_market_for_asset: dict[str, str] = {}
         self._unknown_types: set[str] = set()
+        self.last_trade_price: dict[str, Any] = {}
+        self._last_observation_at: dict[str, Any] = {}
 
     async def run(
         self,
@@ -157,6 +160,23 @@ class PolymarketMarketWebSocket:
                                 dropped += 1
                                 await self.metrics.message("polymarket")
                                 LOGGER.warning("Malformed Polymarket WebSocket JSON frame")
+                                await self.writer.put(
+                                    raw_ws_item(
+                                        exchange="polymarket",
+                                        channel="market",
+                                        connection_id=connection_id,
+                                        market_external_id=None,
+                                        outcome_external_id=None,
+                                        message_type="malformed_json",
+                                        source_timestamp=None,
+                                        exchange_timestamp=None,
+                                        received_at=received_at,
+                                        received_monotonic_ns=received_monotonic_ns,
+                                        sequence_number=None,
+                                        book_hash=None,
+                                        payload={"frame": frame},
+                                    )
+                                )
                                 continue
                             envelopes = decoded if isinstance(decoded, list) else [decoded]
                             messages += len(envelopes)
@@ -302,9 +322,8 @@ class PolymarketMarketWebSocket:
         if asset is not None and market is not None:
             self.last_market_for_asset[str(asset)] = str(market)
         exchange_timestamp = parse_timestamp(raw.get("timestamp"))
-        if self.store_raw:
-            await self.writer.put(
-                raw_ws_item(
+        await self.writer.put(
+            raw_ws_item(
                     exchange="polymarket",
                     channel="market",
                     connection_id=connection_id,
@@ -323,8 +342,8 @@ class PolymarketMarketWebSocket:
                         if raw.get("timestamp") is not None
                         else None
                     ),
-                )
             )
+        )
 
         if event_type == "book":
             parsed = parse_book(
@@ -355,7 +374,10 @@ class PolymarketMarketWebSocket:
                 book = self.books.setdefault(update.outcome_external_id or "", OrderBook())
                 if book.valid and update.size is not None:
                     book.apply_absolute(update.side, update.price, update.size)
-                await self.writer.put(book_update_item(update, connection_id))
+                self.tier_manager.record_book_update(update.market_external_id, observed_at=received_at)
+                await self.writer.put(
+                    book_update_item(update, connection_id, book=book)
+                )
             return
 
         if event_type == "last_trade_price":
@@ -365,6 +387,12 @@ class PolymarketMarketWebSocket:
                 received_monotonic_ns=received_monotonic_ns,
             )
             if parsed_trade:
+                self.last_trade_price[parsed_trade.outcome_external_id or ""] = parsed_trade.price
+                self.tier_manager.record_trade(
+                    parsed_trade.market_external_id,
+                    parsed_trade.size,
+                    observed_at=received_at,
+                )
                 await self.writer.put(trade_item(parsed_trade, connection_id))
             return
 
@@ -423,7 +451,7 @@ class PolymarketMarketWebSocket:
                         observed_at=received_at,
                     )
                     if not updated:
-                        LOGGER.info(
+                        LOGGER.debug(
                             "Polymarket lifecycle arrived before market metadata",
                             extra={"market": str(market), "event_type": event_type},
                         )
@@ -436,7 +464,13 @@ class PolymarketMarketWebSocket:
                 extra={"message_type": event_type},
             )
 
-    def market_snapshot_items(self, connection_id: int | None = None) -> list[WriteItem]:
+    def market_snapshot_items(
+        self,
+        *,
+        full_l2_interval_seconds: int,
+        sampled_interval_seconds: int,
+        connection_id: int | None = None,
+    ) -> list[WriteItem]:
         now = utc_now()
         monotonic = time.monotonic_ns()
         items: list[WriteItem] = []
@@ -446,9 +480,28 @@ class PolymarketMarketWebSocket:
             market = self.last_market_for_asset.get(asset_id)
             if not market:
                 continue
+            tier = self.tier_manager.tier_for(market)
+            if tier is CollectionTier.METADATA_ONLY:
+                continue
+            interval = (
+                full_l2_interval_seconds
+                if tier is CollectionTier.FULL_L2
+                else sampled_interval_seconds
+            )
+            previous = self._last_observation_at.get(asset_id)
+            if previous is not None and (now - previous).total_seconds() < interval:
+                continue
+            self._last_observation_at[asset_id] = now
+            recent_trades, recent_volume, recent_updates = self.tier_manager.activity_for(market)
+            midpoint = book.midpoint
+            spread_bps = (
+                book.spread / midpoint * 10_000
+                if book.spread is not None and midpoint not in {None, 0}
+                else None
+            )
             items.append(
                 WriteItem(
-                    "market_snapshots",
+                    "microstructure_observations",
                     {
                         "exchange": "polymarket",
                         "market_external_id": market,
@@ -463,15 +516,21 @@ class PolymarketMarketWebSocket:
                         "book_hash": book.book_hash,
                         "best_bid": book.best_bid,
                         "best_ask": book.best_ask,
-                        "midpoint": book.midpoint,
+                        "tier": tier.value,
+                        "midpoint": midpoint,
                         "spread": book.spread,
-                        "last_trade_price": None,
-                        "bid_depth": book.bid_depth,
-                        "ask_depth": book.ask_depth,
-                        "volume": None,
-                        "open_interest": None,
-                        "liquidity": None,
-                        "raw_data": {},
+                        "spread_bps": spread_bps,
+                        "last_trade_price": self.last_trade_price.get(asset_id),
+                        "bid_depth_top": book.bid_depth_top,
+                        "ask_depth_top": book.ask_depth_top,
+                        "bid_depth_1pct": book.bid_depth_1pct,
+                        "ask_depth_1pct": book.ask_depth_1pct,
+                        "bid_depth_total": book.bid_depth,
+                        "ask_depth_total": book.ask_depth,
+                        "book_imbalance": book.imbalance,
+                        "recent_trade_count": recent_trades,
+                        "recent_trade_volume": recent_volume,
+                        "recent_update_count": recent_updates,
                     },
                 )
             )

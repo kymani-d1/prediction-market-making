@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import uuid
 from collections.abc import Callable
@@ -37,10 +38,7 @@ def workspace_tmp_path() -> Path:
     try:
         yield path
     finally:
-        for child in path.iterdir():
-            if child.is_file():
-                child.unlink()
-        path.rmdir()
+        shutil.rmtree(path, ignore_errors=True)
         try:
             root.rmdir()
         except OSError:

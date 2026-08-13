@@ -63,11 +63,15 @@ def parse_market_candidate(raw: dict[str, Any]) -> MarketCandidate:
     # retained as an alias and in raw_data.
     external_id = str(first_present(raw, "conditionId", "condition_id", "id") or "")
     token_ids = tuple(str(value) for value in _json_list(raw.get("clobTokenIds")) if value)
-    active = _bool(raw.get("active")) and not _bool(raw.get("closed"))
+    closed = _bool(raw.get("closed"))
+    archived = _bool(raw.get("archived"))
+    accepting_orders = _bool(raw.get("acceptingOrders"), False)
+    enable_order_book = _bool(raw.get("enableOrderBook"), bool(token_ids))
+    active = _bool(raw.get("active")) and not closed and not archived
     tradable = (
         active
-        and _bool(raw.get("enableOrderBook"), bool(token_ids))
-        and _bool(raw.get("acceptingOrders"), False)
+        and enable_order_book
+        and accepting_orders
         and bool(token_ids)
     )
     return MarketCandidate(
@@ -77,6 +81,18 @@ def parse_market_candidate(raw: dict[str, Any]) -> MarketCandidate:
         status=market_status(raw),
         active=active,
         tradable=tradable,
+        closed=closed,
+        archived=archived,
+        accepting_orders=accepting_orders,
+        enable_order_book=enable_order_book,
+        has_maker_rewards=bool(
+            raw.get("clobRewards")
+            or raw.get("rewards")
+            or raw.get("rewardsMinSize") is not None
+            or raw.get("rewardsMaxSpread") is not None
+        ),
+        spread=as_decimal(raw.get("spread")),
+        close_time=parse_timestamp(first_present(raw, "endDate", "endTime")),
         volume=as_decimal(first_present(raw, "volumeNum", "volume")),
         volume_24h=as_decimal(first_present(raw, "volume24hr", "volume_24hr")),
         liquidity=as_decimal(first_present(raw, "liquidityNum", "liquidity")),

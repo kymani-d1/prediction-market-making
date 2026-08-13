@@ -17,6 +17,13 @@ class MarketCandidate:
     status: str | None
     active: bool
     tradable: bool
+    closed: bool = False
+    archived: bool = False
+    accepting_orders: bool = False
+    enable_order_book: bool = False
+    has_maker_rewards: bool = False
+    spread: Decimal | None = None
+    close_time: datetime | None = None
     volume: Decimal | None = None
     volume_24h: Decimal | None = None
     liquidity: Decimal | None = None

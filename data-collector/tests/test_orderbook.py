@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from prediction_collector.common.orderbook import OrderBook, kalshi_yes_book
+from prediction_collector.common.orderbook import OrderBook
 
 
 def test_orderbook_uses_exact_decimals_and_sorted_serialisation() -> None:
@@ -61,16 +61,6 @@ def test_mutation_without_authoritative_hash_clears_snapshot_hash() -> None:
 def test_unknown_orderbook_side_is_rejected() -> None:
     with pytest.raises(ValueError, match="unknown book side"):
         OrderBook().apply_absolute("maybe", Decimal("0.5"), Decimal("1"))
-
-
-def test_kalshi_no_bids_become_exact_yes_asks() -> None:
-    bids, asks = kalshi_yes_book(
-        [["0.42", "3.250"], ["0.40", "8.125"]],
-        [["0.45", "2.50"], ["0.40", "4"]],
-    )
-
-    assert bids == [["0.42", "3.250"], ["0.40", "8.125"]]
-    assert asks == [["0.55", "2.50"], ["0.60", "4"]]
 
 
 def test_non_positive_and_invalid_levels_do_not_enter_book() -> None:

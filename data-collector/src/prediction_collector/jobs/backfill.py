@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
-from prediction_collector.kalshi.service import KalshiService
 from prediction_collector.polymarket.service import PolymarketService
 from prediction_collector.writer import BatchWriter
-
-
-LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +21,12 @@ async def run_polymarket_backfill(
     details: dict[str, object] = {}
     try:
         details["metadata"] = await service.sync_metadata(include_closed=True)
+        if writer.tier_manager is not None:
+            assignments = writer.tier_manager.evaluate(
+                await service.database.live_candidates("polymarket")
+            )
+            await service.database.record_tier_assignments(assignments)
+            details["tiers"] = writer.tier_manager.counts()
         details["fees_incentives"] = await service.sync_fees_and_incentives(
             include_fee_rates=True,
             include_rewards=True,
@@ -35,6 +36,8 @@ async def run_polymarket_backfill(
         details["comments"] = await service.backfill_comments()
         details["market_data"] = await service.backfill_market_data()
         await writer.queue.join()
+        if writer.archive is not None:
+            await writer.archive.queue.join()
     finally:
         await writer.stop()
     details["write_failures"] = writer.failed_items
@@ -47,14 +50,15 @@ async def run_polymarket_backfill(
             or trade_details.get("history_floor_markets", 0)
         )
     )
-    fee_details = details.get("fees_incentives")
-    incomplete_fee_history = bool(
-        isinstance(fee_details, dict) and fee_details.get("errors", 0)
+    incomplete_economics = bool(
+        isinstance(details.get("fees_incentives"), dict)
+        and details["fees_incentives"].get("errors", 0)  # type: ignore[union-attr]
     )
-    comment_details = details.get("comments")
     incomplete_comments = bool(
-        isinstance(comment_details, dict) and comment_details.get("errors", 0)
+        isinstance(details.get("comments"), dict)
+        and details["comments"].get("errors", 0)  # type: ignore[union-attr]
     )
+    archive_degraded = bool(writer.archive and writer.archive.degraded)
     return BackfillResult(
         processed,
         writer.rows_written,
@@ -63,40 +67,13 @@ async def run_polymarket_backfill(
             "partial"
             if (
                 writer.failed_items
+                or archive_degraded
                 or incomplete_trade_history
-                or incomplete_fee_history
+                or incomplete_economics
                 or incomplete_comments
             )
             else "completed"
         ),
-    )
-
-
-async def run_kalshi_backfill(
-    service: KalshiService, writer: BatchWriter
-) -> BackfillResult:
-    await writer.start()
-    details: dict[str, object] = {}
-    try:
-        details["metadata"] = await service.sync_metadata(include_historical=True)
-        details["fees_incentives"] = await service.sync_fees_and_incentives()
-        details["trades"] = await service.backfill_trades()
-        details["market_data"] = await service.backfill_market_data()
-        await writer.queue.join()
-    finally:
-        await writer.stop()
-    details["write_failures"] = writer.failed_items
-    processed = _sum_numbers(details)
-    incomplete_sections = any(
-        isinstance(details.get(section), dict)
-        and bool(details[section].get("errors", 0))  # type: ignore[union-attr]
-        for section in ("fees_incentives", "market_data")
-    )
-    return BackfillResult(
-        processed,
-        writer.rows_written,
-        details,
-        "partial" if writer.failed_items or incomplete_sections else "completed",
     )
 
 

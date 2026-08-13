@@ -36,29 +36,57 @@ if TYPE_CHECKING:
 @dataclass(slots=True)
 class MetadataSyncDiagnostics:
     stale_lifecycle_states_preserved: int = 0
-    unresolved_multivariate_leg_markets: int = 0
-    unresolved_multivariate_leg_outcomes: int = 0
 
     def as_log_fields(self) -> dict[str, int]:
         return {
             "stale_lifecycle_states_preserved": (
                 self.stale_lifecycle_states_preserved
             ),
-            "unresolved_multivariate_legs": (
-                self.unresolved_multivariate_leg_markets
-                + self.unresolved_multivariate_leg_outcomes
-            ),
-            "unresolved_multivariate_leg_markets": (
-                self.unresolved_multivariate_leg_markets
-            ),
-            "unresolved_multivariate_leg_outcomes": (
-                self.unresolved_multivariate_leg_outcomes
-            ),
         }
 
 
 def _json(value: Any) -> Jsonb:
     return Jsonb(value if value is not None else {})
+
+
+def _compact_raw(value: Any, keys: Iterable[str]) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {key: value[key] for key in keys if key in value and value[key] is not None}
+
+
+def _compact_event_raw(value: Any) -> dict[str, Any]:
+    return _compact_raw(value, ("id", "ticker", "slug", "updatedAt"))
+
+
+def _compact_market_raw(value: Any) -> dict[str, Any]:
+    return _compact_raw(
+        value,
+        (
+            "id",
+            "conditionId",
+            "questionID",
+            "clobTokenIds",
+            "outcomes",
+            "negRisk",
+            "negativeRisk",
+            "marketGroup",
+            "groupItemTitle",
+            "groupItemThreshold",
+            "rewardsMinSize",
+            "rewardsMaxSpread",
+            "feesEnabled",
+            "feeSchedule",
+            "makerBaseFee",
+            "takerBaseFee",
+            "active",
+            "closed",
+            "archived",
+            "acceptingOrders",
+            "enableOrderBook",
+            "updatedAt",
+        ),
+    )
 
 
 def _market_metadata_digest(value: Mapping[str, Any]) -> str:
@@ -72,7 +100,6 @@ def _market_metadata_digest(value: Mapping[str, Any]) -> str:
         "negative_risk",
         "negRisk",
         "negRiskAugmented",
-        "is_provisional",
         "feeSchedule",
         "fee_schedule",
         "feesEnabled",
@@ -83,8 +110,8 @@ def _market_metadata_digest(value: Mapping[str, Any]) -> str:
         "rewards_max_spread",
         "price_level_structure",
         "price_ranges",
-        "mve_collection_ticker",
-        "mve_selected_legs",
+        "marketGroup",
+        "groupItemTitle",
     )
     return content_hash(
         {
@@ -100,6 +127,7 @@ def _market_metadata_digest(value: Mapping[str, Any]) -> str:
                     "rules",
                     "resolution_source",
                     "status",
+                    "archived",
                     "market_type",
                     "is_active",
                     "is_tradable",
@@ -468,7 +496,7 @@ class Database:
                         value["title"],
                         value.get("category"),
                         value.get("frequency"),
-                        _json(value.get("raw_data")),
+                        _json(_compact_raw(value.get("raw_data"), ("id", "ticker", "slug"))),
                     ),
                 )
             ).fetchone()
@@ -528,7 +556,7 @@ class Database:
                         value.get("updated_time"),
                         value.get("rules"),
                         value.get("resolution_source"),
-                        _json(value.get("raw_data")),
+                        _json(_compact_event_raw(value.get("raw_data"))),
                         value.get("status") is not None,
                     ),
                 )
@@ -574,7 +602,7 @@ class Database:
                         value.get("description"),
                         value.get("status"),
                         _json(value.get("constraint_definition")),
-                        _json(value.get("raw_data")),
+                        _json({}),
                     ),
                 )
             ).fetchone()
@@ -713,12 +741,16 @@ class Database:
                             value.get("fee_rate"),
                             _json(value.get("price_level_structure")) if value.get("price_level_structure") else None,
                             _json(value.get("structural_metadata")),
-                            _json(raw),
+                            _json(_compact_market_raw(raw)),
                         ),
                     )
                 ).fetchone()
                 assert row is not None
                 market_id = int(row["id"])
+                await connection.execute(
+                    "UPDATE markets SET archived = %s WHERE id = %s",
+                    (bool(value.get("archived", raw.get("archived"))), market_id),
+                )
                 history_rows = await self._record_market_metadata_history(
                     connection,
                     market_id=market_id,
@@ -868,7 +900,8 @@ class Database:
                     "observed_at": observed_at,
                     "raw_data": {
                         **current_raw,
-                        "_latest_lifecycle_event": dict(lifecycle_payload),
+                        "latest_lifecycle_type": lifecycle_payload.get("event_type")
+                        or lifecycle_payload.get("type"),
                     },
                 }
                 merged_updates = dict(updates)
@@ -919,7 +952,7 @@ class Database:
                         if value.get("price_level_structure")
                         else None,
                         _json(value.get("structural_metadata")),
-                        _json(value["raw_data"]),
+                        _json(_compact_market_raw(value["raw_data"])),
                         row["id"],
                     ),
                 )
@@ -1018,7 +1051,7 @@ class Database:
                     if value.get("price_level_structure")
                     else None,
                     _json(value.get("structural_metadata")),
-                    _json(raw),
+                    _json({}),
                     market_id,
                 ),
             )
@@ -1177,7 +1210,7 @@ class Database:
                         observed_at,
                         digest,
                         _json(schedule),
-                        _json(fee_payload),
+                        _json({"source": "market_metadata"}),
                     ),
                 )
 
@@ -1252,7 +1285,7 @@ class Database:
                         observed_at,
                         digest,
                         _json(reward_settings),
-                        _json(raw),
+                        _json({"source": "market_metadata"}),
                     ),
                 )
 
@@ -1262,9 +1295,6 @@ class Database:
         if value.get("negative_risk") and event_external_id:
             group_external_id = f"negative-risk:{event_external_id}"
             group_type = "negative_risk"
-        elif raw.get("mve_collection_ticker"):
-            group_external_id = f"mve:{raw['mve_collection_ticker']}"
-            group_type = "multivariate"
         elif raw.get("marketGroup"):
             group_external_id = f"market-group:{raw['marketGroup']}"
             group_type = "exchange_group"
@@ -1279,35 +1309,9 @@ class Database:
                 """,
                 (observed_at, market_id),
             )
-        if group_type != "multivariate":
-            await connection.execute(
-                """
-                UPDATE market_group_members
-                SET valid_to = GREATEST(%s, valid_from + INTERVAL '1 microsecond')
-                WHERE source_market_id = %s AND member_role = 'selected_leg'
-                  AND valid_to IS NULL
-                """,
-                (observed_at, market_id),
-            )
-            await connection.execute(
-                """
-                UPDATE market_relationships
-                SET valid_to = GREATEST(%s, valid_from + INTERVAL '1 microsecond')
-                WHERE exchange = %s AND from_market_id = %s
-                  AND relationship_type = 'multivariate_leg'
-                  AND valid_to IS NULL
-                """,
-                (observed_at, exchange, market_id),
-            )
         if group_external_id and group_type:
-            group_event_external_id = (
-                None if group_type == "multivariate" else event_external_id
-            )
-            group_name = (
-                raw.get("mve_collection_ticker")
-                if group_type == "multivariate"
-                else raw.get("marketGroup") or event_external_id
-            )
+            group_event_external_id = event_external_id
+            group_name = raw.get("marketGroup") or event_external_id
             group_row = await (
                 await connection.execute(
                     """
@@ -1336,10 +1340,9 @@ class Database:
                         _json(
                             {
                                 "negRiskOther": raw.get("negRiskOther"),
-                                "mve_selected_legs": raw.get("mve_selected_legs"),
                             }
                         ),
-                        _json(raw),
+                        _json({}),
                     ),
                 )
             ).fetchone()
@@ -1372,256 +1375,12 @@ class Database:
                         market_id,
                         membership_role,
                         observed_at,
-                        _json(raw),
+                        _json({}),
                         group_row["id"],
                         market_id,
                         membership_role,
                     ),
                 )
-                if raw.get("mve_collection_ticker"):
-                    await self._record_multivariate_legs(
-                        connection,
-                        group_id=int(group_row["id"]),
-                        market_id=market_id,
-                        market_external_id=external_id,
-                        exchange=exchange,
-                        observed_at=observed_at,
-                        raw=raw,
-                        diagnostics=diagnostics,
-                    )
-
-    async def _record_multivariate_legs(
-        self,
-        connection: Any,
-        *,
-        group_id: int,
-        market_id: int,
-        market_external_id: str,
-        exchange: str,
-        observed_at: datetime,
-        raw: Mapping[str, Any],
-        diagnostics: MetadataSyncDiagnostics | None = None,
-    ) -> None:
-        legs = raw.get("mve_selected_legs")
-        if not isinstance(legs, list):
-            return
-        resolved: list[tuple[int, int | None, dict[str, Any], dict[str, Any]]] = []
-        complete = True
-        for position, leg in enumerate(legs):
-            if not isinstance(leg, Mapping):
-                complete = False
-                LOGGER.warning(
-                    "Skipping malformed Kalshi multivariate leg",
-                    extra={"market": market_external_id, "position": position},
-                )
-                continue
-            leg_ticker = str(leg.get("market_ticker") or "")
-            if not leg_ticker:
-                complete = False
-                LOGGER.warning(
-                    "Skipping Kalshi multivariate leg without market_ticker",
-                    extra={"market": market_external_id, "position": position},
-                )
-                continue
-            side = str(leg.get("side") or "").lower()
-            outcome_external_id = (
-                f"{leg_ticker}:{side}" if side in {"yes", "no"} else None
-            )
-            target = await (
-                await connection.execute(
-                    """
-                    SELECT m.id AS market_id, o.id AS outcome_id
-                    FROM markets m
-                    LEFT JOIN outcomes o
-                      ON o.market_id = m.id AND o.external_id = %s
-                    WHERE m.exchange = %s AND m.external_id = %s
-                    LIMIT 1
-                    """,
-                    (outcome_external_id, exchange, leg_ticker),
-                )
-            ).fetchone()
-            if target is None:
-                complete = False
-                if diagnostics is not None:
-                    diagnostics.unresolved_multivariate_leg_markets += 1
-                LOGGER.debug(
-                    "Kalshi multivariate leg market is not available yet",
-                    extra={
-                        "market": market_external_id,
-                        "leg_market": leg_ticker,
-                        "position": position,
-                    },
-                )
-                continue
-            target_market_id = int(target["market_id"])
-            if target_market_id == market_id:
-                complete = False
-                LOGGER.warning(
-                    "Skipping self-referential Kalshi multivariate leg",
-                    extra={"market": market_external_id, "position": position},
-                )
-                continue
-            target_outcome_id = (
-                int(target["outcome_id"])
-                if target.get("outcome_id") is not None
-                else None
-            )
-            if outcome_external_id and target_outcome_id is None:
-                complete = False
-                if diagnostics is not None:
-                    diagnostics.unresolved_multivariate_leg_outcomes += 1
-                LOGGER.debug(
-                    "Kalshi multivariate leg outcome is not available yet",
-                    extra={
-                        "market": market_external_id,
-                        "leg_market": leg_ticker,
-                        "leg_outcome": outcome_external_id,
-                        "position": position,
-                    },
-                )
-                continue
-            constraint = {
-                "position": position,
-                "collection_ticker": raw.get("mve_collection_ticker"),
-                "event_ticker": leg.get("event_ticker"),
-                "market_ticker": leg_ticker,
-                "side": side or None,
-                "yes_settlement_value_dollars": leg.get(
-                    "yes_settlement_value_dollars"
-                ),
-            }
-            resolved.append(
-                (target_market_id, target_outcome_id, constraint, dict(leg))
-            )
-
-        for target_market_id, target_outcome_id, constraint, leg in resolved:
-            await connection.execute(
-                """
-                INSERT INTO market_group_members
-                    (group_id, source_market_id, market_id, outcome_id,
-                     member_role, valid_from, raw_data)
-                SELECT %s, %s, %s, %s, 'selected_leg', %s, %s
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM market_group_members
-                    WHERE group_id = %s AND source_market_id = %s
-                      AND market_id = %s AND outcome_id IS NOT DISTINCT FROM %s
-                      AND member_role = 'selected_leg' AND valid_to IS NULL
-                )
-                """,
-                (
-                    group_id,
-                    market_id,
-                    target_market_id,
-                    target_outcome_id,
-                    observed_at,
-                    _json(leg),
-                    group_id,
-                    market_id,
-                    target_market_id,
-                    target_outcome_id,
-                ),
-            )
-            await connection.execute(
-                """
-                INSERT INTO market_relationships
-                    (exchange, from_market_id, to_market_id, to_outcome_id,
-                     relationship_type, is_directional, valid_from,
-                     constraint_definition, raw_data)
-                SELECT %s, %s, %s, %s, 'multivariate_leg', TRUE, %s, %s, %s
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM market_relationships
-                    WHERE exchange = %s AND from_market_id = %s
-                      AND from_outcome_id IS NULL AND to_market_id = %s
-                      AND to_outcome_id IS NOT DISTINCT FROM %s
-                      AND relationship_type = 'multivariate_leg'
-                      AND constraint_definition = %s AND valid_to IS NULL
-                )
-                """,
-                (
-                    exchange,
-                    market_id,
-                    target_market_id,
-                    target_outcome_id,
-                    observed_at,
-                    _json(constraint),
-                    _json(leg),
-                    exchange,
-                    market_id,
-                    target_market_id,
-                    target_outcome_id,
-                    _json(constraint),
-                ),
-            )
-
-        # Do not retire prior links when the authoritative payload could not be
-        # fully resolved yet; metadata ordering can temporarily hide a leg.
-        if not complete:
-            return
-        desired_members = {
-            (target_market_id, target_outcome_id)
-            for target_market_id, target_outcome_id, _, _ in resolved
-        }
-        member_rows = await (
-            await connection.execute(
-                """
-                SELECT id, market_id, outcome_id, valid_from
-                FROM market_group_members
-                WHERE group_id = %s AND source_market_id = %s
-                  AND member_role = 'selected_leg' AND valid_to IS NULL
-                FOR UPDATE
-                """,
-                (group_id, market_id),
-            )
-        ).fetchall()
-        for member in member_rows:
-            identity = (int(member["market_id"]), member.get("outcome_id"))
-            if identity in desired_members:
-                continue
-            close_at = max(
-                observed_at,
-                member["valid_from"] + timedelta(microseconds=1),
-            )
-            await connection.execute(
-                "UPDATE market_group_members SET valid_to = %s WHERE id = %s",
-                (close_at, member["id"]),
-            )
-
-        desired_relationships = {
-            (target_market_id, target_outcome_id, content_hash(constraint))
-            for target_market_id, target_outcome_id, constraint, _ in resolved
-        }
-        relationship_rows = await (
-            await connection.execute(
-                """
-                SELECT id, to_market_id, to_outcome_id, constraint_definition,
-                       valid_from
-                FROM market_relationships
-                WHERE exchange = %s AND from_market_id = %s
-                  AND relationship_type = 'multivariate_leg'
-                  AND valid_to IS NULL
-                FOR UPDATE
-                """,
-                (exchange, market_id),
-            )
-        ).fetchall()
-        for relationship in relationship_rows:
-            definition = relationship.get("constraint_definition")
-            definition = definition if isinstance(definition, Mapping) else {}
-            identity = (
-                int(relationship["to_market_id"]),
-                relationship.get("to_outcome_id"),
-                content_hash(definition),
-            )
-            if identity in desired_relationships:
-                continue
-            close_at = max(
-                observed_at,
-                relationship["valid_from"] + timedelta(microseconds=1),
-            )
-            await connection.execute(
-                "UPDATE market_relationships SET valid_to = %s WHERE id = %s",
-                (close_at, relationship["id"]),
-            )
 
     async def record_fee_configuration(
         self,
@@ -1803,7 +1562,7 @@ class Database:
                                 source_timestamp,
                                 digest,
                                 _json(configuration),
-                                _json(configuration),
+                                _json({}),
                             ),
                         )
                     elif exact is not None:
@@ -2016,7 +1775,7 @@ class Database:
                                 source_timestamp,
                                 digest,
                                 _json(configuration),
-                                _json(configuration),
+                                _json({}),
                             ),
                         )
                     elif exact is not None:
@@ -2068,7 +1827,12 @@ class Database:
                         value["name"],
                         value.get("outcome_index"),
                         value.get("last_price"),
-                        _json(value.get("raw_data")),
+                        _json(
+                            _compact_raw(
+                                value.get("raw_data"),
+                                ("name", "token_id", "outcome_index"),
+                            )
+                        ),
                     ),
                 )
             ).fetchone()
@@ -2091,57 +1855,18 @@ class Database:
                         updated_at = clock_timestamp()
                     RETURNING id
                     """,
-                    (exchange, str(external_id) if external_id is not None else None, name, raw.get("slug"), _json(raw)),
+                    (
+                        exchange,
+                        str(external_id) if external_id is not None else None,
+                        name,
+                        raw.get("slug"),
+                        _json(_compact_raw(raw, ("id", "label", "name", "slug"))),
+                    ),
                 )
             ).fetchone()
         assert row is not None
         await self.metrics.rows("tags")
         return int(row["id"])
-
-    async def store_raw_rest(
-        self,
-        *,
-        exchange: str,
-        source: str,
-        endpoint: str,
-        requested_at: datetime,
-        received_at: datetime,
-        response_timestamp: datetime | None,
-        http_status: int,
-        payload: Any,
-        parameters: Mapping[str, Any] | None = None,
-        entity_type: str | None = None,
-        external_key: str | None = None,
-    ) -> bool:
-        digest = content_hash(payload)
-        async with self.pool.connection() as connection:
-            cursor = await connection.execute(
-                """
-                INSERT INTO raw_rest_payloads
-                    (exchange, source, endpoint, entity_type, external_key, requested_at,
-                     received_at, response_timestamp, parameters, http_status, content_hash, payload)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT ON CONSTRAINT raw_rest_payloads_version_key DO NOTHING
-                """,
-                (
-                    exchange,
-                    source,
-                    endpoint,
-                    entity_type,
-                    external_key,
-                    requested_at,
-                    received_at,
-                    response_timestamp,
-                    _json(dict(parameters or {})),
-                    http_status,
-                    digest,
-                    _json(payload),
-                ),
-            )
-            inserted = cursor.rowcount > 0
-        if inserted:
-            await self.metrics.rows("raw_rest_payloads")
-        return inserted
 
     async def checkpoint(
         self,
@@ -2188,7 +1913,9 @@ class Database:
         where = "" if exchange is None else "WHERE m.exchange = %s"
         query = f"""
             SELECT m.exchange, m.external_id, m.ticker, m.status, m.is_active,
-                   m.is_tradable, m.volume, m.volume_24h, m.liquidity, m.raw_data,
+                   m.is_tradable, m.archived, m.accepting_orders,
+                   m.enable_order_book, m.close_time,
+                   m.volume, m.volume_24h, m.liquidity, m.raw_data,
                    COALESCE(array_agg(o.token_id) FILTER (WHERE o.token_id IS NOT NULL), ARRAY[]::TEXT[]) AS token_ids
             FROM markets m
             LEFT JOIN outcomes o ON o.market_id = m.id
@@ -2206,14 +1933,49 @@ class Database:
                 status=row["status"],
                 active=row["is_active"],
                 tradable=row["is_tradable"],
+                closed=str(row["status"] or "").lower() in {
+                    "closed", "resolved", "settled", "finalized"
+                },
+                archived=bool(row["archived"]),
+                accepting_orders=bool(row["accepting_orders"]),
+                enable_order_book=bool(row["enable_order_book"]),
                 volume=row["volume"],
                 volume_24h=row["volume_24h"],
                 liquidity=row["liquidity"],
+                has_maker_rewards=bool(
+                    isinstance(row["raw_data"], Mapping)
+                    and (
+                        row["raw_data"].get("rewardsMinSize") is not None
+                        or row["raw_data"].get("rewardsMaxSpread") is not None
+                    )
+                ),
+                close_time=row["close_time"],
                 outcome_token_ids=tuple(row["token_ids"]),
                 raw_data=row["raw_data"],
             )
             for row in rows
         ]
+
+    async def collection_tier_market_ids(
+        self, tiers: Iterable[str]
+    ) -> set[str]:
+        values = list(dict.fromkeys(tiers))
+        if not values:
+            return set()
+        async with self.pool.connection() as connection:
+            rows = await (
+                await connection.execute(
+                    """
+                    SELECT m.external_id
+                    FROM market_collection_tiers tier
+                    JOIN markets m ON m.id = tier.market_id
+                    WHERE m.exchange = 'polymarket'
+                      AND tier.tier = ANY(%s::TEXT[])
+                    """,
+                    (values,),
+                )
+            ).fetchall()
+        return {str(row["external_id"]) for row in rows}
 
     async def create_connection(
         self,
@@ -2579,71 +2341,72 @@ class Database:
         reasons: Mapping[tuple[str, str], str],
     ) -> None:
         config = {
-            "max_live_markets": self.settings.max_live_markets,
-            "min_live_market_volume": str(self.settings.min_live_market_volume),
-            "min_live_market_liquidity": str(self.settings.min_live_market_liquidity),
-            "allowlist": sorted(self.settings.live_market_allowlist),
+            "full_l2_max_markets": self.settings.full_l2_max_markets,
+            "sampled_max_markets": self.settings.sampled_max_markets,
+            "full_l2_min_score": str(self.settings.full_l2_min_score),
+            "full_l2_min_liquidity": str(self.settings.full_l2_min_liquidity),
+            "full_l2_allowlist": sorted(self.settings.full_l2_market_allowlist),
             "blocklist": sorted(self.settings.live_market_blocklist),
         }
         market_list = list(markets)
-        eligible = {
-            (market.exchange, market.external_id)
+        payload = [
+            {
+                "external_id": market.external_id,
+                "is_active": market.active,
+                "is_tradable": market.tradable,
+                "is_subscribed": (market.exchange, market.external_id) in subscribed_ids,
+                "exclusion_reason": reasons.get((market.exchange, market.external_id)),
+                "observed_volume": str(market.volume) if market.volume is not None else None,
+                "observed_liquidity": (
+                    str(market.liquidity) if market.liquidity is not None else None
+                ),
+            }
             for market in market_list
-            if market.active
-            and market.tradable
-            and reasons.get((market.exchange, market.external_id))
-            in {None, "max_live_markets_cap"}
-        }
-        ranked = sorted(
-            (market for market in market_list if (market.exchange, market.external_id) in eligible),
-            key=lambda market: (
-                -(market.liquidity or Decimal("0")),
-                -(market.volume_24h or Decimal("0")),
-                -(market.volume or Decimal("0")),
-                market.exchange,
-                market.external_id,
-            ),
-        )
-        rank_positions = {
-            (market.exchange, market.external_id): position
-            for position, market in enumerate(ranked, 1)
-        }
-        inserted = 0
+        ]
         async with self.pool.connection() as connection:
-            async with connection.transaction():
-                for market in market_list:
-                    key = (market.exchange, market.external_id)
-                    subscribed = key in subscribed_ids
-                    cursor = await connection.execute(
-                        """
-                        INSERT INTO live_market_subscription_decisions
-                            (collector_run_id, exchange, market_id, market_external_id,
-                             is_active, is_tradable, is_eligible, is_subscribed,
-                             exclusion_reason, ranking_position, observed_volume,
-                             observed_liquidity, config_snapshot)
-                        VALUES
-                            (%s, %s,
-                             (SELECT id FROM markets WHERE exchange = %s AND external_id = %s),
-                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            run_id,
-                            market.exchange,
-                            market.exchange,
-                            market.external_id,
-                            market.external_id,
-                            market.active,
-                            market.tradable,
-                            key in eligible,
-                            subscribed,
-                            reasons.get(key),
-                            rank_positions.get(key),
-                            market.volume,
-                            market.liquidity,
-                            _json(config),
-                        ),
+            cursor = await connection.execute(
+                """
+                WITH input AS (
+                    SELECT *
+                    FROM jsonb_to_recordset(%s::JSONB) AS x(
+                        external_id TEXT, is_active BOOLEAN, is_tradable BOOLEAN,
+                        is_subscribed BOOLEAN, exclusion_reason TEXT,
+                        observed_volume NUMERIC, observed_liquidity NUMERIC
                     )
-                    inserted += max(int(cursor.rowcount or 0), 0)
+                ), resolved AS (
+                    SELECT i.*, m.id AS market_id, t.tier, t.score,
+                           t.tier IN ('full_l2', 'sampled') AS is_eligible
+                    FROM input i
+                    JOIN markets m
+                      ON m.exchange = 'polymarket' AND m.external_id = i.external_id
+                    LEFT JOIN market_collection_tiers t ON t.market_id = m.id
+                ), ranked AS (
+                    SELECT r.*,
+                           CASE WHEN is_eligible THEN row_number() OVER (
+                               PARTITION BY is_eligible
+                               ORDER BY score DESC NULLS LAST, external_id
+                           ) END AS ranking_position
+                    FROM resolved r
+                )
+                INSERT INTO live_market_subscription_decisions
+                    (collector_run_id, exchange, market_id, market_external_id,
+                     is_active, is_tradable, is_eligible, is_subscribed,
+                     exclusion_reason, ranking_criterion, ranking_position,
+                     observed_volume, observed_liquidity, config_snapshot, details)
+                SELECT %s, 'polymarket', market_id, external_id, is_active,
+                       is_tradable, COALESCE(is_eligible, FALSE), is_subscribed,
+                       exclusion_reason, 'tier_score_desc_external_id_asc',
+                       ranking_position, observed_volume, observed_liquidity,
+                       %s, jsonb_build_object('tier', tier, 'score', score)
+                FROM ranked
+                """,
+                (
+                    _json(json.loads(canonical_json(payload))),
+                    run_id,
+                    _json(config),
+                ),
+            )
+            inserted = max(int(cursor.rowcount or 0), 0)
         if inserted:
             await self.metrics.rows("live_market_subscription_decisions", inserted)
 
@@ -2780,6 +2543,377 @@ class Database:
         cursor = await connection.execute(query, params)
         return max(cursor.rowcount, 0)
 
+    async def record_tier_assignments(self, assignments: Iterable[Any]) -> int:
+        values = list(assignments)
+        if not values:
+            return 0
+        now = utc_now()
+        payload = [
+            {
+                "external_id": item.market.external_id,
+                "tier": item.tier.value,
+                "score": str(item.score),
+                "reason_codes": list(item.reasons),
+                "ceiling_binding": item.ceiling_binding,
+            }
+            for item in values
+        ]
+        encoded = _json(json.loads(canonical_json(payload)))
+        async with self.pool.connection() as connection:
+            async with connection.transaction():
+                changed_row = await (
+                    await connection.execute(
+                        """
+                        WITH input AS (
+                            SELECT * FROM jsonb_to_recordset(%s::JSONB) AS x(
+                                external_id TEXT, tier TEXT, score NUMERIC,
+                                reason_codes TEXT[], ceiling_binding BOOLEAN
+                            )
+                        )
+                        INSERT INTO market_collection_tier_history
+                            (market_id, previous_tier, tier, score, reason_codes,
+                             ceiling_binding, evaluated_at)
+                        SELECT m.id, t.tier, i.tier, i.score, i.reason_codes,
+                               i.ceiling_binding, %s
+                        FROM input i
+                        JOIN markets m
+                          ON m.exchange = 'polymarket' AND m.external_id = i.external_id
+                        LEFT JOIN market_collection_tiers t ON t.market_id = m.id
+                        WHERE t.tier IS DISTINCT FROM i.tier
+                        ON CONFLICT DO NOTHING
+                        RETURNING id
+                        """,
+                        (encoded, now),
+                    )
+                ).fetchall()
+                await connection.execute(
+                    """
+                    WITH input AS (
+                        SELECT * FROM jsonb_to_recordset(%s::JSONB) AS x(
+                            external_id TEXT, tier TEXT, score NUMERIC,
+                            reason_codes TEXT[], ceiling_binding BOOLEAN
+                        )
+                    )
+                    INSERT INTO market_collection_tiers
+                        (market_id, tier, score, reason_codes, signals,
+                         ceiling_binding, first_assigned_at, evaluated_at,
+                         promoted_at, demoted_at)
+                    SELECT m.id, i.tier, i.score, i.reason_codes,
+                           jsonb_build_object('policy_reasons', i.reason_codes),
+                           i.ceiling_binding, %s, %s,
+                           CASE WHEN i.tier = 'full_l2' THEN %s END,
+                           NULL
+                    FROM input i
+                    JOIN markets m
+                      ON m.exchange = 'polymarket' AND m.external_id = i.external_id
+                    ON CONFLICT (market_id) DO UPDATE SET
+                        tier = EXCLUDED.tier,
+                        score = EXCLUDED.score,
+                        reason_codes = EXCLUDED.reason_codes,
+                        signals = EXCLUDED.signals,
+                        ceiling_binding = EXCLUDED.ceiling_binding,
+                        evaluated_at = EXCLUDED.evaluated_at,
+                        promoted_at = CASE
+                            WHEN EXCLUDED.tier = 'full_l2'
+                             AND market_collection_tiers.tier <> 'full_l2'
+                            THEN EXCLUDED.evaluated_at
+                            ELSE market_collection_tiers.promoted_at END,
+                        demoted_at = CASE
+                            WHEN EXCLUDED.tier <> 'full_l2'
+                             AND market_collection_tiers.tier = 'full_l2'
+                            THEN EXCLUDED.evaluated_at
+                            ELSE market_collection_tiers.demoted_at END,
+                        updated_at = clock_timestamp()
+                    """,
+                    (encoded, now, now, now),
+                )
+        changed = len(changed_row)
+        if changed:
+            await self.metrics.rows("market_collection_tier_history", changed)
+        await self.metrics.rows("market_collection_tiers", len(values))
+        return changed
+
+    async def register_archive_object(self, **value: Any) -> int:
+        async with self.pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    INSERT INTO archive_objects
+                        (stream, schema_version, object_key, content_hash, compression,
+                         row_count, uncompressed_bytes, compressed_bytes,
+                         min_source_timestamp, max_source_timestamp,
+                         min_received_at, max_received_at, partition_date,
+                         partition_hour, status, local_spool_path)
+                    VALUES
+                        (%(stream)s, %(schema_version)s, %(object_key)s,
+                         %(content_hash)s, %(compression)s, %(row_count)s,
+                         %(uncompressed_bytes)s, %(compressed_bytes)s,
+                         %(min_source_timestamp)s, %(max_source_timestamp)s,
+                         %(min_received_at)s, %(max_received_at)s,
+                         %(partition_date)s, %(partition_hour)s, 'prepared',
+                         %(local_spool_path)s)
+                    ON CONFLICT (content_hash) DO UPDATE SET
+                        local_spool_path = COALESCE(
+                            archive_objects.local_spool_path,
+                            EXCLUDED.local_spool_path
+                        ),
+                        updated_at = clock_timestamp()
+                    RETURNING id
+                    """,
+                    value,
+                )
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    async def mark_archive_upload_attempt(self, object_id: int, attempt: int) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_objects
+                SET status = 'uploading', upload_attempts = GREATEST(upload_attempts, %s),
+                    updated_at = clock_timestamp()
+                WHERE id = %s AND status <> 'uploaded'
+                """,
+                (attempt, object_id),
+            )
+
+    async def mark_archive_uploaded(self, object_id: int) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_objects
+                SET status = 'uploaded', uploaded_at = COALESCE(uploaded_at, clock_timestamp()),
+                    local_spool_path = NULL, last_error = NULL,
+                    updated_at = clock_timestamp()
+                WHERE id = %s
+                """,
+                (object_id,),
+            )
+
+    async def mark_archive_retrying(self, object_id: int, error: str) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_objects SET status = 'retrying', last_error = %s,
+                    updated_at = clock_timestamp() WHERE id = %s AND status <> 'uploaded'
+                """,
+                (error[:8000], object_id),
+            )
+
+    async def mark_archive_failed(self, object_id: int, error: str) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_objects SET status = 'failed', last_error = %s,
+                    updated_at = clock_timestamp() WHERE id = %s
+                """,
+                (error[:8000], object_id),
+            )
+
+    async def archive_object_counts(self, object_id: int) -> Mapping[str, Any]:
+        async with self.pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    SELECT row_count, uncompressed_bytes, compressed_bytes
+                    FROM archive_objects WHERE id = %s
+                    """,
+                    (object_id,),
+                )
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"archive object {object_id} disappeared")
+        return row
+
+    async def pending_archive_objects(self, *, limit: int) -> list[Mapping[str, Any]]:
+        async with self.pool.connection() as connection:
+            rows = await (
+                await connection.execute(
+                    """
+                    SELECT id, object_key, content_hash, local_spool_path
+                    FROM archive_objects
+                    WHERE status IN ('prepared', 'retrying', 'failed')
+                      AND local_spool_path IS NOT NULL
+                    ORDER BY created_at LIMIT %s
+                    """,
+                    (limit,),
+                )
+            ).fetchall()
+        return list(rows)
+
+    async def record_raw_rest_provenance(
+        self, *, archive_object_id: int, object_key: str, value: Mapping[str, Any]
+    ) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                INSERT INTO raw_rest_payloads
+                    (source, endpoint, entity_type, external_key, requested_at,
+                     received_at, response_timestamp, response_timestamp_raw,
+                     parameters, http_status, content_hash, response_bytes,
+                     record_count, archive_object_id, object_key)
+                VALUES
+                    (%(source)s, %(endpoint)s, %(entity_type)s, %(external_key)s,
+                     %(requested_at)s, %(received_at)s, %(response_timestamp)s,
+                     %(response_timestamp_raw)s, %(parameters)s, %(http_status)s,
+                     %(content_hash)s, %(response_bytes)s, %(record_count)s,
+                     %(archive_object_id)s, %(object_key)s)
+                ON CONFLICT ON CONSTRAINT raw_rest_payloads_compact_key DO NOTHING
+                """,
+                {
+                    **value,
+                    "parameters": _json(value.get("parameters")),
+                    "archive_object_id": archive_object_id,
+                    "object_key": object_key,
+                },
+            )
+
+    async def record_archive_degradation(
+        self,
+        *,
+        run_id: int | None,
+        stream: str,
+        priority: int,
+        reason: str,
+        rows_affected: int,
+        bytes_affected: int,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                INSERT INTO archive_degradation_events
+                    (collector_run_id, stream, priority, reason, rows_affected,
+                     bytes_affected, details)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    run_id,
+                    stream,
+                    priority,
+                    reason,
+                    rows_affected,
+                    bytes_affected,
+                    _json(dict(details or {})),
+                ),
+            )
+
+    async def storage_snapshot(self) -> dict[str, Any]:
+        async with self.pool.connection() as connection:
+            database_row = await (
+                await connection.execute("SELECT pg_database_size(current_database()) AS bytes")
+            ).fetchone()
+            table_rows = await (
+                await connection.execute(
+                    """
+                    SELECT relname, pg_total_relation_size(relid) AS bytes
+                    FROM pg_catalog.pg_statio_user_tables
+                    ORDER BY bytes DESC LIMIT 15
+                    """
+                )
+            ).fetchall()
+            previous = await (
+                await connection.execute(
+                    """
+                    SELECT observed_at, postgres_database_bytes,
+                           archive_compressed_bytes
+                    FROM storage_metrics ORDER BY observed_at DESC LIMIT 1
+                    """
+                )
+            ).fetchone()
+        return {
+            "observed_at": utc_now(),
+            "postgres_database_bytes": int(database_row["bytes"] if database_row else 0),
+            "major_table_bytes": {
+                str(row["relname"]): int(row["bytes"]) for row in table_rows
+            },
+            "previous": dict(previous) if previous else None,
+        }
+
+    async def record_storage_metrics(
+        self,
+        *,
+        run_id: int | None,
+        postgres: Mapping[str, Any],
+        archive: Mapping[str, Any],
+        pressure_state: str,
+    ) -> None:
+        observed_at = postgres["observed_at"]
+        previous = postgres.get("previous") or {}
+        elapsed_hours = max(
+            (observed_at - previous.get("observed_at")).total_seconds() / 3600,
+            1 / 3600,
+        ) if previous.get("observed_at") else None
+        postgres_growth = (
+            (postgres["postgres_database_bytes"] - previous["postgres_database_bytes"])
+            / elapsed_hours
+            if elapsed_hours
+            else None
+        )
+        archive_growth = (
+            (archive.get("compressed_bytes_uploaded", 0)
+             - int(previous.get("archive_compressed_bytes") or 0)) / elapsed_hours
+            if elapsed_hours
+            else None
+        )
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                INSERT INTO storage_metrics
+                    (collector_run_id, observed_at, postgres_database_bytes,
+                     postgres_growth_bytes_per_hour, major_table_bytes,
+                     archive_queue_rows, archive_queue_bytes,
+                     archive_oldest_queued_age_seconds, archive_objects_uploaded,
+                     archive_rows_uploaded, archive_uncompressed_bytes,
+                     archive_compressed_bytes, archive_upload_failures,
+                     archive_growth_bytes_per_hour, spool_bytes, pressure_state, details)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s)
+                """,
+                (
+                    run_id,
+                    observed_at,
+                    postgres["postgres_database_bytes"],
+                    postgres_growth,
+                    _json(postgres["major_table_bytes"]),
+                    archive.get("queue_depth", 0),
+                    archive.get("queue_bytes", 0),
+                    archive.get("oldest_queued_seconds"),
+                    archive.get("objects_uploaded", 0),
+                    archive.get("rows_uploaded", 0),
+                    archive.get("uncompressed_bytes_uploaded", 0),
+                    archive.get("compressed_bytes_uploaded", 0),
+                    archive.get("upload_failures", 0),
+                    archive_growth,
+                    archive.get("spool_bytes", 0),
+                    pressure_state,
+                    _json({"archive_healthy": archive.get("healthy", False)}),
+                ),
+            )
+
+    async def apply_retention(self) -> dict[str, int]:
+        deleted: dict[str, int] = {}
+        async with self.pool.connection() as connection:
+            for table, column, interval in (
+                (
+                    "reference_price_updates",
+                    "received_at",
+                    f"{self.settings.postgres_reference_retention_hours} hours",
+                ),
+                (
+                    "microstructure_observations",
+                    "observed_at",
+                    f"{self.settings.postgres_observation_retention_hours} hours",
+                ),
+            ):
+                cursor = await connection.execute(
+                    f"DELETE FROM {table} WHERE {column} < clock_timestamp() - %s::INTERVAL",
+                    (interval,),
+                )
+                deleted[table] = max(int(cursor.rowcount or 0), 0)
+        return deleted
+
     async def status(
         self, *, migration_status: Mapping[str, object] | None = None
     ) -> dict[str, Any]:
@@ -2789,30 +2923,44 @@ class Database:
             "markets",
             "outcomes",
             "trades",
-            "orderbook_snapshots",
-            "orderbook_updates",
-            "market_snapshots",
-            "raw_ws_messages",
+            "current_orderbooks",
+            "current_orderbook_levels",
+            "microstructure_observations",
             "reference_price_updates",
+            "sports_feed_updates",
+            "raw_rest_payloads",
+            "archive_objects",
             "data_gaps",
+            "archive_degradation_events",
             "collector_write_failures",
         ]
         result: dict[str, Any] = {
+            "scope": "polymarket_only",
             "database_connected": await self.ping(),
             "migrations": dict(migration_status or {}),
             "counts": {},
         }
         async with self.pool.connection() as connection:
             for table in tables:
-                row = await (await connection.execute(f"SELECT count(*) AS count FROM {table}")).fetchone()
+                row = await (
+                    await connection.execute(f"SELECT count(*) AS count FROM {table}")
+                ).fetchone()
                 result["counts"][table] = row["count"] if row else 0
             latest = await (
                 await connection.execute(
                     """
                     SELECT
                         (SELECT max(executed_at) FROM trades) AS latest_trade,
-                        (SELECT max(received_at) FROM raw_ws_messages) AS latest_ws_message,
-                        (SELECT max(finished_at) FROM collector_runs WHERE status = 'completed') AS latest_successful_run
+                        (SELECT max(received_at) FROM current_orderbooks)
+                            AS latest_orderbook,
+                        (SELECT max(observed_at) FROM microstructure_observations)
+                            AS latest_microstructure_observation,
+                        (SELECT max(received_at) FROM reference_price_updates)
+                            AS latest_reference_price,
+                        (SELECT max(finished_at) FROM collector_runs
+                         WHERE status = 'completed') AS latest_successful_run,
+                        (SELECT max(uploaded_at) FROM archive_objects
+                         WHERE status = 'uploaded') AS latest_archive_upload
                     """
                 )
             ).fetchone()
@@ -2827,6 +2975,127 @@ class Database:
                 )
             ).fetchall()
             result["checkpoints"] = [dict(row) for row in checkpoints]
+
+            tier_rows = await (
+                await connection.execute(
+                    """
+                    SELECT tier, count(*) AS markets,
+                           count(*) FILTER (WHERE ceiling_binding) AS ceiling_binding,
+                           max(evaluated_at) AS last_evaluated_at
+                    FROM market_collection_tiers
+                    GROUP BY tier
+                    """
+                )
+            ).fetchall()
+            result["tiers"] = {
+                tier: {"markets": 0, "ceiling_binding": 0, "last_evaluated_at": None}
+                for tier in ("full_l2", "sampled", "metadata_only")
+            }
+            for row in tier_rows:
+                result["tiers"][str(row["tier"])] = {
+                    "markets": int(row["markets"]),
+                    "ceiling_binding": int(row["ceiling_binding"]),
+                    "last_evaluated_at": row["last_evaluated_at"],
+                }
+
+            archive_row = await (
+                await connection.execute(
+                    """
+                    SELECT
+                        count(*) FILTER (WHERE status = 'uploaded') AS objects_uploaded,
+                        count(*) FILTER (WHERE status <> 'uploaded') AS objects_pending,
+                        count(*) FILTER (WHERE status = 'failed') AS objects_failed,
+                        COALESCE(sum(row_count) FILTER (WHERE status = 'uploaded'), 0)
+                            AS rows_uploaded,
+                        COALESCE(sum(uncompressed_bytes)
+                            FILTER (WHERE status = 'uploaded'), 0)
+                            AS uncompressed_bytes_uploaded,
+                        COALESCE(sum(compressed_bytes)
+                            FILTER (WHERE status = 'uploaded'), 0)
+                            AS compressed_bytes_uploaded,
+                        max(uploaded_at) AS latest_upload
+                    FROM archive_objects
+                    """
+                )
+            ).fetchone()
+            archive = dict(archive_row or {})
+            compressed = int(archive.get("compressed_bytes_uploaded") or 0)
+            uncompressed = int(archive.get("uncompressed_bytes_uploaded") or 0)
+            archive["compression_ratio"] = (
+                uncompressed / compressed if compressed else None
+            )
+            open_degradation = await (
+                await connection.execute(
+                    """
+                    SELECT count(*) AS count
+                    FROM archive_degradation_events WHERE resolved_at IS NULL
+                    """
+                )
+            ).fetchone()
+            archive["open_degradation_events"] = int(
+                open_degradation["count"] if open_degradation else 0
+            )
+
+            storage = await (
+                await connection.execute(
+                    """
+                    SELECT observed_at, postgres_database_bytes,
+                           postgres_growth_bytes_per_hour, major_table_bytes,
+                           archive_queue_rows, archive_queue_bytes,
+                           archive_oldest_queued_age_seconds,
+                           archive_growth_bytes_per_hour, spool_bytes,
+                           pressure_state
+                    FROM storage_metrics ORDER BY observed_at DESC LIMIT 1
+                    """
+                )
+            ).fetchone()
+            if storage is None:
+                snapshot = await self.storage_snapshot()
+                result["postgres"] = {
+                    "observed_at": snapshot["observed_at"],
+                    "database_bytes": snapshot["postgres_database_bytes"],
+                    "estimated_growth_bytes_per_hour": None,
+                    "major_table_bytes": snapshot["major_table_bytes"],
+                    "pressure_state": "unknown",
+                }
+                archive.update(
+                    {
+                        "queue_depth": None,
+                        "queue_bytes": None,
+                        "oldest_queued_seconds": None,
+                        "spool_bytes": None,
+                        "estimated_growth_bytes_per_hour": None,
+                    }
+                )
+            else:
+                result["postgres"] = {
+                    "observed_at": storage["observed_at"],
+                    "database_bytes": int(storage["postgres_database_bytes"]),
+                    "estimated_growth_bytes_per_hour": storage[
+                        "postgres_growth_bytes_per_hour"
+                    ],
+                    "major_table_bytes": storage["major_table_bytes"],
+                    "pressure_state": storage["pressure_state"],
+                }
+                archive.update(
+                    {
+                        "queue_depth": int(storage["archive_queue_rows"]),
+                        "queue_bytes": int(storage["archive_queue_bytes"]),
+                        "oldest_queued_seconds": storage[
+                            "archive_oldest_queued_age_seconds"
+                        ],
+                        "spool_bytes": int(storage["spool_bytes"]),
+                        "estimated_growth_bytes_per_hour": storage[
+                            "archive_growth_bytes_per_hour"
+                        ],
+                    }
+                )
+            archive["healthy"] = bool(
+                int(archive.get("objects_failed") or 0) == 0
+                and int(archive.get("open_degradation_events") or 0) == 0
+            )
+            result["archive"] = archive
+
             live_run = await (
                 await connection.execute(
                     """
@@ -2837,86 +3106,71 @@ class Database:
                     """
                 )
             ).fetchone()
-            live: dict[str, Any] = {}
+            live: dict[str, Any] = {"polymarket": {"discovery_state": "stopped"}}
             if live_run:
-                metadata = dict(live_run.get("metadata") or {})
-                for exchange in ("polymarket", "kalshi"):
-                    enabled = bool(metadata.get(f"{exchange}_enabled"))
-                    if not enabled:
-                        continue
-                    row = await (
-                        await connection.execute(
-                            """
-                            WITH latest_decision AS (
-                                SELECT max(evaluated_at) AS evaluated_at
-                                FROM live_market_subscription_decisions
-                                WHERE collector_run_id = %s AND exchange = %s
-                            )
-                            SELECT
-                                (SELECT count(*) FROM collector_connections
-                                 WHERE collector_run_id = %s AND exchange = %s
-                                   AND status = 'connected' AND disconnected_at IS NULL)
-                                    AS connections_active,
-                                (SELECT count(DISTINCT ccm.market_external_id)
-                                 FROM collector_connections cc
-                                 JOIN collector_connection_markets ccm
-                                   ON ccm.connection_id = cc.id
-                                 WHERE cc.collector_run_id = %s AND cc.exchange = %s
-                                   AND cc.status = 'connected'
-                                   AND cc.disconnected_at IS NULL
-                                   AND ccm.unsubscribed_at IS NULL)
-                                    AS markets_confirmed_subscribed,
-                                (SELECT count(*)
-                                 FROM live_market_subscription_decisions d,
-                                      latest_decision latest
-                                 WHERE d.collector_run_id = %s AND d.exchange = %s
-                                   AND d.evaluated_at = latest.evaluated_at
-                                   AND d.is_eligible AND d.exclusion_reason IS NULL)
-                                    AS markets_selected,
-                                (SELECT max(r.received_at)
-                                 FROM raw_ws_messages r
-                                 JOIN collector_connections cc
-                                   ON cc.id = r.collector_connection_id
-                                 WHERE cc.collector_run_id = %s AND cc.exchange = %s)
-                                    AS latest_ws_message,
-                                (SELECT max(d.evaluated_at)
-                                 FROM live_market_subscription_decisions d
-                                 WHERE d.collector_run_id = %s AND d.exchange = %s)
-                                    AS latest_complete_discovery,
-                                (SELECT count(*) FROM data_gaps g
-                                 WHERE g.collector_run_id = %s AND g.exchange = %s
-                                   AND g.channel = 'rest:market_discovery'
-                                   AND g.status IN ('open', 'reconciling'))
-                                    AS open_discovery_gaps
-                            """,
-                            tuple(
-                                value
-                                for _ in range(7)
-                                for value in (live_run["id"], exchange)
-                            ),
+                row = await (
+                    await connection.execute(
+                        """
+                        WITH latest_decision AS (
+                            SELECT max(evaluated_at) AS evaluated_at
+                            FROM live_market_subscription_decisions
+                            WHERE collector_run_id = %s AND exchange = 'polymarket'
                         )
-                    ).fetchone()
-                    state = dict(row or {})
-                    if int(state.get("open_discovery_gaps") or 0):
-                        state["discovery_state"] = "retrying"
-                    elif state.get("latest_complete_discovery") is not None:
-                        state["discovery_state"] = "ready"
-                    else:
-                        state["discovery_state"] = "pending"
-                    requires_market_ws = exchange == "polymarket" or bool(
-                        metadata.get("kalshi_websocket_configured")
+                        SELECT
+                            (SELECT count(*) FROM collector_connections
+                             WHERE collector_run_id = %s AND exchange = 'polymarket'
+                               AND status = 'connected' AND disconnected_at IS NULL)
+                                AS connections_active,
+                            (SELECT count(DISTINCT ccm.market_external_id)
+                             FROM collector_connections cc
+                             JOIN collector_connection_markets ccm
+                               ON ccm.connection_id = cc.id
+                             WHERE cc.collector_run_id = %s
+                               AND cc.exchange = 'polymarket'
+                               AND cc.status = 'connected'
+                               AND cc.disconnected_at IS NULL
+                               AND ccm.unsubscribed_at IS NULL)
+                                AS markets_confirmed_subscribed,
+                            (SELECT count(*)
+                             FROM live_market_subscription_decisions d,
+                                  latest_decision latest
+                             WHERE d.collector_run_id = %s
+                               AND d.exchange = 'polymarket'
+                               AND d.evaluated_at = latest.evaluated_at
+                               AND d.is_eligible) AS markets_selected,
+                            (SELECT max(co.received_at)
+                             FROM current_orderbooks co
+                             JOIN markets m ON m.id = co.market_id
+                             WHERE m.exchange = 'polymarket') AS latest_ws_message,
+                            (SELECT max(d.evaluated_at)
+                             FROM live_market_subscription_decisions d
+                             WHERE d.collector_run_id = %s
+                               AND d.exchange = 'polymarket')
+                                AS latest_complete_discovery,
+                            (SELECT count(*) FROM data_gaps g
+                             WHERE g.collector_run_id = %s
+                               AND g.exchange = 'polymarket'
+                               AND g.channel = 'rest:market_discovery'
+                               AND g.status IN ('open', 'reconciling'))
+                                AS open_discovery_gaps
+                        """,
+                        tuple(live_run["id"] for _ in range(6)),
                     )
-                    state["healthy"] = (
-                        not requires_market_ws
-                        or (
-                            state["discovery_state"] == "ready"
-                            and
-                            int(state.get("connections_active") or 0) > 0
-                            and int(state.get("markets_confirmed_subscribed") or 0) > 0
-                            and state.get("latest_ws_message") is not None
-                        )
-                    )
-                    live[exchange] = state
+                ).fetchone()
+                state = dict(row or {})
+                if int(state.get("open_discovery_gaps") or 0):
+                    state["discovery_state"] = "retrying"
+                elif state.get("latest_complete_discovery") is not None:
+                    state["discovery_state"] = "ready"
+                else:
+                    state["discovery_state"] = "discovering"
+                state["healthy"] = bool(
+                    state["discovery_state"] == "ready"
+                    and int(state.get("connections_active") or 0) > 0
+                    and int(state.get("markets_confirmed_subscribed") or 0) > 0
+                    and state.get("latest_ws_message") is not None
+                )
+                live["polymarket"] = state
                 result["live_run"] = {
                     "id": live_run["id"],
                     "started_at": live_run["started_at"],
@@ -2925,8 +3179,9 @@ class Database:
             result["healthy"] = bool(
                 result["database_connected"]
                 and bool((migration_status or {}).get("current", True))
-                and live
-                and all(state.get("healthy") for state in live.values())
+                and live["polymarket"].get("healthy")
+                and archive["healthy"]
+                and result["postgres"].get("pressure_state") != "critical"
             )
         return result
 
@@ -2979,87 +3234,149 @@ def _write_query(kind: str, value: Mapping[str, Any]) -> tuple[str, Mapping[str,
             """,
             data,
         )
-    if kind == "orderbook_snapshots":
+    if kind == "current_orderbook_snapshots":
         data["bids"] = _json(data.get("bids", []))
         data["asks"] = _json(data.get("asks", []))
         return (
             prefix
             + """
-            INSERT INTO orderbook_snapshots
-                (exchange, market_id, outcome_id, collector_connection_id, snapshot_type,
-                 source_timestamp, exchange_timestamp, source_timestamp_raw,
-                 exchange_timestamp_raw, received_at, received_monotonic_ns,
-                 sequence_number, book_hash, bids, asks, best_bid, best_ask,
-                 is_reconciliation, raw_data)
-            SELECT %(exchange)s, market_id, outcome_id, %(connection_id)s,
-                   %(snapshot_type)s, %(source_timestamp)s, %(exchange_timestamp)s,
-                   %(source_timestamp_raw)s, %(exchange_timestamp_raw)s,
-                   %(received_at)s, %(received_monotonic_ns)s, %(sequence_number)s,
-                   %(book_hash)s, %(bids)s, %(asks)s, %(best_bid)s, %(best_ask)s,
-                   %(is_reconciliation)s, %(raw_data)s
-            FROM resolved
+            , header AS (
+                INSERT INTO current_orderbooks
+                    (outcome_id, market_id, collector_connection_id, valid,
+                     source_timestamp, exchange_timestamp, received_at,
+                     received_monotonic_ns, sequence_number, book_hash,
+                     best_bid, best_ask, midpoint, spread, bid_depth, ask_depth,
+                     level_count)
+                SELECT outcome_id, market_id, %(connection_id)s, TRUE,
+                       %(source_timestamp)s, %(exchange_timestamp)s, %(received_at)s,
+                       %(received_monotonic_ns)s, %(sequence_number)s, %(book_hash)s,
+                       %(best_bid)s, %(best_ask)s, %(midpoint)s, %(spread)s,
+                       %(bid_depth)s, %(ask_depth)s, %(level_count)s
+                FROM resolved WHERE outcome_id IS NOT NULL
+                ON CONFLICT (outcome_id) DO UPDATE SET
+                    market_id = EXCLUDED.market_id,
+                    collector_connection_id = EXCLUDED.collector_connection_id,
+                    valid = TRUE,
+                    source_timestamp = EXCLUDED.source_timestamp,
+                    exchange_timestamp = EXCLUDED.exchange_timestamp,
+                    received_at = EXCLUDED.received_at,
+                    received_monotonic_ns = EXCLUDED.received_monotonic_ns,
+                    sequence_number = EXCLUDED.sequence_number,
+                    book_hash = EXCLUDED.book_hash,
+                    best_bid = EXCLUDED.best_bid, best_ask = EXCLUDED.best_ask,
+                    midpoint = EXCLUDED.midpoint, spread = EXCLUDED.spread,
+                    bid_depth = EXCLUDED.bid_depth, ask_depth = EXCLUDED.ask_depth,
+                    level_count = EXCLUDED.level_count,
+                    updated_at = clock_timestamp()
+                RETURNING outcome_id
+            ), removed AS (
+                DELETE FROM current_orderbook_levels levels
+                USING header WHERE levels.outcome_id = header.outcome_id
+            ), levels AS (
+                INSERT INTO current_orderbook_levels
+                    (outcome_id, side, price, size, received_at, received_monotonic_ns)
+                SELECT header.outcome_id, side_name, level.price::NUMERIC,
+                       level.size::NUMERIC, %(received_at)s,
+                       %(received_monotonic_ns)s
+                FROM header
+                CROSS JOIN LATERAL (
+                    SELECT DISTINCT ON (side_name, price::NUMERIC)
+                           side_name, price::NUMERIC AS price, size
+                    FROM (
+                        SELECT 'buy'::TEXT AS side_name,
+                               value->>0 AS price, value->>1 AS size, ordinal
+                        FROM jsonb_array_elements(%(bids)s)
+                             WITH ORDINALITY AS bid(value, ordinal)
+                        UNION ALL
+                        SELECT 'sell'::TEXT, value->>0, value->>1, ordinal
+                        FROM jsonb_array_elements(%(asks)s)
+                             WITH ORDINALITY AS ask(value, ordinal)
+                    ) raw_level
+                    WHERE size::NUMERIC > 0
+                    ORDER BY side_name, price::NUMERIC, ordinal DESC
+                ) level
+                ON CONFLICT (outcome_id, side, price) DO UPDATE SET
+                    size = EXCLUDED.size,
+                    received_at = EXCLUDED.received_at,
+                    received_monotonic_ns = EXCLUDED.received_monotonic_ns
+                RETURNING outcome_id
+            )
+            SELECT count(*) FROM header
             """,
             data,
         )
-    if kind == "orderbook_updates":
+    if kind == "current_orderbook_updates":
         return (
             prefix
             + """
-            INSERT INTO orderbook_updates
-                (exchange, market_id, outcome_id, collector_connection_id,
-                 source_timestamp, exchange_timestamp, source_timestamp_raw,
-                 exchange_timestamp_raw, received_at, received_monotonic_ns,
-                 sequence_number, book_hash, side, price, size, size_delta,
-                 operation, event_type, raw_data)
-            SELECT %(exchange)s, market_id, outcome_id, %(connection_id)s,
-                   %(source_timestamp)s, %(exchange_timestamp)s,
-                   %(source_timestamp_raw)s, %(exchange_timestamp_raw)s,
-                   %(received_at)s, %(received_monotonic_ns)s,
-                   %(sequence_number)s, %(book_hash)s,
-                   %(side)s, %(price)s, %(size)s, %(size_delta)s, %(operation)s,
-                   %(event_type)s, %(raw_data)s
-            FROM resolved
+            , header AS (
+                INSERT INTO current_orderbooks
+                    (outcome_id, market_id, collector_connection_id, valid,
+                     source_timestamp, exchange_timestamp, received_at,
+                     received_monotonic_ns, sequence_number, book_hash,
+                     best_bid, best_ask, midpoint, spread, bid_depth, ask_depth,
+                     level_count)
+                SELECT outcome_id, market_id, %(connection_id)s, TRUE,
+                       %(source_timestamp)s, %(exchange_timestamp)s, %(received_at)s,
+                       %(received_monotonic_ns)s, %(sequence_number)s, %(book_hash)s,
+                       %(best_bid)s, %(best_ask)s, %(midpoint)s, %(spread)s,
+                       %(bid_depth)s, %(ask_depth)s, %(level_count)s
+                FROM resolved WHERE outcome_id IS NOT NULL
+                ON CONFLICT (outcome_id) DO UPDATE SET
+                    collector_connection_id = EXCLUDED.collector_connection_id,
+                    valid = TRUE,
+                    source_timestamp = EXCLUDED.source_timestamp,
+                    exchange_timestamp = EXCLUDED.exchange_timestamp,
+                    received_at = EXCLUDED.received_at,
+                    received_monotonic_ns = EXCLUDED.received_monotonic_ns,
+                    sequence_number = EXCLUDED.sequence_number,
+                    book_hash = EXCLUDED.book_hash,
+                    best_bid = EXCLUDED.best_bid, best_ask = EXCLUDED.best_ask,
+                    midpoint = EXCLUDED.midpoint, spread = EXCLUDED.spread,
+                    bid_depth = EXCLUDED.bid_depth, ask_depth = EXCLUDED.ask_depth,
+                    level_count = EXCLUDED.level_count,
+                    updated_at = clock_timestamp()
+                RETURNING outcome_id
+            ), changed AS (
+                INSERT INTO current_orderbook_levels
+                    (outcome_id, side, price, size, received_at, received_monotonic_ns)
+                SELECT outcome_id, %(side)s, %(price)s, %(size)s,
+                       %(received_at)s, %(received_monotonic_ns)s
+                FROM header WHERE %(size)s > 0
+                ON CONFLICT (outcome_id, side, price) DO UPDATE SET
+                    size = EXCLUDED.size, received_at = EXCLUDED.received_at,
+                    received_monotonic_ns = EXCLUDED.received_monotonic_ns
+            ), removed AS (
+                DELETE FROM current_orderbook_levels levels USING header
+                WHERE levels.outcome_id = header.outcome_id
+                  AND levels.side = %(side)s AND levels.price = %(price)s
+                  AND %(size)s <= 0
+            )
+            SELECT count(*) FROM header
             """,
             data,
         )
-    if kind == "market_snapshots":
+    if kind == "microstructure_observations":
         return (
             prefix
             + """
-            INSERT INTO market_snapshots
-                (exchange, market_id, outcome_id, collector_connection_id, observed_at,
-                 source_timestamp, exchange_timestamp, received_at, received_monotonic_ns,
-                 sequence_number, book_hash, best_bid, best_ask, midpoint, spread,
-                 last_trade_price, bid_depth, ask_depth, volume, open_interest, liquidity,
-                 raw_data)
-            SELECT %(exchange)s, market_id, outcome_id, %(connection_id)s, %(observed_at)s,
-                   %(source_timestamp)s, %(exchange_timestamp)s, %(received_at)s,
-                   %(received_monotonic_ns)s, %(sequence_number)s, %(book_hash)s,
-                   %(best_bid)s, %(best_ask)s, %(midpoint)s, %(spread)s,
-                   %(last_trade_price)s, %(bid_depth)s, %(ask_depth)s, %(volume)s,
-                   %(open_interest)s, %(liquidity)s, %(raw_data)s
-            FROM resolved
-            """,
-            data,
-        )
-    if kind == "raw_ws_messages":
-        return (
-            prefix
-            + """
-            INSERT INTO raw_ws_messages
-                (exchange, collector_connection_id, channel, market_id, outcome_id,
-                 market_external_id, outcome_external_id, message_type,
-                 source_timestamp, exchange_timestamp, source_timestamp_raw,
-                 exchange_timestamp_raw, received_at, received_monotonic_ns,
-                 sequence_number, book_hash, payload)
-            VALUES
-                (%(exchange)s, %(connection_id)s, %(channel)s,
-                 (SELECT market_id FROM resolved), (SELECT outcome_id FROM resolved),
-                 %(market_external_id)s, %(outcome_external_id)s, %(message_type)s,
-                 %(source_timestamp)s, %(exchange_timestamp)s,
-                 %(source_timestamp_raw)s, %(exchange_timestamp_raw)s,
-                 %(received_at)s, %(received_monotonic_ns)s,
-                 %(sequence_number)s, %(book_hash)s, %(payload)s)
+            INSERT INTO microstructure_observations
+                (market_id, outcome_id, tier, observed_at, source_timestamp,
+                 received_at, best_bid, best_ask, midpoint, spread, spread_bps,
+                 bid_depth_top, ask_depth_top, bid_depth_1pct, ask_depth_1pct,
+                 bid_depth_total, ask_depth_total, book_imbalance,
+                 last_trade_price, recent_trade_count, recent_trade_volume,
+                 recent_update_count)
+            SELECT market_id, outcome_id, %(tier)s, %(observed_at)s,
+                   %(source_timestamp)s, %(received_at)s, %(best_bid)s,
+                   %(best_ask)s, %(midpoint)s, %(spread)s, %(spread_bps)s,
+                   %(bid_depth_top)s, %(ask_depth_top)s, %(bid_depth_1pct)s,
+                   %(ask_depth_1pct)s, %(bid_depth_total)s, %(ask_depth_total)s,
+                   %(book_imbalance)s, %(last_trade_price)s,
+                   %(recent_trade_count)s, %(recent_trade_volume)s,
+                   %(recent_update_count)s
+            FROM resolved WHERE outcome_id IS NOT NULL
+            ON CONFLICT (outcome_id, tier, observed_at) DO NOTHING
             """,
             data,
         )

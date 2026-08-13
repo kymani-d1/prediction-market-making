@@ -5,6 +5,9 @@
 .gitignore
 .pytest_cache
 .pytest-tmp
+.integration-tools
+.integration-runtime
+integration-results.local.json
 .venv
 __pycache__
 *.py[cod]

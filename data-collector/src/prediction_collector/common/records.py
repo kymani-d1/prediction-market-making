@@ -7,6 +7,8 @@ from prediction_collector.common.types import (
     ParsedBookUpdate,
     ParsedTrade,
 )
+from prediction_collector.common.orderbook import OrderBook
+from prediction_collector.common.utils import as_decimal
 from prediction_collector.writer import WriteItem
 
 
@@ -43,6 +45,24 @@ def book_snapshot_item(
     *,
     reconciliation: bool = False,
 ) -> WriteItem:
+    bid_depth = sum(
+        (as_decimal(level[1]) or 0 for level in snapshot.bids if len(level) >= 2),
+        0,
+    )
+    ask_depth = sum(
+        (as_decimal(level[1]) or 0 for level in snapshot.asks if len(level) >= 2),
+        0,
+    )
+    midpoint = (
+        (snapshot.best_bid + snapshot.best_ask) / 2
+        if snapshot.best_bid is not None and snapshot.best_ask is not None
+        else None
+    )
+    spread = (
+        snapshot.best_ask - snapshot.best_bid
+        if snapshot.best_bid is not None and snapshot.best_ask is not None
+        else None
+    )
     return WriteItem(
         "orderbook_snapshots",
         {
@@ -63,6 +83,11 @@ def book_snapshot_item(
             "asks": snapshot.asks,
             "best_bid": snapshot.best_bid,
             "best_ask": snapshot.best_ask,
+            "midpoint": midpoint,
+            "spread": spread,
+            "bid_depth": bid_depth,
+            "ask_depth": ask_depth,
+            "level_count": len(snapshot.bids) + len(snapshot.asks),
             "is_reconciliation": reconciliation,
             "raw_data": snapshot.raw_data,
         },
@@ -70,7 +95,10 @@ def book_snapshot_item(
 
 
 def book_update_item(
-    update: ParsedBookUpdate, connection_id: int | None = None
+    update: ParsedBookUpdate,
+    connection_id: int | None = None,
+    *,
+    book: OrderBook | None = None,
 ) -> WriteItem:
     return WriteItem(
         "orderbook_updates",
@@ -93,6 +121,13 @@ def book_update_item(
             "size_delta": update.size_delta,
             "operation": update.operation,
             "event_type": "price_change" if update.exchange == "polymarket" else "orderbook_delta",
+            "best_bid": book.best_bid if book else None,
+            "best_ask": book.best_ask if book else None,
+            "midpoint": book.midpoint if book else None,
+            "spread": book.spread if book else None,
+            "bid_depth": book.bid_depth if book else 0,
+            "ask_depth": book.ask_depth if book else 0,
+            "level_count": len(book.bids) + len(book.asks) if book else 0,
             "raw_data": update.raw_data,
         },
     )

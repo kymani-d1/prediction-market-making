@@ -5,6 +5,14 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from prediction_collector.archive import (
+    ArchiveBackpressureError,
+    ArchiveRecord,
+    ArchiveWriter,
+)
+from prediction_collector.common.utils import content_hash
+from prediction_collector.tiering import CollectionTier, TierManager
+
 
 if TYPE_CHECKING:
     from prediction_collector.database import Database
@@ -29,22 +37,30 @@ class BatchWriter:
         max_queue_size: int,
         batch_size: int,
         flush_interval_seconds: float,
+        archive: ArchiveWriter | None = None,
+        tier_manager: TierManager | None = None,
     ) -> None:
         self.database = database
         self.queue: asyncio.Queue[WriteItem] = asyncio.Queue(maxsize=max_queue_size)
         self.batch_size = batch_size
         self.flush_interval_seconds = flush_interval_seconds
+        self.archive = archive
+        self.tier_manager = tier_manager
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self.rows_written = 0
         self.failed_items = 0
         self.run_id: int | None = None
+        self.postgres_pressure = "normal"
 
     @property
     def task(self) -> asyncio.Task[None] | None:
         return self._task
 
     async def start(self) -> None:
+        if self.archive is not None:
+            self.archive.run_id = self.run_id
+            await self.archive.start()
         if self._task is None:
             self._task = asyncio.create_task(self.run(), name="database-batch-writer")
 
@@ -52,7 +68,138 @@ class BatchWriter:
         if self._task is not None and self._task.done():
             await self._task
             raise RuntimeError("database writer stopped unexpectedly")
-        await self.queue.put(item)
+        routed = await self._route(item)
+        if routed is not None:
+            await self.queue.put(routed)
+
+    async def _route(self, item: WriteItem) -> WriteItem | None:
+        data = item.data
+        market = data.get("market_external_id")
+        tier = (
+            self.tier_manager.tier_for(str(market) if market is not None else None)
+            if self.tier_manager is not None
+            else CollectionTier.FULL_L2
+        )
+        if item.kind == "orderbook_updates":
+            if tier is CollectionTier.FULL_L2:
+                await self._archive("orderbook_updates", data, priority=3)
+            return WriteItem("current_orderbook_updates", data)
+        if item.kind == "orderbook_snapshots":
+            if tier is CollectionTier.FULL_L2:
+                await self._archive("orderbook_snapshots", data, priority=3)
+            # Periodic REST reconciliation is useful immutable archive
+            # evidence, but its response has no ordering relationship with
+            # concurrent WebSocket deltas. Never let it regress the hot book.
+            if data.get("archive_only"):
+                return None
+            return WriteItem("current_orderbook_snapshots", data)
+        if item.kind in {"market_snapshots", "microstructure_observations"}:
+            await self._archive("microstructure_observations", data, priority=5)
+            if self.postgres_pressure == "critical":
+                await self._record_pressure_degradation(item, priority=5)
+                return None
+            return WriteItem("microstructure_observations", data)
+        if item.kind == "raw_ws_messages":
+            if not self._retain_raw_ws(data, tier):
+                return None
+            archive_data = dict(data)
+            archive_data["payload_hash"] = content_hash(data.get("payload"))
+            try:
+                await self._archive("raw_ws", archive_data, priority=6)
+            except ArchiveBackpressureError:
+                # Optional debug evidence degrades before normalized L2. The
+                # archive writer has already persisted an explicit event.
+                LOGGER.warning("Raw WebSocket evidence shed under archive pressure")
+            return None
+        if item.kind == "raw_rest_payloads":
+            await self._archive("raw_rest", data, priority=2)
+            return None
+        if item.kind == "reference_price_updates":
+            try:
+                await self._archive("reference_prices", data, priority=4)
+            except ArchiveBackpressureError:
+                LOGGER.warning("Reference-price archive degraded; hot copy retained")
+            if self.postgres_pressure == "critical":
+                await self._record_pressure_degradation(item, priority=4)
+                return None
+            compact = dict(data)
+            compact["raw_data"] = {}
+            return WriteItem(item.kind, compact)
+        if item.kind in {"sports_feed_updates", "market_lifecycle_events", "trades"}:
+            compact = dict(data)
+            compact["raw_data"] = {}
+            return WriteItem(item.kind, compact)
+        return item
+
+    async def _archive(
+        self, stream: str, data: dict[str, Any], *, priority: int
+    ) -> None:
+        if self.archive is None:
+            raise RuntimeError(f"archive writer is required for {stream}")
+        await self.archive.put(ArchiveRecord.create(stream, data, priority=priority))
+
+    def _retain_raw_ws(
+        self, data: dict[str, Any], tier: CollectionTier
+    ) -> bool:
+        if self.archive is None:
+            return False
+        policy = self.archive.settings.raw_ws_policy
+        if policy == "none":
+            return False
+        if policy == "all":
+            return True
+        known = {
+            "book",
+            "price_change",
+            "last_trade_price",
+            "tick_size_change",
+            "new_market",
+            "market_resolved",
+            "best_bid_ask",
+            "price",
+            "equity_prices",
+            "crypto_prices",
+            "crypto_prices_chainlink",
+            "crypto_prices_twap_thirty",
+            "crypto_prices_twap_sixty",
+            "sports",
+        }
+        message_type = str(data.get("message_type") or "unknown")
+        channel = str(data.get("channel") or "")
+        known_rtds_channels = {
+            "rtds:crypto_prices",
+            "rtds:crypto_prices_chainlink",
+            "rtds:crypto_prices_twap_thirty",
+            "rtds:crypto_prices_twap_sixty",
+            "rtds:equity_prices",
+            "rtds:comments",
+        }
+        known_transport_envelope = (
+            channel in known_rtds_channels
+            and message_type in {"update", "snapshot"}
+        ) or (
+            channel == "sports"
+            and message_type not in {"error", "malformed_json", "unknown"}
+        )
+        if policy == "errors":
+            return (
+                (message_type not in known and not known_transport_envelope)
+                or message_type in {"error", "malformed_json"}
+            )
+        return policy == "full_l2" and tier is CollectionTier.FULL_L2
+
+    async def _record_pressure_degradation(
+        self, item: WriteItem, *, priority: int
+    ) -> None:
+        if self.archive is not None:
+            await self.archive.database.record_archive_degradation(
+                run_id=self.run_id,
+                stream=item.kind,
+                priority=priority,
+                reason="postgres_critical_optional_hot_write_shed",
+                rows_affected=1,
+                bytes_affected=0,
+            )
 
     def put_nowait(self, item: WriteItem) -> bool:
         try:
@@ -155,3 +302,5 @@ class BatchWriter:
         if self._task is not None:
             await self._task
             self._task = None
+        if self.archive is not None:
+            await self.archive.stop()

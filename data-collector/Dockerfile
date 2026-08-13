@@ -21,4 +21,4 @@ USER collector
 
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["python", "-m", "prediction_collector"]
-CMD ["run", "--exchange", "all"]
+CMD ["run"]

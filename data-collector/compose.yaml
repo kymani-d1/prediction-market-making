@@ -8,25 +8,24 @@ x-collector-base: &collector-base
   env_file:
     - .env
   environment: &collector-environment
-    # Use separate fields locally so passwords containing URL-reserved
-    # characters are encoded by the application instead of Compose.
     DATABASE_URL: ""
     POSTGRES_HOST: database
     POSTGRES_PORT: "5432"
+    S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://object-store:9000}
+    S3_BUCKET: ${S3_BUCKET:-prediction-market-archive}
+    S3_REGION: ${S3_REGION:-us-east-1}
+    S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-local-archive-admin}
+    S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-change-this-local-archive-password}
+    S3_URL_STYLE: ${S3_URL_STYLE:-path}
   depends_on:
     database:
       condition: service_healthy
+    object-store-init:
+      condition: service_completed_successfully
     migrate:
       condition: service_completed_successfully
   init: true
-  restart: unless-stopped
-  stop_grace_period: 45s
-  healthcheck:
-    test: ["CMD", "python", "-m", "prediction_collector", "status"]
-    interval: 30s
-    timeout: 15s
-    retries: 3
-    start_period: 30s
+  stop_grace_period: 60s
 
 services:
   database:
@@ -38,8 +37,6 @@ services:
     ports:
       - "${POSTGRES_BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
-      # PostgreSQL 18+ expects the volume at /var/lib/postgresql so major-version
-      # upgrades can use version-specific data directories beneath it.
       - postgres_data:/var/lib/postgresql
     restart: unless-stopped
     stop_grace_period: 60s
@@ -49,6 +46,35 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
+
+  object-store:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-local-archive-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-this-local-archive-password}
+    ports:
+      - "${MINIO_BIND_HOST:-127.0.0.1}:9000:9000"
+      - "${MINIO_BIND_HOST:-127.0.0.1}:9001:9001"
+    volumes:
+      - object_store_data:/data
+    restart: unless-stopped
+
+  object-store-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      - object-store
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        until mc alias set local http://object-store:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do sleep 2; done
+        mc mb --ignore-existing "local/$${S3_BUCKET}"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-local-archive-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-this-local-archive-password}
+      S3_BUCKET: ${S3_BUCKET:-prediction-market-archive}
+    restart: "no"
 
   migrate:
     image: ${COLLECTOR_IMAGE:-prediction-market-collector:local}
@@ -65,37 +91,17 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # Full production collector. The host key is mounted read-only and is never
-  # copied into the image. Use only a newly rotated Kalshi key.
   collector:
     <<: *collector-base
-    profiles: ["authenticated"]
-    # Match the Linux owner of the mode-0600 host key. Docker Desktop on
-    # Windows maps host ACLs into its VM and can normally use these defaults.
-    user: "${COLLECTOR_UID:-1000}:${COLLECTOR_GID:-1000}"
-    environment:
-      <<: *collector-environment
-      KALSHI_PRIVATE_KEY_PATH: /run/collector-secrets/kalshi-private-key.pem
-    volumes:
-      - type: bind
-        source: ${KALSHI_PRIVATE_KEY_HOST_PATH:-./secrets/kalshi-private-key.pem}
-        target: /run/collector-secrets/kalshi-private-key.pem
-        read_only: true
-        bind:
-          create_host_path: false
-    command: ["run", "--exchange", "all"]
-
-  # Key-free fallback: Polymarket live feeds and both exchanges' public REST
-  # remain available, but authenticated Kalshi market/lifecycle/reference
-  # WebSockets are intentionally disabled.
-  collector-public:
-    <<: *collector-base
-    profiles: ["public"]
-    environment:
-      <<: *collector-environment
-      KALSHI_API_KEY_ID: ""
-      KALSHI_PRIVATE_KEY_PATH: ""
-    command: ["run", "--exchange", "all"]
+    command: ["run"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "prediction_collector", "status"]
+      interval: 60s
+      timeout: 20s
+      retries: 5
+      start_period: 300s
 
 volumes:
   postgres_data:
+  object_store_data:

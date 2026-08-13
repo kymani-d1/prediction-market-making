@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -12,117 +11,79 @@ def settings(env: dict[str, str] | None = None) -> Settings:
     return Settings.from_env(env or {}, load_dotenv_file=False)
 
 
-def test_live_coverage_defaults_are_unrestricted() -> None:
+def test_defaults_are_polymarket_only_and_bounded() -> None:
     value = settings()
+    assert value.full_l2_max_markets == 500
+    assert value.sampled_max_markets == 1_000
+    assert value.sampled_snapshot_interval_seconds == 60
+    assert value.postgres_reference_retention_hours == 6
+    assert value.postgres_observation_retention_hours == 24
+    assert value.raw_ws_policy == "errors"
+    assert value.safe_summary()["scope"] == "polymarket_only"
+    assert not any("kalshi" in key.lower() for key in value.safe_summary())
 
-    assert value.economics_sync_interval_seconds == 3600
-    assert value.polymarket_fee_rate_sync_interval_seconds == 21_600
-    assert value.max_live_markets == 0
-    assert value.min_live_market_volume == Decimal("0")
-    assert value.min_live_market_liquidity == Decimal("0")
-    assert value.live_market_allowlist == frozenset()
-    assert value.live_market_blocklist == frozenset()
 
-
-def test_env_parses_coverage_booleans_csv_decimals_and_urls() -> None:
+def test_railway_aws_aliases_configure_archive_without_exposing_credentials() -> None:
     value = settings(
         {
-            "MAX_LIVE_MARKETS": "17",
-            "MIN_LIVE_MARKET_VOLUME": "1000.2500",
-            "MIN_LIVE_MARKET_LIQUIDITY": "50.125",
-            "LIVE_MARKET_ALLOWLIST": " poly:one, two,poly:one, ",
-            "LIVE_MARKET_BLOCKLIST": "three",
-            "POLYMARKET_ENABLED": "off",
-            "STORE_RAW_WS": "YES",
-            "POLYMARKET_GAMMA_URL": "https://example.test/gamma///",
-            "LOG_LEVEL": "debug",
-            "ECONOMICS_SYNC_INTERVAL_SECONDS": "900",
-            "POLYMARKET_FEE_RATE_SYNC_INTERVAL_SECONDS": "7200",
+            "AWS_ENDPOINT_URL": "https://storage.railway.app",
+            "AWS_S3_BUCKET_NAME": "collector",
+            "AWS_DEFAULT_REGION": "auto",
+            "AWS_ACCESS_KEY_ID": "access",
+            "AWS_SECRET_ACCESS_KEY": "secret",
+            "AWS_S3_URL_STYLE": "virtual",
+            "FULL_L2_MARKET_ALLOWLIST": "abc, polymarket:def",
+            "LIVE_MARKET_BLOCKLIST": "blocked",
         }
     )
+    assert value.archive_configured
+    assert value.s3_bucket == "collector"
+    assert value.full_l2_market_allowlist == {"abc", "polymarket:def"}
+    summary = str(value.safe_summary())
+    assert "access" not in summary
+    assert "secret" not in summary
 
-    assert value.max_live_markets == 17
-    assert value.min_live_market_volume == Decimal("1000.2500")
-    assert value.min_live_market_liquidity == Decimal("50.125")
-    assert value.live_market_allowlist == frozenset({"poly:one", "two"})
-    assert value.live_market_blocklist == frozenset({"three"})
-    assert value.polymarket_enabled is False
-    assert value.store_raw_ws is True
-    assert value.polymarket_gamma_url == "https://example.test/gamma"
-    assert value.log_level == "DEBUG"
-    assert value.economics_sync_interval_seconds == 900
-    assert value.polymarket_fee_rate_sync_interval_seconds == 7200
+
+def test_run_requires_complete_archive_credentials() -> None:
+    with pytest.raises(ConfigurationError, match="Continuous collection requires"):
+        settings({"S3_BUCKET": "only-a-bucket"}).require_archive()
 
 
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("MAX_LIVE_MARKETS", "-1"),
-        ("MAX_LIVE_MARKETS", "1.5"),
-        ("MIN_LIVE_MARKET_VOLUME", "-0.01"),
-        ("MIN_LIVE_MARKET_LIQUIDITY", "NaN"),
-        ("MIN_LIVE_MARKET_LIQUIDITY", "Infinity"),
-        ("POLYMARKET_ENABLED", "sometimes"),
-        ("ECONOMICS_SYNC_INTERVAL_SECONDS", "59"),
-        ("POLYMARKET_FEE_RATE_SYNC_INTERVAL_SECONDS", "899"),
+        ("RAW_WS_POLICY", "forever"),
+        ("ARCHIVE_COMPRESSION", "gzip"),
+        ("S3_URL_STYLE", "invalid"),
+        ("FULL_L2_MAX_MARKETS", "-1"),
+        ("POSTGRES_STORAGE_WARN_GB", "-1"),
     ],
 )
-def test_invalid_configuration_is_rejected(name: str, value: str) -> None:
+def test_invalid_configuration_fails_closed(name: str, value: str) -> None:
     with pytest.raises(ConfigurationError):
         settings({name: value})
 
 
-def test_pool_bounds_and_allow_block_overlap_are_rejected() -> None:
-    with pytest.raises(ConfigurationError, match="MIN_SIZE cannot exceed"):
-        settings({"DATABASE_POOL_MIN_SIZE": "9", "DATABASE_POOL_MAX_SIZE": "8"})
-
+def test_allowlist_and_blocklist_cannot_overlap() -> None:
     with pytest.raises(ConfigurationError, match="overlap"):
         settings(
             {
-                "LIVE_MARKET_ALLOWLIST": "polymarket:123,kalshi:ABC",
-                "LIVE_MARKET_BLOCKLIST": "polymarket:123",
+                "FULL_L2_MARKET_ALLOWLIST": "same",
+                "LIVE_MARKET_BLOCKLIST": "same",
             }
         )
 
 
-def test_database_dsn_escapes_credentials_and_safe_summary_omits_secrets(
-    workspace_tmp_path: Path,
-) -> None:
-    key_path = workspace_tmp_path / "exists.pem"
-    key_path.write_text("ephemeral test placeholder", encoding="utf-8")
-    value = settings(
-        {
-            "POSTGRES_USER": "user@example",
-            "POSTGRES_PASSWORD": "p@ss:/word",
-            "POSTGRES_DB": "market data",
-            "KALSHI_API_KEY_ID": "test-key-id",
-            "KALSHI_PRIVATE_KEY_PATH": str(key_path),
-        }
-    )
-
-    assert value.database_dsn == (
-        "postgresql://user%40example:p%40ss%3A%2Fword@127.0.0.1:5432/market+data"
-    )
-    summary = value.safe_summary()
-    assert summary["kalshi_websocket_configured"] is True
-    assert "postgres_password" not in summary
-    assert "kalshi_api_key_id" not in summary
-    assert "kalshi_private_key_path" not in summary
-
-
-def test_kalshi_websocket_requires_both_key_id_and_existing_key_path(
-    workspace_tmp_path: Path,
-) -> None:
-    key_path = workspace_tmp_path / "exists.pem"
-    key_path.write_text("ephemeral test placeholder", encoding="utf-8")
-    assert not settings({"KALSHI_API_KEY_ID": "id-only"}).kalshi_websocket_configured
-    assert not settings({"KALSHI_PRIVATE_KEY_PATH": str(key_path)}).kalshi_websocket_configured
-    assert not settings(
-        {
-            "KALSHI_API_KEY_ID": "id",
-            "KALSHI_PRIVATE_KEY_PATH": str(workspace_tmp_path / "missing.pem"),
-        }
-    ).kalshi_websocket_configured
-    assert settings(
-        {"KALSHI_API_KEY_ID": "id", "KALSHI_PRIVATE_KEY_PATH": str(key_path)}
-    ).kalshi_websocket_configured
+def test_env_example_is_polymarket_only_and_parses() -> None:
+    values = {
+        key: value
+        for line in (Path(__file__).parents[1] / ".env.example").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line and not line.startswith("#") and "=" in line
+        for key, value in [line.split("=", 1)]
+    }
+    assert not any(key.startswith("KALSHI_") for key in values)
+    parsed = Settings.from_env(values, load_dotenv_file=False)
+    assert parsed.archive_configured
+    assert parsed.s3_url_style == "path"

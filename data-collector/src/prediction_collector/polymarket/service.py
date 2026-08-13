@@ -11,6 +11,7 @@ from prediction_collector.common.records import book_snapshot_item, trade_item
 from prediction_collector.common.types import MarketCandidate
 from prediction_collector.common.utils import (
     as_decimal,
+    canonical_json,
     content_hash,
     first_present,
     parse_timestamp,
@@ -40,12 +41,10 @@ class PolymarketService:
         rest: PolymarketRestClient,
         database: Database,
         writer: BatchWriter,
-        store_raw_rest: bool,
     ) -> None:
         self.rest = rest
         self.database = database
         self.writer = writer
-        self.store_raw_rest = store_raw_rest
 
     async def sync_metadata(self, *, include_closed: bool = True) -> dict[str, int]:
         counts = {"series": 0, "events": 0, "markets": 0, "outcomes": 0, "tags": 0}
@@ -381,7 +380,7 @@ class PolymarketService:
         pages_fetched = 0
         windows_completed = 0
         page_size = 10_000
-        for market in markets:  # MAX_LIVE_MARKETS never enters this path
+        for market in markets:  # Live tier ceilings never enter this path.
             markets_queried += 1
             market_saturated = False
             end = int(utc_now().timestamp())
@@ -543,8 +542,19 @@ class PolymarketService:
             else []
         )
         if fee_rate_live_only:
-            markets = [market for market in markets if market.active and market.tradable]
-        for market in markets:  # historical/live limits intentionally do not apply
+            # Continuous authoritative per-token requests are resource-heavy.
+            # Limit them to the currently subscribed research universe; the
+            # explicit backfill remains comprehensive and ignores tier ceilings.
+            selected = await self.database.collection_tier_market_ids(
+                ("full_l2", "sampled")
+            )
+            markets = [
+                market
+                for market in markets
+                if market.active and market.tradable
+                and market.external_id in selected
+            ]
+        for market in markets:
             counts["markets_checked"] += 1
             observed_at = utc_now()
             outcome_fees: dict[str, Any] = {}
@@ -688,7 +698,6 @@ class PolymarketService:
                                 "variant": reward_variant,
                                 "daily_summary": daily_summary,
                                 "schedule": schedule,
-                                "market_configuration": raw,
                             },
                         )
                         counts["reward_versions_inserted"] += int(inserted)
@@ -718,7 +727,6 @@ class PolymarketService:
                         configuration={
                             "variant": reward_variant,
                             "daily_summary": daily_summary,
-                            "market_configuration": raw,
                         },
                         version_current=True,
                     )
@@ -904,20 +912,32 @@ class PolymarketService:
         result: Any,
         external_key: str | None = None,
     ) -> None:
-        if not self.store_raw_rest:
-            return
-        await self.database.store_raw_rest(
-            exchange="polymarket",
-            source=source,
-            endpoint=endpoint,
-            entity_type=entity_type,
-            external_key=external_key,
-            requested_at=result.requested_at,
-            received_at=utc_now(),
-            response_timestamp=result.response_timestamp,
-            http_status=result.status_code,
-            parameters=request_parameters(result.url),
-            payload=payload,
+        encoded = canonical_json(payload)
+        record_count = len(payload) if isinstance(payload, list) else (
+            len(payload.get("data", []))
+            if isinstance(payload, dict) and isinstance(payload.get("data"), list)
+            else 1
+        )
+        await self.writer.put(
+            WriteItem(
+                "raw_rest_payloads",
+                {
+                    "source": source,
+                    "endpoint": endpoint,
+                    "entity_type": entity_type,
+                    "external_key": external_key,
+                    "requested_at": result.requested_at,
+                    "received_at": utc_now(),
+                    "response_timestamp": result.response_timestamp,
+                    "response_timestamp_raw": None,
+                    "http_status": result.status_code,
+                    "parameters": request_parameters(result.url),
+                    "content_hash": content_hash(payload),
+                    "record_count": record_count,
+                    "response_bytes": len(encoded.encode("utf-8")),
+                    "payload": payload,
+                },
+            )
         )
 
     async def _raw_result(
