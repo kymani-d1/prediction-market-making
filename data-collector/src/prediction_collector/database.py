@@ -39,9 +39,7 @@ class MetadataSyncDiagnostics:
 
     def as_log_fields(self) -> dict[str, int]:
         return {
-            "stale_lifecycle_states_preserved": (
-                self.stale_lifecycle_states_preserved
-            ),
+            "stale_lifecycle_states_preserved": (self.stale_lifecycle_states_preserved),
         }
 
 
@@ -194,9 +192,8 @@ def _market_metadata_is_stale(
 ) -> bool:
     incoming_upstream = _market_metadata_upstream_timestamp(value)
     current_upstream = parse_timestamp(current.get("metadata_source_timestamp"))
-    if (
-        current_upstream is None
-        and not current.get("metadata_exchange_timestamp_is_transport")
+    if current_upstream is None and not current.get(
+        "metadata_exchange_timestamp_is_transport"
     ):
         current_upstream = parse_timestamp(current.get("metadata_exchange_timestamp"))
     if incoming_upstream is not None and current_upstream is not None:
@@ -230,9 +227,7 @@ def _preserve_newer_market_state(
     incoming_raw = value.get("raw_data")
     incoming_raw = dict(incoming_raw) if isinstance(incoming_raw, dict) else {}
     if "_latest_lifecycle_event" in current_raw:
-        incoming_raw["_latest_lifecycle_event"] = current_raw[
-            "_latest_lifecycle_event"
-        ]
+        incoming_raw["_latest_lifecycle_event"] = current_raw["_latest_lifecycle_event"]
     merged["raw_data"] = incoming_raw
     return merged, True
 
@@ -378,7 +373,9 @@ def parse_effective_time(
 
 
 class Database:
-    def __init__(self, settings: Settings, metrics: ThroughputMetrics | None = None) -> None:
+    def __init__(
+        self, settings: Settings, metrics: ThroughputMetrics | None = None
+    ) -> None:
         self.settings = settings
         self.metrics = metrics or ThroughputMetrics()
         self.pool = AsyncConnectionPool(
@@ -428,7 +425,12 @@ class Database:
                     VALUES (%s, %s, %s, 'running', %s)
                     RETURNING id
                     """,
-                    (uuid.uuid4(), job_type, exchange, _json(self.settings.safe_summary())),
+                    (
+                        uuid.uuid4(),
+                        job_type,
+                        exchange,
+                        _json(self.settings.safe_summary()),
+                    ),
                 )
             ).fetchone()
         assert row is not None
@@ -496,7 +498,11 @@ class Database:
                         value["title"],
                         value.get("category"),
                         value.get("frequency"),
-                        _json(_compact_raw(value.get("raw_data"), ("id", "ticker", "slug"))),
+                        _json(
+                            _compact_raw(
+                                value.get("raw_data"), ("id", "ticker", "slug")
+                            )
+                        ),
                     ),
                 )
             ).fetchone()
@@ -739,7 +745,9 @@ class Database:
                             value.get("liquidity"),
                             value.get("tick_size"),
                             value.get("fee_rate"),
-                            _json(value.get("price_level_structure")) if value.get("price_level_structure") else None,
+                            _json(value.get("price_level_structure"))
+                            if value.get("price_level_structure")
+                            else None,
                             _json(value.get("structural_metadata")),
                             _json(_compact_market_raw(raw)),
                         ),
@@ -790,7 +798,9 @@ class Database:
         allowed = set(_LIFECYCLE_MUTABLE_MARKET_FIELDS)
         unexpected = set(updates) - allowed
         if unexpected:
-            raise ValueError(f"unsupported lifecycle market fields: {sorted(unexpected)}")
+            raise ValueError(
+                f"unsupported lifecycle market fields: {sorted(unexpected)}"
+            )
         observed_at = observed_at or utc_now()
         history_rows = 0
         async with self.pool.connection() as connection:
@@ -860,7 +870,9 @@ class Database:
                     )
                     return True
 
-                current_raw = row["raw_data"] if isinstance(row["raw_data"], dict) else {}
+                current_raw = (
+                    row["raw_data"] if isinstance(row["raw_data"], dict) else {}
+                )
                 value: dict[str, Any] = {
                     "exchange": row["exchange"],
                     "external_id": row["external_id"],
@@ -1063,19 +1075,19 @@ class Database:
                     last_observed_at = GREATEST(last_observed_at, clock_timestamp()),
                     observation_timestamp = GREATEST(observation_timestamp, %s),
                     source_timestamp = CASE
-                        WHEN %s IS NOT NULL
+                        WHEN CAST(%s AS timestamptz) IS NOT NULL
                          AND (source_timestamp IS NULL OR %s > source_timestamp)
                         THEN %s ELSE source_timestamp
                     END,
                     exchange_timestamp = CASE
-                        WHEN NOT %s AND %s IS NOT NULL
+                        WHEN NOT %s AND CAST(%s AS timestamptz) IS NOT NULL
                          AND (exchange_timestamp IS NULL
                               OR exchange_timestamp_is_transport
                               OR %s > exchange_timestamp)
                         THEN %s ELSE exchange_timestamp
                     END,
                     exchange_timestamp_is_transport = CASE
-                        WHEN NOT %s AND %s IS NOT NULL
+                        WHEN NOT %s AND CAST(%s AS timestamptz) IS NOT NULL
                          AND (exchange_timestamp IS NULL
                               OR exchange_timestamp_is_transport
                               OR %s > exchange_timestamp)
@@ -1145,7 +1157,9 @@ class Database:
                 "fees_enabled": raw.get("feesEnabled"),
                 "maker_base_fee": raw.get("makerBaseFee"),
                 "taker_base_fee": raw.get("takerBaseFee"),
-                "fee_rate": str(value.get("fee_rate")) if value.get("fee_rate") is not None else None,
+                "fee_rate": str(value.get("fee_rate"))
+                if value.get("fee_rate") is not None
+                else None,
             }
             digest = content_hash(fee_payload)
             schedule = fee_schedule if isinstance(fee_schedule, dict) else fee_payload
@@ -1228,7 +1242,9 @@ class Database:
             for key in ("minimum_size", "maximum_spread", "maker_rebate")
         ):
             digest = content_hash(reward_settings)
-            first_reward = rewards[0] if rewards and isinstance(rewards[0], dict) else {}
+            first_reward = (
+                rewards[0] if rewards and isinstance(rewards[0], dict) else {}
+            )
             latest_reward = await (
                 await connection.execute(
                     """
@@ -1441,7 +1457,11 @@ class Database:
                         (exchange, scope_type, scope_external_id, fee_type),
                     )
                 ).fetchone()
-                if version_current and latest is not None and latest["content_hash"] == digest:
+                if (
+                    version_current
+                    and latest is not None
+                    and latest["content_hash"] == digest
+                ):
                     await connection.execute(
                         """
                         UPDATE fee_configuration_history
@@ -1651,7 +1671,11 @@ class Database:
                         (exchange, scope_type, scope_external_id, incentive_type),
                     )
                 ).fetchone()
-                if version_current and latest is not None and latest["content_hash"] == digest:
+                if (
+                    version_current
+                    and latest is not None
+                    and latest["content_hash"] == digest
+                ):
                     await connection.execute(
                         """
                         UPDATE incentive_configuration_history
@@ -1842,7 +1866,9 @@ class Database:
 
     async def upsert_tag(self, exchange: str, raw: Mapping[str, Any]) -> int:
         external_id = raw.get("id")
-        name = str(raw.get("label") or raw.get("name") or raw.get("slug") or external_id or "")
+        name = str(
+            raw.get("label") or raw.get("name") or raw.get("slug") or external_id or ""
+        )
         async with self.pool.connection() as connection:
             row = await (
                 await connection.execute(
@@ -1908,7 +1934,9 @@ class Database:
                 "collector_checkpoints", max(int(cursor.rowcount), 0)
             )
 
-    async def live_candidates(self, exchange: str | None = None) -> list[MarketCandidate]:
+    async def live_candidates(
+        self, exchange: str | None = None
+    ) -> list[MarketCandidate]:
         params: tuple[Any, ...] = () if exchange is None else (exchange,)
         where = "" if exchange is None else "WHERE m.exchange = %s"
         query = f"""
@@ -1933,9 +1961,8 @@ class Database:
                 status=row["status"],
                 active=row["is_active"],
                 tradable=row["is_tradable"],
-                closed=str(row["status"] or "").lower() in {
-                    "closed", "resolved", "settled", "finalized"
-                },
+                closed=str(row["status"] or "").lower()
+                in {"closed", "resolved", "settled", "finalized"},
                 archived=bool(row["archived"]),
                 accepting_orders=bool(row["accepting_orders"]),
                 enable_order_book=bool(row["enable_order_book"]),
@@ -1956,9 +1983,7 @@ class Database:
             for row in rows
         ]
 
-    async def collection_tier_market_ids(
-        self, tiers: Iterable[str]
-    ) -> set[str]:
+    async def collection_tier_market_ids(self, tiers: Iterable[str]) -> set[str]:
         values = list(dict.fromkeys(tiers))
         if not values:
             return set()
@@ -2036,7 +2061,7 @@ class Database:
                 ).fetchone()
                 assert row is not None
                 connection_id = int(row["id"])
-                for external_id in (() if pending_subscription else market_external_ids):
+                for external_id in () if pending_subscription else market_external_ids:
                     await connection.execute(
                         """
                         INSERT INTO collector_connection_markets
@@ -2093,7 +2118,10 @@ class Database:
                         updated_at = clock_timestamp()
                     WHERE id = %s
                     """,
-                    (_json({"subscription_ack": dict(acknowledgement or {})}), connection_id),
+                    (
+                        _json({"subscription_ack": dict(acknowledgement or {})}),
+                        connection_id,
+                    ),
                 )
                 connection_rows = max(int(cursor.rowcount or 0), 0)
                 inserted = 0
@@ -2210,10 +2238,7 @@ class Database:
                     (run_id,),
                 )
             ).fetchall()
-        return {
-            (str(row["exchange"]), str(row["market_external_id"]))
-            for row in rows
-        }
+        return {(str(row["exchange"]), str(row["market_external_id"])) for row in rows}
 
     async def update_connection_stats(
         self,
@@ -2275,7 +2300,11 @@ class Database:
             and actual_sequence > expected_sequence
         )
         missing_start = expected_sequence if is_forward_gap else None
-        missing_end = actual_sequence - 1 if is_forward_gap and actual_sequence is not None else None
+        missing_end = (
+            actual_sequence - 1
+            if is_forward_gap and actual_sequence is not None
+            else None
+        )
         messages_missing = (
             actual_sequence - expected_sequence
             if is_forward_gap
@@ -2373,9 +2402,12 @@ class Database:
                 "external_id": market.external_id,
                 "is_active": market.active,
                 "is_tradable": market.tradable,
-                "is_subscribed": (market.exchange, market.external_id) in subscribed_ids,
+                "is_subscribed": (market.exchange, market.external_id)
+                in subscribed_ids,
                 "exclusion_reason": reasons.get((market.exchange, market.external_id)),
-                "observed_volume": str(market.volume) if market.volume is not None else None,
+                "observed_volume": str(market.volume)
+                if market.volume is not None
+                else None,
                 "observed_liquidity": (
                     str(market.liquidity) if market.liquidity is not None else None
                 ),
@@ -2491,10 +2523,7 @@ class Database:
                         """
                     )
                 ).fetchall()
-            current = {
-                str(row["relname"]): int(row["row_writes"] or 0)
-                for row in rows
-            }
+            current = {str(row["relname"]): int(row["row_writes"] or 0) for row in rows}
             previous = self._database_write_baseline
             self._database_write_baseline = current
             if previous is None:
@@ -2557,7 +2586,9 @@ class Database:
             )
         await self.metrics.rows("collector_write_failures")
 
-    async def _write_item(self, connection: Any, kind: str, data: Mapping[str, Any]) -> int:
+    async def _write_item(
+        self, connection: Any, kind: str, data: Mapping[str, Any]
+    ) -> int:
         query, params = _write_query(kind, data)
         cursor = await connection.execute(query, params)
         return max(cursor.rowcount, 0)
@@ -2925,7 +2956,8 @@ class Database:
                     ORDER BY compressed_bytes, id
                     """,
                     (
-                        partition["stream"], partition["partition_date"],
+                        partition["stream"],
+                        partition["partition_date"],
                         partition["partition_hour"],
                     ),
                 )
@@ -2978,7 +3010,8 @@ class Database:
                     RETURNING id
                     """,
                     (
-                        first["stream"], first["partition_date"],
+                        first["stream"],
+                        first["partition_date"],
                         first["partition_hour"],
                         [int(value["id"]) for value in candidates],
                         len(candidates),
@@ -3124,7 +3157,9 @@ class Database:
     async def storage_snapshot(self) -> dict[str, Any]:
         async with self.pool.connection() as connection:
             database_row = await (
-                await connection.execute("SELECT pg_database_size(current_database()) AS bytes")
+                await connection.execute(
+                    "SELECT pg_database_size(current_database()) AS bytes"
+                )
             ).fetchone()
             table_rows = await (
                 await connection.execute(
@@ -3146,7 +3181,9 @@ class Database:
             ).fetchone()
         return {
             "observed_at": utc_now(),
-            "postgres_database_bytes": int(database_row["bytes"] if database_row else 0),
+            "postgres_database_bytes": int(
+                database_row["bytes"] if database_row else 0
+            ),
             "major_table_bytes": {
                 str(row["relname"]): int(row["bytes"]) for row in table_rows
             },
@@ -3163,10 +3200,14 @@ class Database:
     ) -> None:
         observed_at = postgres["observed_at"]
         previous = postgres.get("previous") or {}
-        elapsed_hours = max(
-            (observed_at - previous.get("observed_at")).total_seconds() / 3600,
-            1 / 3600,
-        ) if previous.get("observed_at") else None
+        elapsed_hours = (
+            max(
+                (observed_at - previous.get("observed_at")).total_seconds() / 3600,
+                1 / 3600,
+            )
+            if previous.get("observed_at")
+            else None
+        )
         postgres_growth = (
             (postgres["postgres_database_bytes"] - previous["postgres_database_bytes"])
             / elapsed_hours
@@ -3174,8 +3215,11 @@ class Database:
             else None
         )
         archive_growth = (
-            (archive.get("compressed_bytes_uploaded", 0)
-             - int(previous.get("archive_compressed_bytes") or 0)) / elapsed_hours
+            (
+                archive.get("compressed_bytes_uploaded", 0)
+                - int(previous.get("archive_compressed_bytes") or 0)
+            )
+            / elapsed_hours
             if elapsed_hours
             else None
         )
@@ -3210,14 +3254,16 @@ class Database:
                     archive_growth,
                     archive.get("spool_bytes", 0),
                     pressure_state,
-                    _json({
-                        "archive_healthy": archive.get("healthy", False),
-                        "streams": archive.get("streams", {}),
-                        "compaction": archive.get("compaction", {}),
-                        "raw_rest_objects_reused": archive.get(
-                            "raw_rest_objects_reused", 0
-                        ),
-                    }),
+                    _json(
+                        {
+                            "archive_healthy": archive.get("healthy", False),
+                            "streams": archive.get("streams", {}),
+                            "compaction": archive.get("compaction", {}),
+                            "raw_rest_objects_reused": archive.get(
+                                "raw_rest_objects_reused", 0
+                            ),
+                        }
+                    ),
                 ),
             )
 
