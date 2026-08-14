@@ -372,6 +372,162 @@ async def test_slow_upload_backpressure_stays_bounded_without_row_loss(
 
 
 @pytest.mark.asyncio
+async def test_raw_rest_waits_for_capacity_while_websocket_stream_times_out(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_queue_max_rows=1,
+        archive_queue_max_bytes=1_000_000,
+        archive_enqueue_timeout_seconds=0.01,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    writer = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    blocker = update_record("blocker", "0.40")
+    await writer.put(blocker)
+
+    raw_rest = ArchiveRecord.create(
+        "raw_rest",
+        {
+            "source": "gamma",
+            "endpoint": "/events",
+            "entity_type": "events",
+            "external_key": "page-2",
+            "requested_at": NOW,
+            "received_at": NOW,
+            "parameters": {"limit": 100},
+            "http_status": 200,
+            "content_hash": "raw-rest-backpressure",
+            "record_count": 1,
+            "response_bytes": 20,
+            "payload": [{"id": "event"}],
+        },
+        priority=2,
+    )
+    raw_put = asyncio.create_task(writer.put(raw_rest))
+    await asyncio.sleep(0.03)
+    assert not raw_put.done()
+
+    dequeued = writer.queue.get_nowait()
+    assert dequeued.record_id == blocker.record_id
+    writer.queue.task_done()
+    await writer._release_bytes(dequeued.estimated_bytes)
+    await asyncio.wait_for(raw_put, timeout=1)
+    assert next(iter(writer.queue._queue)).record_id == raw_rest.record_id
+
+    websocket_record = update_record("websocket", "0.41")
+    await asyncio.wait_for(writer.put(websocket_record), timeout=1)
+    assert database.degradations[-1]["reason"] == "bounded_queue_timeout"
+    assert database.degradations[-1]["stream"] == "orderbook_updates"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_raw_rest_backpressure_is_recovered_from_journal(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_queue_max_rows=1,
+        archive_queue_max_bytes=1_000_000,
+        archive_enqueue_timeout_seconds=0.01,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    interrupted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    await interrupted.put(update_record("journal-blocker", "0.42"))
+    raw_rest = ArchiveRecord.create(
+        "raw_rest",
+        {
+            "source": "gamma",
+            "endpoint": "/markets",
+            "entity_type": "markets",
+            "external_key": "cancelled-page",
+            "requested_at": NOW,
+            "received_at": NOW,
+            "parameters": {"limit": 100},
+            "http_status": 200,
+            "content_hash": "cancelled-raw-rest",
+            "record_count": 1,
+            "response_bytes": 20,
+            "payload": [{"id": "market"}],
+        },
+        priority=2,
+    )
+    pending = asyncio.create_task(interrupted.put(raw_rest))
+    await asyncio.sleep(0.03)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert raw_rest.record_id in interrupted._spilled_record_ids
+    assert raw_rest.record_id in interrupted._journal_path.read_text(encoding="utf-8")
+
+    recovered = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    await recovered.start()
+    await recovered.stop()
+    assert any(
+        value["stream"] == "raw_rest" and value["status"] == "uploaded"
+        for value in database.objects.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_internal_spilled_raw_rest_replay_does_not_wait_on_its_own_queue(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_queue_max_rows=1,
+        archive_queue_max_bytes=1_000_000,
+        archive_enqueue_timeout_seconds=0.01,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    writer = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    await writer.put(update_record("replay-blocker", "0.43"))
+    spilled = ArchiveRecord.create(
+        "raw_rest",
+        {
+            "source": "gamma",
+            "endpoint": "/events",
+            "entity_type": "events",
+            "external_key": "spilled-page",
+            "requested_at": NOW,
+            "received_at": NOW,
+            "parameters": {"limit": 100},
+            "http_status": 200,
+            "content_hash": "spilled-raw-rest",
+            "record_count": 1,
+            "response_bytes": 20,
+            "payload": [{"id": "event"}],
+        },
+        priority=2,
+    )
+    await writer._append_journal(spilled)
+    writer._spilled_record_ids.add(spilled.record_id)
+
+    await asyncio.wait_for(writer._retry_spilled_journal_once(), timeout=1)
+    assert spilled.record_id in writer._spilled_record_ids
+    assert database.degradations[-1]["reason"] == "bounded_queue_timeout"
+
+
+@pytest.mark.asyncio
 async def test_permanent_failure_spools_durably_and_restart_recovers(
     workspace_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

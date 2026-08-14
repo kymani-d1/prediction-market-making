@@ -55,6 +55,7 @@ class BatchWriter:
         self.failed_items = 0
         self.run_id: int | None = None
         self.postgres_pressure = "normal"
+        self.storage_pressure_details: dict[str, Any] = {}
         self._reference_state: dict[tuple[str, str], tuple[str, float]] = {}
         self.reference_duplicates_suppressed = 0
 
@@ -247,10 +248,17 @@ class BatchWriter:
                 run_id=self.run_id,
                 stream=item.kind,
                 priority=priority,
-                reason="postgres_critical_optional_hot_write_shed",
+                reason="storage_critical_optional_hot_write_shed",
                 rows_affected=1,
                 bytes_affected=0,
+                details=dict(getattr(self, "storage_pressure_details", {})),
             )
+
+    def set_storage_pressure(
+        self, pressure: str, *, details: dict[str, Any] | None = None
+    ) -> None:
+        self.postgres_pressure = pressure
+        self.storage_pressure_details = dict(details or {})
 
     def put_nowait(self, item: WriteItem) -> bool:
         try:

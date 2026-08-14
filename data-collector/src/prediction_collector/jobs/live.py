@@ -749,23 +749,50 @@ class LiveCollector:
                 pressure = "critical" if size >= critical else "warning" if size >= warning else "normal"
                 queue_rows = int(archive.get("queue_depth", 0))
                 queue_bytes = int(archive.get("queue_bytes", 0))
+                critical_sources: list[str] = []
+                if size >= critical:
+                    critical_sources.append("postgres_size")
                 if (
                     queue_rows >= self.settings.archive_queue_critical_rows
                     or queue_bytes >= self.settings.archive_queue_critical_bytes
                 ):
                     pressure = "critical"
+                    if queue_rows >= self.settings.archive_queue_critical_rows:
+                        critical_sources.append("archive_queue_rows")
+                    if queue_bytes >= self.settings.archive_queue_critical_bytes:
+                        critical_sources.append("archive_queue_bytes")
                 elif pressure == "normal" and (
                     queue_rows >= self.settings.archive_queue_warn_rows
                     or queue_bytes >= self.settings.archive_queue_warn_bytes
                 ):
                     pressure = "warning"
-                self.writer.postgres_pressure = pressure
+                pressure_details = {
+                    "pressure_state": pressure,
+                    "critical_sources": critical_sources,
+                    "postgres_database_bytes": size,
+                    "postgres_critical_bytes": critical,
+                    "archive_queue_rows": queue_rows,
+                    "archive_queue_critical_rows": (
+                        self.settings.archive_queue_critical_rows
+                    ),
+                    "archive_queue_bytes": queue_bytes,
+                    "archive_queue_critical_bytes": (
+                        self.settings.archive_queue_critical_bytes
+                    ),
+                }
+                self.writer.set_storage_pressure(
+                    pressure, details=pressure_details
+                )
                 await self.database.record_storage_metrics(
                     run_id=self.run_id,
                     postgres=postgres,
                     archive=archive,
                     pressure_state=pressure,
                 )
+                if pressure != "critical" and hasattr(
+                    self.database, "resolve_optional_hot_write_degradations"
+                ):
+                    await self.database.resolve_optional_hot_write_degradations()
                 log = LOGGER.warning if pressure != "normal" else LOGGER.info
                 log(
                     "Storage throughput",

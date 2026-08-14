@@ -29,6 +29,50 @@ from prediction_collector.migrations import migrate_database, verify_database_mi
 
 LOGGER = logging.getLogger(__name__)
 
+
+_CURRENT_TIER_STATUS_SQL = """
+    WITH latest_cohort AS (
+        SELECT max(evaluated_at) AS evaluated_at
+        FROM market_collection_tiers
+    )
+    SELECT tier, count(*) AS markets,
+           count(*) FILTER (WHERE ceiling_binding) AS ceiling_binding,
+           max(tier.evaluated_at) AS last_evaluated_at
+    FROM market_collection_tiers tier
+    CROSS JOIN latest_cohort latest
+    WHERE tier.evaluated_at = latest.evaluated_at
+    GROUP BY tier
+"""
+
+
+def _discovery_state(
+    *, latest_complete_discovery: datetime | None, open_refresh_failures: int
+) -> str:
+    if open_refresh_failures:
+        return "retrying"
+    if latest_complete_discovery is not None:
+        return "ready"
+    return "discovering"
+
+
+def _discovery_status(
+    *,
+    latest_complete_discovery: datetime | None,
+    open_refresh_failures: int,
+    open_coverage_warnings: int,
+    open_metadata_schema_warnings: int,
+) -> dict[str, Any]:
+    return {
+        "discovery_state": _discovery_state(
+            latest_complete_discovery=latest_complete_discovery,
+            open_refresh_failures=open_refresh_failures,
+        ),
+        "discovery_warnings": {
+            "open_total": open_coverage_warnings,
+            "market_metadata_schema_failure": open_metadata_schema_warnings,
+        },
+    }
+
 if TYPE_CHECKING:
     from prediction_collector.writer import WriteItem
 
@@ -417,6 +461,36 @@ class Database:
 
     async def start_run(self, job_type: str, exchange: str | None) -> int:
         async with self.pool.connection() as connection:
+            superseded = 0
+            if job_type == "live":
+                # Deployments may briefly overlap while the old process drains,
+                # but a newly starting single-replica live worker is the sole
+                # authoritative run. Serialise concurrent starts, then mark
+                # older running rows cancelled without touching the old process.
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext("
+                    "'prediction_collector_single_live_run'))"
+                )
+                cursor = await connection.execute(
+                    """
+                    UPDATE collector_runs
+                    SET status = 'cancelled',
+                        finished_at = clock_timestamp(),
+                        error_summary = COALESCE(
+                            error_summary,
+                            'superseded by a newer single-replica live run'
+                        ),
+                        metadata = metadata || jsonb_build_object(
+                            'superseded_by_live_startup', true,
+                            'superseded_at', clock_timestamp()
+                        )
+                    WHERE job_type = 'live'
+                      AND status = 'running'
+                      AND exchange IS NOT DISTINCT FROM %s
+                    """,
+                    (exchange,),
+                )
+                superseded = max(int(cursor.rowcount or 0), 0)
             row = await (
                 await connection.execute(
                     """
@@ -434,6 +508,11 @@ class Database:
                 )
             ).fetchone()
         assert row is not None
+        if superseded:
+            LOGGER.info(
+                "Reconciled superseded live collector runs",
+                extra={"superseded_runs": superseded, "exchange": exchange},
+            )
         return int(row["id"])
 
     async def finish_run(
@@ -457,7 +536,7 @@ class Database:
                     markets_tradable = %s, markets_subscribed = %s,
                     markets_excluded = %s,
                     error_summary = %s
-                WHERE id = %s
+                WHERE id = %s AND status = 'running'
                 """,
                 (
                     status,
@@ -3154,6 +3233,21 @@ class Database:
                 """
             )
 
+    async def resolve_optional_hot_write_degradations(self) -> None:
+        """Resolve only pressure-driven optional PostgreSQL shedding events."""
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_degradation_events
+                SET resolved_at = clock_timestamp()
+                WHERE resolved_at IS NULL
+                  AND reason IN (
+                      'storage_critical_optional_hot_write_shed',
+                      'postgres_critical_optional_hot_write_shed'
+                  )
+                """
+            )
+
     async def storage_snapshot(self) -> dict[str, Any]:
         async with self.pool.connection() as connection:
             database_row = await (
@@ -3398,15 +3492,7 @@ class Database:
             result["checkpoints"] = [dict(row) for row in checkpoints]
 
             tier_rows = await (
-                await connection.execute(
-                    """
-                    SELECT tier, count(*) AS markets,
-                           count(*) FILTER (WHERE ceiling_binding) AS ceiling_binding,
-                           max(evaluated_at) AS last_evaluated_at
-                    FROM market_collection_tiers
-                    GROUP BY tier
-                    """
-                )
+                await connection.execute(_CURRENT_TIER_STATUS_SQL)
             ).fetchall()
             result["tiers"] = {
                 tier: {"markets": 0, "ceiling_binding": 0, "last_evaluated_at": None}
@@ -3599,19 +3685,50 @@ class Database:
                              WHERE g.collector_run_id = %s
                                AND g.exchange = 'polymarket'
                                AND g.channel = 'rest:market_discovery'
+                               AND g.gap_type IN (
+                                   'discovery_refresh_failed',
+                                   'market_discovery_refresh_failed'
+                               )
                                AND g.status IN ('open', 'reconciling'))
-                                AS open_discovery_gaps
+                                AS open_discovery_refresh_failures,
+                            (SELECT count(*) FROM data_gaps g
+                             WHERE g.collector_run_id = %s
+                               AND g.exchange = 'polymarket'
+                               AND g.channel = 'rest:market_discovery'
+                               AND g.gap_type = 'market_metadata_schema_failure'
+                               AND g.status IN ('open', 'reconciling'))
+                                AS open_metadata_schema_warnings,
+                            (SELECT count(*) FROM data_gaps g
+                             WHERE g.collector_run_id = %s
+                               AND g.exchange = 'polymarket'
+                               AND g.channel = 'rest:market_discovery'
+                               AND g.gap_type NOT IN (
+                                   'discovery_refresh_failed',
+                                   'market_discovery_refresh_failed'
+                               )
+                               AND g.status IN ('open', 'reconciling'))
+                                AS open_discovery_coverage_warnings
                         """,
-                        tuple(live_run["id"] for _ in range(6)),
+                        tuple(live_run["id"] for _ in range(8)),
                     )
                 ).fetchone()
                 state = dict(row or {})
-                if int(state.get("open_discovery_gaps") or 0):
-                    state["discovery_state"] = "retrying"
-                elif state.get("latest_complete_discovery") is not None:
-                    state["discovery_state"] = "ready"
-                else:
-                    state["discovery_state"] = "discovering"
+                state.update(
+                    _discovery_status(
+                        latest_complete_discovery=state.get(
+                            "latest_complete_discovery"
+                        ),
+                        open_refresh_failures=int(
+                            state.get("open_discovery_refresh_failures") or 0
+                        ),
+                        open_coverage_warnings=int(
+                            state.get("open_discovery_coverage_warnings") or 0
+                        ),
+                        open_metadata_schema_warnings=int(
+                            state.get("open_metadata_schema_warnings") or 0
+                        ),
+                    )
+                )
                 state["healthy"] = bool(
                     state["discovery_state"] == "ready"
                     and int(state.get("connections_active") or 0) > 0

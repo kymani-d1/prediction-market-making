@@ -601,27 +601,60 @@ class ArchiveWriter:
             self._spilled_record_ids.add(record.record_id)
             raise
 
-    async def _enqueue(self, record: ArchiveRecord) -> bool:
+    async def _enqueue(
+        self,
+        record: ArchiveRecord,
+        *,
+        wait_for_raw_rest_capacity: bool = True,
+    ) -> bool:
         if self._task is not None and self._task.done():
             await self._task
             raise RuntimeError("archive writer stopped unexpectedly")
         self._active_record_ids.add(record.record_id)
-        try:
-            async with asyncio.timeout(self.settings.archive_enqueue_timeout_seconds):
-                async with self._bytes_condition:
-                    await self._bytes_condition.wait_for(
-                        lambda: (
-                            self._queued_bytes == 0
-                            or self._queued_bytes + record.estimated_bytes
-                               <= self.settings.archive_queue_max_bytes
+
+        async def enqueue_when_capacity_available() -> None:
+            async with self._bytes_condition:
+                while not (
+                    self._queued_bytes == 0
+                    or self._queued_bytes + record.estimated_bytes
+                       <= self.settings.archive_queue_max_bytes
+                ):
+                    if self._task is not None and self._task.done():
+                        await self._task
+                        raise RuntimeError("archive writer stopped unexpectedly")
+                    # The bounded wait lets us notice a failed consumer even
+                    # when no future byte-release notification can arrive.
+                    try:
+                        await asyncio.wait_for(
+                            self._bytes_condition.wait(), timeout=1.0
                         )
-                    )
-                    self._queued_bytes += record.estimated_bytes
-                try:
-                    await self.queue.put(record)
-                except BaseException:
-                    await self._release_bytes(record.estimated_bytes)
-                    raise
+                    except TimeoutError:
+                        continue
+                self._queued_bytes += record.estimated_bytes
+            try:
+                while True:
+                    try:
+                        await asyncio.wait_for(self.queue.put(record), timeout=1.0)
+                        break
+                    except TimeoutError:
+                        if self._task is not None and self._task.done():
+                            await self._task
+                            raise RuntimeError("archive writer stopped unexpectedly")
+            except BaseException:
+                await self._release_bytes(record.estimated_bytes)
+                raise
+
+        try:
+            if record.stream == "raw_rest" and wait_for_raw_rest_capacity:
+                # The ingress journal already owns the record durably. REST is
+                # replayable and not latency-sensitive, so exert real producer
+                # backpressure until both row and byte capacity become free.
+                await enqueue_when_capacity_available()
+            else:
+                async with asyncio.timeout(
+                    self.settings.archive_enqueue_timeout_seconds
+                ):
+                    await enqueue_when_capacity_available()
         except TimeoutError as exc:
             self._active_record_ids.discard(record.record_id)
             self._spilled_record_ids.add(record.record_id)
@@ -1315,7 +1348,13 @@ class ArchiveWriter:
                 ),
                 estimated_bytes=int(value["estimated_bytes"]),
             )
-            if not await self._enqueue(record):
+            # This method can run inside the sole archive consumer. It must
+            # yield after the configured timeout rather than wait for itself
+            # to free queue capacity. The journal remains authoritative and a
+            # later retry will continue replay.
+            if not await self._enqueue(
+                record, wait_for_raw_rest_capacity=False
+            ):
                 break
 
     async def _recover_compactions(self) -> None:
