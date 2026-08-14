@@ -1,5 +1,10 @@
 # Integration benchmark — 2026-08-13
 
+> Historical report. Its schema/defaults and 9-35 GB/day estimate are
+> superseded by
+> [storage-capacity-validation-2026-08-14.md](storage-capacity-validation-2026-08-14.md).
+> Do not use the 500/1,000 values below as a deployment recommendation.
+
 This is a local disposable integration test, not a Railway production test. It
 used public read-only Polymarket endpoints and placed no orders.
 

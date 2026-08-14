@@ -33,6 +33,7 @@ class OrderBook:
     sequence: int | None = None
     book_hash: str | None = None
     valid: bool = False
+    revision: int = 0
 
     def reset(
         self,
@@ -47,6 +48,7 @@ class OrderBook:
         self.sequence = sequence
         self.book_hash = book_hash
         self.valid = True
+        self.revision += 1
 
     def apply_absolute(
         self,
@@ -67,6 +69,7 @@ class OrderBook:
         # A snapshot hash identifies that exact full state. Any mutation that
         # does not carry a replacement full-book hash invalidates it.
         self.book_hash = book_hash
+        self.revision += 1
 
     def apply_delta(
         self,
@@ -85,6 +88,7 @@ class OrderBook:
         if sequence is not None:
             self.sequence = sequence
         self.book_hash = None
+        self.revision += 1
 
     def _side(self, side: str) -> dict[Decimal, Decimal]:
         normalized = side.lower()

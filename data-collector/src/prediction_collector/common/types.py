@@ -29,6 +29,8 @@ class MarketCandidate:
     liquidity: Decimal | None = None
     outcome_token_ids: tuple[str, ...] = ()
     aliases: tuple[str, ...] = ()
+    source_id: str | None = None
+    event_external_id: str | None = None
     raw_data: JsonObject = field(default_factory=dict)
 
     @property
@@ -36,6 +38,10 @@ class MarketCandidate:
         values = {self.external_id, f"{self.exchange}:{self.external_id}"}
         if self.ticker:
             values.update({self.ticker, f"{self.exchange}:{self.ticker}"})
+        if self.source_id:
+            values.update(
+                {self.source_id, f"{self.exchange}:{self.source_id}"}
+            )
         values.update(self.outcome_token_ids)
         values.update(f"{self.exchange}:{token}" for token in self.outcome_token_ids)
         values.update(self.aliases)
@@ -57,6 +63,7 @@ class LiveSelection:
     tradable: int
     subscribed: list[MarketCandidate]
     excluded: list[MarketExclusion]
+    excluded_total: int | None = None
 
     @property
     def excluded_counts(self) -> dict[str, int]:

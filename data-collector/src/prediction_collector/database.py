@@ -1977,6 +1977,25 @@ class Database:
             ).fetchall()
         return {str(row["external_id"]) for row in rows}
 
+    async def load_tier_state(self) -> list[tuple[str, str, datetime]]:
+        async with self.pool.connection() as connection:
+            rows = await (
+                await connection.execute(
+                    """
+                    SELECT market.external_id, tier.tier,
+                           COALESCE(tier.promoted_at, tier.demoted_at,
+                                    tier.first_assigned_at) AS assigned_at
+                    FROM market_collection_tiers tier
+                    JOIN markets market ON market.id = tier.market_id
+                    WHERE market.exchange = 'polymarket'
+                    """
+                )
+            ).fetchall()
+        return [
+            (str(row["external_id"]), str(row["tier"]), row["assigned_at"])
+            for row in rows
+        ]
+
     async def create_connection(
         self,
         *,
@@ -2634,6 +2653,9 @@ class Database:
         return changed
 
     async def register_archive_object(self, **value: Any) -> int:
+        value.setdefault("payload_content_hash", None)
+        value.setdefault("object_role", "data")
+        value.setdefault("compaction_generation", 0)
         async with self.pool.connection() as connection:
             row = await (
                 await connection.execute(
@@ -2643,7 +2665,8 @@ class Database:
                          row_count, uncompressed_bytes, compressed_bytes,
                          min_source_timestamp, max_source_timestamp,
                          min_received_at, max_received_at, partition_date,
-                         partition_hour, status, local_spool_path)
+                         partition_hour, status, local_spool_path,
+                         payload_content_hash, object_role, compaction_generation)
                     VALUES
                         (%(stream)s, %(schema_version)s, %(object_key)s,
                          %(content_hash)s, %(compression)s, %(row_count)s,
@@ -2651,7 +2674,8 @@ class Database:
                          %(min_source_timestamp)s, %(max_source_timestamp)s,
                          %(min_received_at)s, %(max_received_at)s,
                          %(partition_date)s, %(partition_hour)s, 'prepared',
-                         %(local_spool_path)s)
+                          %(local_spool_path)s, %(payload_content_hash)s,
+                          %(object_role)s, %(compaction_generation)s)
                     ON CONFLICT (content_hash) DO UPDATE SET
                         local_spool_path = COALESCE(
                             archive_objects.local_spool_path,
@@ -2677,6 +2701,35 @@ class Database:
                 """,
                 (attempt, object_id),
             )
+
+    async def archive_object_state(self, object_id: int) -> Mapping[str, Any]:
+        async with self.pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    SELECT id, object_key, content_hash, status
+                    FROM archive_objects WHERE id = %s
+                    """,
+                    (object_id,),
+                )
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"archive object {object_id} disappeared")
+        return row
+
+    async def archive_object_by_content_hash(
+        self, digest: str
+    ) -> Mapping[str, Any] | None:
+        async with self.pool.connection() as connection:
+            return await (
+                await connection.execute(
+                    """
+                    SELECT id, object_key, content_hash, status
+                    FROM archive_objects WHERE content_hash = %s
+                    """,
+                    (digest,),
+                )
+            ).fetchone()
 
     async def mark_archive_uploaded(self, object_id: int) -> None:
         async with self.pool.connection() as connection:
@@ -2711,12 +2764,23 @@ class Database:
                 (error[:8000], object_id),
             )
 
+    async def abandon_archive_object(self, object_id: int, error: str) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_objects SET status = 'failed', last_error = %s,
+                    local_spool_path = NULL, updated_at = clock_timestamp()
+                WHERE id = %s AND status <> 'uploaded'
+                """,
+                (error[:8000], object_id),
+            )
+
     async def archive_object_counts(self, object_id: int) -> Mapping[str, Any]:
         async with self.pool.connection() as connection:
             row = await (
                 await connection.execute(
                     """
-                    SELECT row_count, uncompressed_bytes, compressed_bytes
+                    SELECT stream, row_count, uncompressed_bytes, compressed_bytes
                     FROM archive_objects WHERE id = %s
                     """,
                     (object_id,),
@@ -2725,6 +2789,82 @@ class Database:
         if row is None:
             raise LookupError(f"archive object {object_id} disappeared")
         return row
+
+    async def ensure_archive_identifier(
+        self,
+        *,
+        entity_kind: str,
+        archive_key: int,
+        external_id: str,
+        parent_archive_key: int | None,
+    ) -> bool:
+        async with self.pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    INSERT INTO archive_id_dictionary
+                        (entity_kind, archive_key, exchange, external_id,
+                         parent_archive_key)
+                    VALUES (%s, %s, 'polymarket', %s, %s)
+                    ON CONFLICT (entity_kind, archive_key) DO UPDATE SET
+                        last_observed_at = clock_timestamp()
+                    RETURNING external_id, (xmax = 0) AS inserted
+                    """,
+                    (entity_kind, archive_key, external_id, parent_archive_key),
+                )
+            ).fetchone()
+        if row is None or str(row["external_id"]) != external_id:
+            raise RuntimeError(
+                f"archive identifier collision for {entity_kind}:{archive_key}"
+            )
+        return bool(row["inserted"])
+
+    async def raw_rest_archive_by_content_hash(
+        self, content_hash: str
+    ) -> Mapping[str, Any] | None:
+        async with self.pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    SELECT id, object_key, content_hash, compressed_bytes
+                    FROM archive_objects
+                    WHERE payload_content_hash = %s AND status = 'uploaded'
+                      AND superseded_at IS NULL
+                    LIMIT 1
+                    """,
+                    (content_hash,),
+                )
+            ).fetchone()
+        return row
+
+    async def archive_manifest_keys(self) -> list[str]:
+        async with self.pool.connection() as connection:
+            rows = await (
+                await connection.execute(
+                    """
+                    SELECT object_key FROM archive_objects
+                    WHERE status = 'uploaded' AND superseded_at IS NULL
+                    """
+                )
+            ).fetchall()
+        return [str(row["object_key"]) for row in rows]
+
+    async def mark_market_final_snapshot_archived(
+        self, *, market_external_id: str, archive_object_id: int
+    ) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                INSERT INTO market_archive_finalizations
+                    (market_id, final_snapshot_object_id)
+                SELECT id, %s FROM markets
+                WHERE exchange = 'polymarket' AND external_id = %s
+                ON CONFLICT (market_id) DO UPDATE SET
+                    final_snapshot_object_id = EXCLUDED.final_snapshot_object_id,
+                    archived_at = clock_timestamp()
+                """,
+                (archive_object_id, market_external_id),
+            )
 
     async def pending_archive_objects(self, *, limit: int) -> list[Mapping[str, Any]]:
         async with self.pool.connection() as connection:
@@ -2741,6 +2881,174 @@ class Database:
                 )
             ).fetchall()
         return list(rows)
+
+    async def archive_compaction_candidates(
+        self,
+        *,
+        min_age_seconds: int,
+        min_objects: int,
+        target_bytes: int,
+    ) -> list[Mapping[str, Any]]:
+        async with self.pool.connection() as connection:
+            partition = await (
+                await connection.execute(
+                    """
+                    SELECT stream, partition_date, partition_hour
+                    FROM archive_objects
+                    WHERE status = 'uploaded' AND superseded_at IS NULL
+                      AND object_role IN ('data', 'compacted')
+                      AND stream NOT IN ('raw_rest', 'archive_dictionary')
+                      AND uploaded_at < clock_timestamp() - make_interval(secs => %s)
+                    GROUP BY stream, partition_date, partition_hour
+                    HAVING count(*) >= %s
+                    ORDER BY partition_date, partition_hour, stream
+                    LIMIT 1
+                    """,
+                    (min_age_seconds, min_objects),
+                )
+            ).fetchone()
+            if partition is None:
+                return []
+            rows = await (
+                await connection.execute(
+                    """
+                    SELECT id, stream, schema_version, object_key, content_hash,
+                           row_count, uncompressed_bytes, compressed_bytes,
+                           min_source_timestamp, max_source_timestamp,
+                           min_received_at, max_received_at, partition_date,
+                           partition_hour, compaction_generation
+                    FROM archive_objects
+                    WHERE stream = %s AND partition_date = %s
+                      AND partition_hour = %s AND status = 'uploaded'
+                      AND superseded_at IS NULL
+                      AND object_role IN ('data', 'compacted')
+                    ORDER BY compressed_bytes, id
+                    """,
+                    (
+                        partition["stream"], partition["partition_date"],
+                        partition["partition_hour"],
+                    ),
+                )
+            ).fetchall()
+        selected: list[Mapping[str, Any]] = []
+        total = 0
+        for row in rows:
+            if selected and total >= target_bytes:
+                break
+            selected.append(row)
+            total += int(row["compressed_bytes"])
+        return selected if len(selected) >= min_objects else []
+
+    async def running_archive_compactions(self) -> list[Mapping[str, Any]]:
+        async with self.pool.connection() as connection:
+            rows = await (
+                await connection.execute(
+                    """
+                    SELECT c.id, c.source_object_ids,
+                           c.replacement_object_id,
+                           replacement.status AS replacement_status,
+                           ARRAY(
+                               SELECT source.object_key
+                               FROM archive_objects source
+                               WHERE source.id = ANY(c.source_object_ids)
+                               ORDER BY source.id
+                           ) AS source_object_keys
+                    FROM archive_compactions c
+                    LEFT JOIN archive_objects replacement
+                      ON replacement.id = c.replacement_object_id
+                    WHERE c.status = 'running'
+                    ORDER BY c.started_at
+                    """
+                )
+            ).fetchall()
+        return list(rows)
+
+    async def begin_archive_compaction(
+        self, candidates: list[Mapping[str, Any]]
+    ) -> int:
+        first = candidates[0]
+        async with self.pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    INSERT INTO archive_compactions
+                        (stream, partition_date, partition_hour, status,
+                         source_object_ids, objects_before, bytes_before, row_count)
+                    VALUES (%s, %s, %s, 'running', %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        first["stream"], first["partition_date"],
+                        first["partition_hour"],
+                        [int(value["id"]) for value in candidates],
+                        len(candidates),
+                        sum(int(value["compressed_bytes"]) for value in candidates),
+                        sum(int(value["row_count"]) for value in candidates),
+                    ),
+                )
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    async def set_archive_compaction_replacement(
+        self, compaction_id: int, object_id: int
+    ) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_compactions SET replacement_object_id = %s
+                WHERE id = %s AND status = 'running'
+                """,
+                (object_id, compaction_id),
+            )
+
+    async def complete_archive_compaction(
+        self, compaction_id: int, replacement_id: int, source_ids: list[int]
+    ) -> None:
+        async with self.pool.connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    UPDATE archive_objects SET
+                        status = 'uploaded',
+                        uploaded_at = COALESCE(uploaded_at, clock_timestamp()),
+                        local_spool_path = NULL, last_error = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE id = %s
+                    """,
+                    (replacement_id,),
+                )
+                await connection.execute(
+                    """
+                    UPDATE archive_objects SET
+                        superseded_by_object_id = %s,
+                        superseded_at = clock_timestamp(),
+                        updated_at = clock_timestamp()
+                    WHERE id = ANY(%s::BIGINT[]) AND superseded_at IS NULL
+                    """,
+                    (replacement_id, source_ids),
+                )
+                await connection.execute(
+                    """
+                    UPDATE archive_compactions SET status = 'completed',
+                        objects_after = 1,
+                        bytes_after = (SELECT compressed_bytes FROM archive_objects WHERE id = %s),
+                        replacement_object_id = %s,
+                        completed_at = clock_timestamp()
+                    WHERE id = %s
+                    """,
+                    (replacement_id, replacement_id, compaction_id),
+                )
+
+    async def fail_archive_compaction(self, compaction_id: int, error: str) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_compactions SET status = 'failed', error = %s,
+                    completed_at = clock_timestamp() WHERE id = %s
+                """,
+                (error[:8000], compaction_id),
+            )
 
     async def record_raw_rest_provenance(
         self, *, archive_object_id: int, object_key: str, value: Mapping[str, Any]
@@ -2759,7 +3067,7 @@ class Database:
                      %(response_timestamp_raw)s, %(parameters)s, %(http_status)s,
                      %(content_hash)s, %(response_bytes)s, %(record_count)s,
                      %(archive_object_id)s, %(object_key)s)
-                ON CONFLICT ON CONSTRAINT raw_rest_payloads_compact_key DO NOTHING
+                ON CONFLICT ON CONSTRAINT raw_rest_payloads_request_key DO NOTHING
                 """,
                 {
                     **value,
@@ -2797,6 +3105,20 @@ class Database:
                     bytes_affected,
                     _json(dict(details or {})),
                 ),
+            )
+
+    async def resolve_transient_archive_degradations(self) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_degradation_events
+                SET resolved_at = clock_timestamp()
+                WHERE resolved_at IS NULL
+                  AND reason IN (
+                      'bounded_queue_timeout',
+                      'archive_spool_capacity_exceeded'
+                  )
+                """
             )
 
     async def storage_snapshot(self) -> dict[str, Any]:
@@ -2888,7 +3210,14 @@ class Database:
                     archive_growth,
                     archive.get("spool_bytes", 0),
                     pressure_state,
-                    _json({"archive_healthy": archive.get("healthy", False)}),
+                    _json({
+                        "archive_healthy": archive.get("healthy", False),
+                        "streams": archive.get("streams", {}),
+                        "compaction": archive.get("compaction", {}),
+                        "raw_rest_objects_reused": archive.get(
+                            "raw_rest_objects_reused", 0
+                        ),
+                    }),
                 ),
             )
 
@@ -2912,6 +3241,52 @@ class Database:
                     (interval,),
                 )
                 deleted[table] = max(int(cursor.rowcount or 0), 0)
+            grace = f"{self.settings.closed_market_hot_state_grace_hours} hours"
+            evicted = await connection.execute(
+                """
+                WITH stale_markets AS (
+                    SELECT market.id FROM markets market
+                    JOIN market_archive_finalizations final
+                      ON final.market_id = market.id
+                    WHERE market.exchange = 'polymarket'
+                      AND (NOT market.is_active OR NOT market.is_tradable)
+                      AND COALESCE(market.settlement_time, market.close_time,
+                                   market.updated_at)
+                          < clock_timestamp() - %s::INTERVAL
+                )
+                DELETE FROM current_orderbooks books
+                USING stale_markets stale
+                WHERE books.market_id = stale.id
+                """,
+                (grace,),
+            )
+            deleted["closed_market_current_orderbooks"] = max(
+                int(evicted.rowcount or 0), 0
+            )
+            tiers = await connection.execute(
+                """
+                DELETE FROM market_collection_tiers tier
+                USING markets market
+                WHERE tier.market_id = market.id
+                  AND market.exchange = 'polymarket'
+                  AND (NOT market.is_active OR NOT market.is_tradable)
+                  AND COALESCE(market.settlement_time, market.close_time,
+                               market.updated_at)
+                      < clock_timestamp() - %s::INTERVAL
+                  AND (
+                      EXISTS (
+                          SELECT 1 FROM market_archive_finalizations final
+                          WHERE final.market_id = market.id
+                      )
+                      OR NOT EXISTS (
+                          SELECT 1 FROM current_orderbooks books
+                          WHERE books.market_id = market.id
+                      )
+                  )
+                """,
+                (grace,),
+            )
+            deleted["closed_market_tiers"] = max(int(tiers.rowcount or 0), 0)
         return deleted
 
     async def status(
@@ -3015,6 +3390,7 @@ class Database:
                             AS compressed_bytes_uploaded,
                         max(uploaded_at) AS latest_upload
                     FROM archive_objects
+                    WHERE superseded_at IS NULL
                     """
                 )
             ).fetchone()
@@ -3024,6 +3400,32 @@ class Database:
             archive["compression_ratio"] = (
                 uncompressed / compressed if compressed else None
             )
+            stream_rows = await (
+                await connection.execute(
+                    """
+                    SELECT stream, count(*) AS objects,
+                           COALESCE(sum(row_count), 0) AS rows,
+                           COALESCE(sum(uncompressed_bytes), 0) AS uncompressed_bytes,
+                           COALESCE(sum(compressed_bytes), 0) AS compressed_bytes,
+                           COALESCE(sum(compressed_bytes) FILTER (
+                               WHERE uploaded_at >= clock_timestamp() - INTERVAL '1 hour'
+                           ), 0) AS bytes_last_hour
+                    FROM archive_objects
+                    WHERE status = 'uploaded' AND superseded_at IS NULL
+                    GROUP BY stream ORDER BY stream
+                    """
+                )
+            ).fetchall()
+            archive["streams"] = {
+                str(row["stream"]): {
+                    "objects_total": int(row["objects"]),
+                    "rows_total": int(row["rows"]),
+                    "uncompressed_bytes_total": int(row["uncompressed_bytes"]),
+                    "compressed_bytes_total": int(row["compressed_bytes"]),
+                    "bytes_last_hour": int(row["bytes_last_hour"]),
+                }
+                for row in stream_rows
+            }
             open_degradation = await (
                 await connection.execute(
                     """
@@ -3208,6 +3610,7 @@ def _write_query(kind: str, value: Mapping[str, Any]) -> tuple[str, Mapping[str,
     data = dict(value)
     data.setdefault("source_timestamp_raw", None)
     data.setdefault("exchange_timestamp_raw", None)
+    data.setdefault("observation_kind", "change")
     for key in ("raw_data", "payload", "details", "state"):
         if key in data:
             data[key] = _json(data[key])
@@ -3268,6 +3671,8 @@ def _write_query(kind: str, value: Mapping[str, Any]) -> tuple[str, Mapping[str,
                     bid_depth = EXCLUDED.bid_depth, ask_depth = EXCLUDED.ask_depth,
                     level_count = EXCLUDED.level_count,
                     updated_at = clock_timestamp()
+                WHERE current_orderbooks.received_monotonic_ns
+                      <= EXCLUDED.received_monotonic_ns
                 RETURNING outcome_id
             ), removed AS (
                 DELETE FROM current_orderbook_levels levels
@@ -3336,6 +3741,8 @@ def _write_query(kind: str, value: Mapping[str, Any]) -> tuple[str, Mapping[str,
                     bid_depth = EXCLUDED.bid_depth, ask_depth = EXCLUDED.ask_depth,
                     level_count = EXCLUDED.level_count,
                     updated_at = clock_timestamp()
+                WHERE current_orderbooks.received_monotonic_ns
+                      <= EXCLUDED.received_monotonic_ns
                 RETURNING outcome_id
             ), changed AS (
                 INSERT INTO current_orderbook_levels
@@ -3346,6 +3753,7 @@ def _write_query(kind: str, value: Mapping[str, Any]) -> tuple[str, Mapping[str,
                 ON CONFLICT (outcome_id, side, price) DO UPDATE SET
                     size = EXCLUDED.size, received_at = EXCLUDED.received_at,
                     received_monotonic_ns = EXCLUDED.received_monotonic_ns
+                WHERE current_orderbook_levels.size IS DISTINCT FROM EXCLUDED.size
             ), removed AS (
                 DELETE FROM current_orderbook_levels levels USING header
                 WHERE levels.outcome_id = header.outcome_id
@@ -3366,7 +3774,7 @@ def _write_query(kind: str, value: Mapping[str, Any]) -> tuple[str, Mapping[str,
                  bid_depth_top, ask_depth_top, bid_depth_1pct, ask_depth_1pct,
                  bid_depth_total, ask_depth_total, book_imbalance,
                  last_trade_price, recent_trade_count, recent_trade_volume,
-                 recent_update_count)
+                  recent_update_count, observation_kind)
             SELECT market_id, outcome_id, %(tier)s, %(observed_at)s,
                    %(source_timestamp)s, %(received_at)s, %(best_bid)s,
                    %(best_ask)s, %(midpoint)s, %(spread)s, %(spread_bps)s,
@@ -3374,7 +3782,7 @@ def _write_query(kind: str, value: Mapping[str, Any]) -> tuple[str, Mapping[str,
                    %(ask_depth_1pct)s, %(bid_depth_total)s, %(ask_depth_total)s,
                    %(book_imbalance)s, %(last_trade_price)s,
                    %(recent_trade_count)s, %(recent_trade_volume)s,
-                   %(recent_update_count)s
+                   %(recent_update_count)s, %(observation_kind)s
             FROM resolved WHERE outcome_id IS NOT NULL
             ON CONFLICT (outcome_id, tier, observed_at) DO NOTHING
             """,

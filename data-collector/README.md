@@ -42,8 +42,9 @@ The new split is deliberate:
   long-duration measurements demonstrate that they dominate growth.
 - Full raw REST bodies are archive-only. PostgreSQL keeps request provenance,
   content hashes, record counts, sizes, and the archive object key.
-- Raw WebSocket retention defaults to malformed, unknown, and error messages.
-  Normal known FULL_L2 messages already have a normalized permanent stream.
+- Raw WebSocket retention defaults to every malformed, unknown, and parser-error
+  message plus a deterministic 0.1% sample of known-valid frames. Normal known
+  FULL_L2 messages already have a normalized permanent stream.
 
 ## Collection tiers
 
@@ -53,8 +54,8 @@ not capped.
 
 | Tier | Continuous collection | Permanent history |
 |---|---|---|
-| `FULL_L2` | All book deltas/snapshots, trades, current books, periodic derived observations | Normalized L2 and observations in Parquet |
-| `SAMPLED` | Current books, trades, lifecycle, and 60-second derived observations | Observations in Parquet; no permanent per-delta stream |
+| `FULL_L2` | Every ordered book delta, reconstruction/recovery snapshots, trades, current books, periodic hot derived observations | Initial/reset/recovery/closing snapshots plus normalized L2 deltas; ordinary derived observations are regenerated, not archived |
+| `SAMPLED` | Current books, trades, lifecycle, change-driven derived observations | Changed observations plus sparse liveness heartbeats; no permanent per-delta stream |
 | `METADATA_ONLY` | No continuous market-book subscription | Metadata/lifecycle/economics only |
 
 Eligibility requires a genuinely trade-ready market: active, not closed or
@@ -64,36 +65,62 @@ volume, recent trades/book updates, maker rewards, research-useful wide spreads,
 and proximity to resolution. Ties use the exchange market ID. Tier reasons and
 ceiling bindings are persisted in `market_collection_tiers` and its history.
 
-Production defaults are `500` FULL_L2 and `1,000` SAMPLED markets. These are
-resource safety ceilings, not arbitrary discovery limits. Set either to `0` for
-no ceiling only after measuring CPU, archive backlog, PostgreSQL write activity,
-and disk growth. `FULL_L2_MARKET_ALLOWLIST` forces named markets into FULL_L2;
+Production defaults are `10` FULL_L2 and `50` SAMPLED markets. The limits are
+resource safety ceilings, not discovery limits: the public benchmark discovered
+158,407 trade-ready markets before applying them. Do not set either to `0` until
+a 24-hour stage proves CPU, event-loop lag, archive backlog, PostgreSQL/WAL
+activity, and disk growth are safe. `FULL_L2_MARKET_ALLOWLIST` forces named markets into FULL_L2;
 `LIVE_MARKET_BLOCKLIST` forces named markets to metadata-only. Lists accept
 comma-separated condition IDs, slugs, tickers, or outcome token IDs.
 
-Tier A observations default to 300 seconds because its exact tick history is
-already archived. Tier B defaults to 60 seconds because its observation stream
-is its permanent microstructure history. PostgreSQL retains six hours of hot
-reference prices and 24 hours of hot microstructure observations; the
-same observations remain permanent in Parquet.
+FULL_L2 hot observations default to 300 seconds because its exact tick history
+is already archived. SAMPLED state is evaluated every 30 seconds but persisted
+only after a relevant change; a static stream emits a 900-second heartbeat.
+PostgreSQL retains six hours of hot reference prices and 24 hours of hot
+microstructure observations. Only the SAMPLED observations remain permanent.
+
+Promotion does not require an existing subscription. Complete public discovery
+provides liquidity, 24-hour volume, spread/top-of-book, maker-reward, close-time
+and status signals, so `METADATA_ONLY` can promote directly. Separate promotion
+and demotion thresholds, 1,800-second dwell, cooldown and shard-local socket
+replacement prevent churn. Five FULL_L2 places are reserved by default for a
+deterministic wide-spread/illiquid research bucket rather than ranking only the
+largest markets.
 
 ## Archive and failure semantics
 
 Objects use keys such as:
 
 ```text
-production/schema_version=1/exchange=polymarket/
+production/schema_version=2/exchange=polymarket/
   stream=orderbook_updates/date=2026-08-13/hour=14/
   part-0123456789abcdef01234567.parquet
 ```
 
 Supported streams are `orderbook_updates`, `orderbook_snapshots`,
-`microstructure_observations`, `raw_ws`, `raw_rest`, and `reference_prices`.
+`microstructure_observations`, `raw_ws`, `raw_rest`, `reference_prices`, and
+`archive_dictionary`.
 The writer batches by row count, estimated bytes, flush interval, stream, date,
 and hour. Serialization runs off the WebSocket path. Queue rows and bytes are
 both bounded. Uploads use retry/backoff/jitter, remain in a bounded local spool,
 and are verified with object size plus SHA-256 metadata before the manifest is
 marked uploaded.
+
+Book streams use stable `int64` market/token keys, nanosecond `int64`
+timestamps, `int8` side/action codes, and exact `int64` mantissa plus `int8`
+scale values. This avoids repeated long IDs and decimal strings without float
+rounding. The dictionary is durable in PostgreSQL and Parquet, and the research
+reader resolves ordinary Polymarket IDs automatically.
+
+Permanent snapshots are event-driven: initial/reset/recovery/closing anchors,
+plus a configurable hourly REST reconciliation record. HTTP reconciliation is
+quality evidence and is not applied to deterministic WebSocket replay. The
+writer targets 250,000 rows, 48 MiB estimated input or a five-minute flush;
+hourly compaction safely supersedes compatible small objects only after
+replacement hash/row-count verification and an atomic manifest update.
+
+Raw REST bodies are content-addressed by SHA-256. Every request still gets an
+auditable provenance row, but an already verified body is not uploaded twice.
 
 Priority under pressure is:
 
@@ -126,13 +153,20 @@ Important groups:
   `ARCHIVE_FLUSH_SECONDS`, queue/spool limits, and retry attempts.
 - Tiering: `FULL_L2_MAX_MARKETS`, `SAMPLED_MAX_MARKETS`, score/activity
   thresholds, allowlist/blocklist, and reevaluation interval.
-- Retention: `RAW_WS_POLICY`, `POSTGRES_REFERENCE_RETENTION_HOURS`,
-`POSTGRES_OBSERVATION_RETENTION_HOURS`. Reference prices default to six hot
-hours and observations to 24 hours; both remain permanent in Parquet.
+- Retention/audit: `RAW_WS_POLICY`, `RAW_WS_VALID_SAMPLE_RATE`,
+  `REFERENCE_UNCHANGED_HEARTBEAT_SECONDS`,
+  `POSTGRES_REFERENCE_RETENTION_HOURS`, and
+  `POSTGRES_OBSERVATION_RETENTION_HOURS`. Reference prices default to six hot
+  hours and observations to 24 hours; normalized references and SAMPLED
+  observations remain permanent in Parquet.
+- Compaction: `ARCHIVE_COMPACTION_*`, `ARCHIVE_ROW_GROUP_ROWS`, Zstd level,
+  batch rows/bytes, flush interval, bounded queue and durable spool limits.
 - Guardrails: `POSTGRES_STORAGE_WARN_GB`,
   `POSTGRES_STORAGE_CRITICAL_GB`, archive warning/critical thresholds.
 
-The six-hour live `/fee-rate` refresh is limited to current FULL_L2/SAMPLED
+Complete metadata refresh defaults to 15 minutes. Live lifecycle messages remain
+continuous; the longer REST cadence cuts repeated transport/archive work while
+content hashing still preserves every distinct response body. The six-hour live `/fee-rate` refresh is limited to current FULL_L2/SAMPLED
 markets because it requires one REST request per token. The explicit backfill
 remains comprehensive and is not affected by tier ceilings.
 
@@ -224,9 +258,9 @@ not a normal reset command and must never be run against data you intend to keep
 
 ## PostgreSQL schema
 
-Migration `002_polymarket_hot_archive.sql` is forward-only and non-destructive.
-It renames the former unbounded tables to `legacy_*` instead of dropping them,
-then creates:
+Migrations `002_polymarket_hot_archive.sql` and
+`003_archive_minimisation.sql` are forward-only. Migration 002 renames the
+former unbounded tables to `legacy_*` instead of dropping them, then creates:
 
 - `market_collection_tiers` and append-only tier changes;
 - `current_orderbooks` and `current_orderbook_levels` (replacement state);
@@ -234,6 +268,13 @@ then creates:
 - `archive_objects` (hash/size/time/status manifest);
 - compact `raw_rest_payloads` provenance;
 - `storage_metrics` and `archive_degradation_events`.
+
+Migration 003 adds deterministic archive IDs, content-addressed REST object
+identity, compaction/finalization manifests, sampled observation kinds, current
+book HOT-update tuning, and earlier autovacuum triggers for short-retention
+reference/observation tables. Closed-market retention removes current
+books/levels and active tier state only after the grace period and a verified
+final archive snapshot; metadata, result, lifecycle and manifest remain.
 
 Metadata history hashes only semantic state/structure. Bid, ask, volume, and
 transport timing changes update current fields without opening false metadata
@@ -243,7 +284,7 @@ and retired when authoritative metadata changes.
 
 ## Status and observability
 
-`status` reports database/migration health, table counts, latest trades/books/
+`status` is strictly read-only and never applies a migration. It reports database/migration health, table counts, latest trades/books/
 reference/archive times, tier counts and ceiling bindings, discovery/subscription
 state, archive pending/failed objects, queue age/bytes, compression, spool size,
 PostgreSQL database size/growth, largest tables, and overall health.
@@ -255,7 +296,8 @@ reasons are DEBUG or persisted, not emitted once per record. The one-minute
 throughput event includes WebSocket messages/minute and actual PostgreSQL row
 write activity from `pg_stat_user_tables`.
 
-Storage guardrails set the writer state to `warning` or `critical`. At critical
+Archive metrics include rows and compressed/uncompressed bytes by stream plus
+compaction object/byte counts before and after. Storage guardrails set the writer state to `warning` or `critical`. At critical
 PostgreSQL size, optional hot observations/reference copies are shed only after
 their permanent archive path is attempted, and degradation is explicit. Watch
 Railway volume usage as well as row counts because `raw_ws`, normalized L2, and
@@ -280,17 +322,24 @@ table = load_archive(
     start=datetime(2026, 8, 13, 14, tzinfo=UTC),
     end=datetime(2026, 8, 13, 15, tzinfo=UTC),
     markets=["0x-condition-id"],
-    columns=["received_at", "market_external_id", "price", "size"],
+    columns=["received_ts_ns", "market_key", "price_mantissa", "price_scale"],
 )
 ```
+
+The `markets` filter takes normal Polymarket market or token identifiers. The
+reader resolves compact keys through `archive_dictionary`, prunes hour
+partitions, and applies Arrow projection/predicate pushdown. Use
+`prediction_collector.archive_replay.replay_book()` to reconstruct one FULL_L2
+token from compact snapshot and delta tables.
 
 DuckDB can query the same objects directly after download or with an S3 extension:
 
 ```sql
-SELECT market_external_id, received_at, side, price, size
-FROM read_parquet('research/schema_version=1/exchange=polymarket/stream=orderbook_updates/date=2026-08-13/hour=14/*.parquet')
-WHERE market_external_id = '0x-condition-id'
-ORDER BY received_at;
+SELECT market_key, received_ts_ns, side, action,
+       price_mantissa, price_scale, size_mantissa, size_scale
+FROM read_parquet('research/schema_version=2/exchange=polymarket/stream=orderbook_updates/date=2026-08-13/hour=14/*.parquet')
+WHERE market_key = 123456789
+ORDER BY received_ts_ns, received_monotonic_ns;
 ```
 
 ## Railway production deployment
@@ -336,9 +385,10 @@ Create two services from the same repository/Dockerfile:
 - `collector-backfill`: start command `python -m prediction_collector backfill`,
   restart policy `Never`; deploy/run only after live is confirmed.
 
-Use the production defaults from `.env.example`; set `JSON_LOGS=true` and
-`LOG_LEVEL=INFO`. Start `collector-live` first. Do not let a one-shot backfill
-service restart forever.
+Use the conservative 10/50 defaults from `.env.example`; set `JSON_LOGS=true`
+and `LOG_LEVEL=INFO`. Start `collector-live` first. Do not let a one-shot
+backfill service restart forever. Do not start at 25/200: the accepted 25/100
+local stage already averaged 97.4% of one CPU core.
 
 Verify deployment:
 
@@ -362,7 +412,7 @@ still need a separate replication/export plan.
 ### Backups before irreplaceable collection
 
 Before leaving the live worker unattended, open the Railway PostgreSQL service,
-go to **Settings -> Backups**, and enable at least Daily plus Weekly scheduled
+open the **Backups** tab, and enable at least Daily plus Weekly scheduled
 volume backups. Daily snapshots run every 24 hours and are retained six days;
 weekly snapshots run every seven days and are retained one month. Railway warns
 that wiping a volume deletes its backups, so do not treat same-volume backups as
@@ -372,6 +422,14 @@ For a valuable long-running database, enable PostgreSQL point-in-time recovery
 as well. Railway’s PITR uses pgBackRest, daily incremental and weekly full base
 backups, plus archived WAL for roughly a four-week restore window:
 <https://docs.railway.com/volumes/point-in-time-recovery>.
+
+As verified on 2026-08-14, Railway Buckets cost $0.015/GB-month and operations /
+bucket egress are free; uploads from the worker still incur service egress at
+$0.05/GB because buckets use the public network. Thus 100/250/500/1,000 GB
+stored for a full month cost about $1.50/$3.75/$7.50/$15.00 for bucket storage,
+excluding plan, compute, service egress, database volume and PITR. Current
+official references: <https://docs.railway.com/storage-buckets/billing> and
+<https://railway.com/pricing>.
 
 ## Safe replacement of the experimental Railway database
 
@@ -413,7 +471,9 @@ The repository includes deterministic tests for Polymarket-only startup,
 tradability, tier scoring/caps/promotions, current-book replacement, metadata
 semantic deduplication, raw REST provenance, archive batching/partitioning,
 Parquet readability, retry/backpressure/permanent failure, restart spool recovery,
-status read-only behavior, and timestamp/feed integrity.
+status read-only behavior, exact decimal encoding, stable IDs, valid-frame
+sampling, change/heartbeat suppression, replay, reader ID resolution,
+closed-market eviction, compaction/crash safety, and timestamp/feed integrity.
 
 For a disposable real PostgreSQL 18 and S3-compatible endpoint:
 
@@ -426,8 +486,11 @@ throwaway `DATABASE_URL` and S3 bucket. It runs public read-only Polymarket
 traffic, reports coverage, messages, actual PostgreSQL write activity, archive
 compression/backlog/failures, CPU, memory, and short-sample projections.
 
-The measured PostgreSQL 18/MinIO/public-Polymarket results and explicit capacity
-assumptions are in [docs/integration-benchmark-2026-08-13.md](docs/integration-benchmark-2026-08-13.md).
+The final PostgreSQL 18/MinIO/public-Polymarket scaling, encoding, retention,
+failure and capacity evidence is in
+[docs/storage-capacity-validation-2026-08-14.md](docs/storage-capacity-validation-2026-08-14.md).
+The older 2026-08-13 report is retained as historical evidence and its 9-35
+GB/day projection is superseded.
 
 ## Remaining limitations
 
@@ -436,7 +499,13 @@ assumptions are in [docs/integration-benchmark-2026-08-13.md](docs/integration-b
   where available; reconnects require new snapshots.
 - Short benchmarks are not long-duration capacity proofs. Initial comprehensive
   metadata discovery is write-heavy and must not be extrapolated as steady state.
-- Tier scoring is intentionally deterministic but requires tuning from real
+- 50/200 saturated a core and 100/500 did not complete safely. A 24-hour 10/50
+  Railway pilot is required before incremental scaling.
+- Normalized trades remain permanent in PostgreSQL, so the database is bounded
+  for hot windows but does not reach a strict all-table plateau.
+- Hourly compaction and archive outages are deterministically tested, but not
+  validated through a day-long real bucket outage/workload.
+- Tier scoring is deterministic but requires tuning from real
   maker-research outcomes and long-duration resource measurements.
 - Railway Buckets lack versioning, object lock, lifecycle management, and native
   backups. Replicate valuable Parquet externally.

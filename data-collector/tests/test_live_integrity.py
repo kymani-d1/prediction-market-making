@@ -6,7 +6,10 @@ from decimal import Decimal
 import pytest
 
 from prediction_collector.polymarket.rtds import PolymarketRtdsWebSocket
-from prediction_collector.polymarket.websocket import _polymarket_lifecycle_updates
+from prediction_collector.polymarket.websocket import (
+    _fully_initialized_markets,
+    _polymarket_lifecycle_updates,
+)
 from prediction_collector.writer import WriteItem
 
 
@@ -36,6 +39,18 @@ def test_new_market_lifecycle_does_not_invent_trade_readiness() -> None:
         "status": "active",
         "is_active": True,
     }
+
+
+def test_partial_initial_dump_confirms_only_complete_markets() -> None:
+    mapping = {
+        "a-yes": "market-a",
+        "a-no": "market-a",
+        "b-yes": "market-b",
+        "b-no": "market-b",
+    }
+    assert _fully_initialized_markets(
+        mapping, {"a-yes", "a-no", "b-yes"}
+    ) == {"market-a"}
 
 
 @pytest.mark.asyncio
@@ -85,6 +100,28 @@ async def test_chainlink_twap_scales_e18_and_keeps_window_feed_identity() -> Non
     assert writer.items[0].data["provider"] == "chainlink_twap_30s"
     assert writer.items[0].data["price"] == Decimal("65000.5")
     assert writer.items[0].data["raw_data"]["point"]["full_accuracy_value"] == raw_exact
+
+
+@pytest.mark.asyncio
+async def test_chainlink_spot_uses_documented_decimal_value_not_e18_auxiliary() -> None:
+    writer = CapturingWriter()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    await socket(writer)._price_item(
+        "crypto_prices_chainlink",
+        "chainlink_spot",
+        "ZEC/USD",
+        {
+            "timestamp": 1_800_000_000,
+            "value": "486.41403713256",
+            "full_accuracy_value": "486414037132560000000",
+        },
+        {},
+        1,
+        now,
+        now,
+        123,
+    )
+    assert writer.items[0].data["price"] == Decimal("486.41403713256")
 
 
 @pytest.mark.asyncio

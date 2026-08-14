@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from psycopg import DataError, IntegrityError, ProgrammingError
 
 from prediction_collector.archive import (
     ArchiveBackpressureError,
@@ -52,6 +55,8 @@ class BatchWriter:
         self.failed_items = 0
         self.run_id: int | None = None
         self.postgres_pressure = "normal"
+        self._reference_state: dict[tuple[str, str], tuple[str, float]] = {}
+        self.reference_duplicates_suppressed = 0
 
     @property
     def task(self) -> asyncio.Task[None] | None:
@@ -85,7 +90,13 @@ class BatchWriter:
                 await self._archive("orderbook_updates", data, priority=3)
             return WriteItem("current_orderbook_updates", data)
         if item.kind == "orderbook_snapshots":
-            if tier is CollectionTier.FULL_L2:
+            # A terminal snapshot is the replay anchor for evicting a closed
+            # market from PostgreSQL.  Preserve it even if a concurrent
+            # lifecycle/tier update has already demoted the market.
+            if (
+                tier is CollectionTier.FULL_L2
+                or data.get("snapshot_type") == "closing"
+            ):
                 await self._archive("orderbook_snapshots", data, priority=3)
             # Periodic REST reconciliation is useful immutable archive
             # evidence, but its response has no ordering relationship with
@@ -94,7 +105,10 @@ class BatchWriter:
                 return None
             return WriteItem("current_orderbook_snapshots", data)
         if item.kind in {"market_snapshots", "microstructure_observations"}:
-            await self._archive("microstructure_observations", data, priority=5)
+            # FULL_L2 observations are a bounded PostgreSQL convenience view;
+            # the permanent snapshot+delta stream regenerates them exactly.
+            if tier is CollectionTier.SAMPLED:
+                await self._archive("microstructure_observations", data, priority=5)
             if self.postgres_pressure == "critical":
                 await self._record_pressure_degradation(item, priority=5)
                 return None
@@ -115,6 +129,30 @@ class BatchWriter:
             await self._archive("raw_rest", data, priority=2)
             return None
         if item.kind == "reference_price_updates":
+            reference_key = (
+                str(data.get("provider") or ""),
+                str(data.get("external_instrument_id") or ""),
+            )
+            reference_fingerprint = content_hash(
+                {
+                    key: data.get(key)
+                    for key in (
+                        "price", "bid", "ask", "confidence_interval",
+                        "publish_slot", "source_status",
+                    )
+                }
+            )
+            now = time.monotonic()
+            previous = self._reference_state.get(reference_key)
+            if (
+                previous is not None
+                and previous[0] == reference_fingerprint
+                and now - previous[1]
+                    < self.archive.settings.reference_unchanged_heartbeat_seconds
+            ):
+                self.reference_duplicates_suppressed += 1
+                return None
+            self._reference_state[reference_key] = (reference_fingerprint, now)
             try:
                 await self._archive("reference_prices", data, priority=4)
             except ArchiveBackpressureError:
@@ -181,11 +219,24 @@ class BatchWriter:
             channel == "sports"
             and message_type not in {"error", "malformed_json", "unknown"}
         )
-        if policy == "errors":
-            return (
-                (message_type not in known and not known_transport_envelope)
-                or message_type in {"error", "malformed_json"}
+        is_error = (
+            (message_type not in known and not known_transport_envelope)
+            or message_type in {"error", "malformed_json", "parser_error", "unknown"}
+        )
+        if policy in {"errors", "errors_sample"}:
+            if is_error:
+                return True
+            if policy == "errors":
+                return False
+            digest = content_hash(
+                {
+                    "channel": channel,
+                    "message_type": message_type,
+                    "payload": data.get("payload"),
+                }
             )
+            bucket = int(digest[:16], 16) / float(1 << 64)
+            return bucket < float(self.archive.settings.raw_ws_valid_sample_rate)
         return policy == "full_l2" and tier is CollectionTier.FULL_L2
 
     async def _record_pressure_degradation(
@@ -211,18 +262,23 @@ class BatchWriter:
     async def run(self) -> None:
         batch: list[WriteItem] = []
         while not self._stop.is_set() or not self.queue.empty() or batch:
+            flush_event: asyncio.Event | None = None
             timeout = self.flush_interval_seconds if not batch else min(
                 self.flush_interval_seconds, 0.25
             )
             try:
                 item = await asyncio.wait_for(self.queue.get(), timeout=timeout)
-                batch.append(item)
+                if item.kind == "__flush__":
+                    flush_event = item.data["event"]
+                else:
+                    batch.append(item)
             except TimeoutError:
                 pass
             if batch and (
                 len(batch) >= self.batch_size
                 or self._stop.is_set()
                 or self.queue.empty()
+                or flush_event is not None
             ):
                 flushing = batch
                 batch = []
@@ -231,6 +287,17 @@ class BatchWriter:
                 finally:
                     for _ in flushing:
                         self.queue.task_done()
+            if flush_event is not None:
+                self.queue.task_done()
+                flush_event.set()
+
+    async def flush(self) -> None:
+        """Wait for DB records preceding this FIFO boundary, not future traffic."""
+        if self._task is not None and self._task.done():
+            await self._task
+        event = asyncio.Event()
+        await self.queue.put(WriteItem("__flush__", {"event": event}))
+        await event.wait()
 
     async def _flush_with_retry(self, batch: list[WriteItem]) -> None:
         delay = 0.5
@@ -244,6 +311,25 @@ class BatchWriter:
                 raise
             except Exception as exc:
                 last_error = exc
+                if isinstance(
+                    exc,
+                    (
+                        DataError,
+                        IntegrityError,
+                        ProgrammingError,
+                        TypeError,
+                        ValueError,
+                    ),
+                ):
+                    LOGGER.error(
+                        "Permanent database batch error; isolating bad rows",
+                        extra={
+                            "batch_size": len(batch),
+                            "error_type": type(exc).__name__,
+                            "error": str(exc)[:1000],
+                        },
+                    )
+                    break
                 if attempt == 6:
                     LOGGER.exception(
                         "Database batch failed after retries; isolating bad rows",

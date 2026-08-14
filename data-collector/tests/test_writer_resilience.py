@@ -63,3 +63,25 @@ async def test_poison_row_is_quarantined_without_deadlocking_queue(
     assert writer.failed_items == 1
     assert database.quarantined[0][0].data == realistic_payload
     assert database.quarantined[0][2] == 42
+
+
+@pytest.mark.asyncio
+async def test_fifo_flush_boundary_does_not_wait_for_future_live_records() -> None:
+    database = FailingDatabase()
+    writer = BatchWriter(
+        database,  # type: ignore[arg-type]
+        max_queue_size=10,
+        batch_size=100,
+        flush_interval_seconds=300,
+    )
+    await writer.start()
+    await writer.put(WriteItem("trades", {"id": "before-boundary"}))
+    await asyncio.wait_for(writer.flush(), timeout=1)
+    assert [item.data["id"] for item in database.persisted] == ["before-boundary"]
+
+    await writer.put(WriteItem("trades", {"id": "after-boundary"}))
+    await asyncio.wait_for(writer.stop(), timeout=1)
+    assert [item.data["id"] for item in database.persisted] == [
+        "before-boundary",
+        "after-boundary",
+    ]

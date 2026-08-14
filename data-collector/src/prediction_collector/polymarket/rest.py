@@ -116,12 +116,14 @@ class PolymarketRestClient:
     ) -> AsyncIterator[tuple[list[dict[str, Any]], HttpResult, str | None]]:
         """Enumerate live events with nested markets using stable cursors.
 
-        Gamma's keyset event endpoint documents ``closed`` but not ``active``.
-        The service filters the returned event objects by their authoritative
-        state instead of sending an ignored query parameter.
+        Polymarket's official market-discovery guidance explicitly requires
+        both ``active=true`` and ``closed=false`` for live coverage. The
+        service still validates each returned event defensively.
         """
         async for page in self._keyset(
-            "events", parameters={"closed": "false"}, page_size=100
+            "events",
+            parameters={"active": "true", "closed": "false"},
+            page_size=100,
         ):
             yield page
 

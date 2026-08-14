@@ -96,15 +96,16 @@ class Settings:
     polymarket_sports_enabled: bool = True
     polymarket_comments_enabled: bool = False
 
-    metadata_sync_interval_seconds: int = 300
+    metadata_sync_interval_seconds: int = 900
     economics_sync_interval_seconds: int = 3600
     polymarket_fee_rate_sync_interval_seconds: int = 21_600
     # The complete tick stream for FULL_L2 lives in Parquet. PostgreSQL keeps
     # only coarse research-ready observations, so these conservative defaults
     # do not recreate the old unbounded hot-store growth through derived rows.
     full_l2_observation_interval_seconds: int = 300
-    sampled_snapshot_interval_seconds: int = 60
-    orderbook_reconcile_interval_seconds: int = 300
+    sampled_snapshot_interval_seconds: int = 30
+    sampled_heartbeat_interval_seconds: int = 900
+    orderbook_reconcile_interval_seconds: int = 3600
     tier_reevaluation_interval_seconds: int = 300
     tier_activity_window_seconds: int = 900
     metrics_log_interval_seconds: int = 60
@@ -120,12 +121,20 @@ class Settings:
     database_queue_size: int = 50_000
     polymarket_ws_subscription_chunk_size: int = 500
 
-    full_l2_max_markets: int = 500
-    sampled_max_markets: int = 1_000
+    # These are intentionally pilot limits. Raising them requires a measured
+    # queue/CPU/archive-growth review, not an assumption that discovery scale
+    # and full-depth subscription scale are equivalent.
+    full_l2_max_markets: int = 10
+    sampled_max_markets: int = 50
     full_l2_min_score: Decimal = Decimal("55")
     full_l2_min_liquidity: Decimal = Decimal("1000")
     full_l2_min_recent_trades: int = 2
     full_l2_min_book_updates: int = 100
+    sampled_promotion_score: Decimal = Decimal("20")
+    sampled_demotion_score: Decimal = Decimal("12")
+    full_l2_demotion_score: Decimal = Decimal("45")
+    tier_min_dwell_seconds: int = 1800
+    full_l2_research_reserve: int = 5
     full_l2_market_allowlist: frozenset[str] = field(default_factory=frozenset)
     live_market_blocklist: frozenset[str] = field(default_factory=frozenset)
 
@@ -136,10 +145,12 @@ class Settings:
     s3_secret_access_key: str | None = field(default=None, repr=False)
     s3_prefix: str = "prediction-market-archive"
     s3_url_style: str = "virtual"
-    archive_batch_rows: int = 25_000
-    archive_batch_bytes: int = 32 * 1024 * 1024
-    archive_flush_seconds: float = 15
+    archive_batch_rows: int = 250_000
+    archive_batch_bytes: int = 48 * 1024 * 1024
+    archive_flush_seconds: float = 300
     archive_compression: str = "zstd"
+    archive_zstd_level: int = 3
+    archive_row_group_rows: int = 100_000
     archive_queue_max_rows: int = 50_000
     archive_queue_max_bytes: int = 64 * 1024 * 1024
     archive_queue_warn_rows: int = 35_000
@@ -150,12 +161,20 @@ class Settings:
     archive_spool_directory: Path = Path("/tmp/prediction-collector-archive")
     archive_spool_max_bytes: int = 2 * 1024 * 1024 * 1024
     archive_upload_max_attempts: int = 6
-    raw_ws_policy: str = "errors"
+    archive_compaction_enabled: bool = True
+    archive_compaction_interval_seconds: int = 3600
+    archive_compaction_min_age_seconds: int = 900
+    archive_compaction_min_objects: int = 4
+    archive_compaction_target_bytes: int = 64 * 1024 * 1024
+    raw_ws_policy: str = "errors_sample"
+    raw_ws_valid_sample_rate: Decimal = Decimal("0.001")
+    reference_unchanged_heartbeat_seconds: int = 300
 
     postgres_storage_warn_gb: Decimal = Decimal("70")
     postgres_storage_critical_gb: Decimal = Decimal("85")
     postgres_reference_retention_hours: int = 6
     postgres_observation_retention_hours: int = 24
+    closed_market_hot_state_grace_hours: int = 24
 
     polymarket_equity_symbols: frozenset[str] = DEFAULT_POLYMARKET_EQUITY_SYMBOLS
     log_level: str = "INFO"
@@ -200,6 +219,7 @@ class Settings:
             "s3_bucket": self.s3_bucket,
             "s3_prefix": self.s3_prefix,
             "raw_ws_policy": self.raw_ws_policy,
+            "raw_ws_valid_sample_rate": str(self.raw_ws_valid_sample_rate),
             "full_l2_max_markets": self.full_l2_max_markets,
             "sampled_max_markets": self.sampled_max_markets,
             "full_l2_min_score": str(self.full_l2_min_score),
@@ -235,12 +255,13 @@ class Settings:
             polymarket_rtds_enabled=_bool(get("POLYMARKET_RTDS_ENABLED"), True),
             polymarket_sports_enabled=_bool(get("POLYMARKET_SPORTS_ENABLED"), True),
             polymarket_comments_enabled=_bool(get("POLYMARKET_COMMENTS_ENABLED"), False),
-            metadata_sync_interval_seconds=_int(get("METADATA_SYNC_INTERVAL_SECONDS"), 300, name="METADATA_SYNC_INTERVAL_SECONDS", minimum=5),
+            metadata_sync_interval_seconds=_int(get("METADATA_SYNC_INTERVAL_SECONDS"), 900, name="METADATA_SYNC_INTERVAL_SECONDS", minimum=5),
             economics_sync_interval_seconds=_int(get("ECONOMICS_SYNC_INTERVAL_SECONDS"), 3600, name="ECONOMICS_SYNC_INTERVAL_SECONDS", minimum=60),
             polymarket_fee_rate_sync_interval_seconds=_int(get("POLYMARKET_FEE_RATE_SYNC_INTERVAL_SECONDS"), 21_600, name="POLYMARKET_FEE_RATE_SYNC_INTERVAL_SECONDS", minimum=900),
             full_l2_observation_interval_seconds=_int(get("FULL_L2_OBSERVATION_INTERVAL_SECONDS"), 300, name="FULL_L2_OBSERVATION_INTERVAL_SECONDS", minimum=1),
-            sampled_snapshot_interval_seconds=_int(get("SAMPLED_SNAPSHOT_INTERVAL_SECONDS"), 60, name="SAMPLED_SNAPSHOT_INTERVAL_SECONDS", minimum=1),
-            orderbook_reconcile_interval_seconds=_int(get("ORDERBOOK_RECONCILE_INTERVAL_SECONDS"), 300, name="ORDERBOOK_RECONCILE_INTERVAL_SECONDS", minimum=5),
+            sampled_snapshot_interval_seconds=_int(get("SAMPLED_SNAPSHOT_INTERVAL_SECONDS"), 30, name="SAMPLED_SNAPSHOT_INTERVAL_SECONDS", minimum=1),
+            sampled_heartbeat_interval_seconds=_int(get("SAMPLED_HEARTBEAT_INTERVAL_SECONDS"), 900, name="SAMPLED_HEARTBEAT_INTERVAL_SECONDS", minimum=1),
+            orderbook_reconcile_interval_seconds=_int(get("ORDERBOOK_RECONCILE_INTERVAL_SECONDS"), 3600, name="ORDERBOOK_RECONCILE_INTERVAL_SECONDS", minimum=60),
             tier_reevaluation_interval_seconds=_int(get("TIER_REEVALUATION_INTERVAL_SECONDS"), 300, name="TIER_REEVALUATION_INTERVAL_SECONDS", minimum=10),
             tier_activity_window_seconds=_int(get("TIER_ACTIVITY_WINDOW_SECONDS"), 900, name="TIER_ACTIVITY_WINDOW_SECONDS", minimum=60),
             metrics_log_interval_seconds=_int(get("METRICS_LOG_INTERVAL_SECONDS"), 60, name="METRICS_LOG_INTERVAL_SECONDS", minimum=10),
@@ -255,12 +276,17 @@ class Settings:
             database_flush_interval_seconds=_float(get("DATABASE_FLUSH_INTERVAL_SECONDS"), 2, name="DATABASE_FLUSH_INTERVAL_SECONDS", minimum=0.1),
             database_queue_size=_int(get("DATABASE_QUEUE_SIZE"), 50_000, name="DATABASE_QUEUE_SIZE", minimum=100),
             polymarket_ws_subscription_chunk_size=_int(get("POLYMARKET_WS_SUBSCRIPTION_CHUNK_SIZE"), 500, name="POLYMARKET_WS_SUBSCRIPTION_CHUNK_SIZE", minimum=1),
-            full_l2_max_markets=_int(get("FULL_L2_MAX_MARKETS"), 500, name="FULL_L2_MAX_MARKETS"),
-            sampled_max_markets=_int(get("SAMPLED_MAX_MARKETS"), 1_000, name="SAMPLED_MAX_MARKETS"),
+            full_l2_max_markets=_int(get("FULL_L2_MAX_MARKETS"), 10, name="FULL_L2_MAX_MARKETS"),
+            sampled_max_markets=_int(get("SAMPLED_MAX_MARKETS"), 50, name="SAMPLED_MAX_MARKETS"),
             full_l2_min_score=_decimal(get("FULL_L2_MIN_SCORE"), Decimal("55"), name="FULL_L2_MIN_SCORE"),
             full_l2_min_liquidity=_decimal(get("FULL_L2_MIN_LIQUIDITY"), Decimal("1000"), name="FULL_L2_MIN_LIQUIDITY"),
             full_l2_min_recent_trades=_int(get("FULL_L2_MIN_RECENT_TRADES"), 2, name="FULL_L2_MIN_RECENT_TRADES"),
             full_l2_min_book_updates=_int(get("FULL_L2_MIN_BOOK_UPDATES"), 100, name="FULL_L2_MIN_BOOK_UPDATES"),
+            sampled_promotion_score=_decimal(get("SAMPLED_PROMOTION_SCORE"), Decimal("20"), name="SAMPLED_PROMOTION_SCORE"),
+            sampled_demotion_score=_decimal(get("SAMPLED_DEMOTION_SCORE"), Decimal("12"), name="SAMPLED_DEMOTION_SCORE"),
+            full_l2_demotion_score=_decimal(get("FULL_L2_DEMOTION_SCORE"), Decimal("45"), name="FULL_L2_DEMOTION_SCORE"),
+            tier_min_dwell_seconds=_int(get("TIER_MIN_DWELL_SECONDS"), 1800, name="TIER_MIN_DWELL_SECONDS", minimum=0),
+            full_l2_research_reserve=_int(get("FULL_L2_RESEARCH_RESERVE"), 5, name="FULL_L2_RESEARCH_RESERVE", minimum=0),
             full_l2_market_allowlist=_csv(get("FULL_L2_MARKET_ALLOWLIST")),
             live_market_blocklist=_csv(get("LIVE_MARKET_BLOCKLIST")),
             s3_endpoint_url=get("S3_ENDPOINT_URL") or get("AWS_ENDPOINT_URL"),
@@ -270,10 +296,12 @@ class Settings:
             s3_secret_access_key=get("S3_SECRET_ACCESS_KEY") or get("AWS_SECRET_ACCESS_KEY"),
             s3_prefix=(get("S3_PREFIX", "prediction-market-archive") or "prediction-market-archive").strip("/"),
             s3_url_style=(get("S3_URL_STYLE") or get("AWS_S3_URL_STYLE") or "virtual").lower(),
-            archive_batch_rows=_int(get("ARCHIVE_BATCH_ROWS"), 25_000, name="ARCHIVE_BATCH_ROWS", minimum=1),
-            archive_batch_bytes=_int(get("ARCHIVE_BATCH_BYTES"), 32 * 1024 * 1024, name="ARCHIVE_BATCH_BYTES", minimum=1024),
-            archive_flush_seconds=_float(get("ARCHIVE_FLUSH_SECONDS"), 15, name="ARCHIVE_FLUSH_SECONDS", minimum=0.1),
+            archive_batch_rows=_int(get("ARCHIVE_BATCH_ROWS"), 250_000, name="ARCHIVE_BATCH_ROWS", minimum=1),
+            archive_batch_bytes=_int(get("ARCHIVE_BATCH_BYTES"), 48 * 1024 * 1024, name="ARCHIVE_BATCH_BYTES", minimum=1024),
+            archive_flush_seconds=_float(get("ARCHIVE_FLUSH_SECONDS"), 300, name="ARCHIVE_FLUSH_SECONDS", minimum=1),
             archive_compression=(get("ARCHIVE_COMPRESSION", "zstd") or "zstd").lower(),
+            archive_zstd_level=_int(get("ARCHIVE_ZSTD_LEVEL"), 3, name="ARCHIVE_ZSTD_LEVEL", minimum=1),
+            archive_row_group_rows=_int(get("ARCHIVE_ROW_GROUP_ROWS"), 100_000, name="ARCHIVE_ROW_GROUP_ROWS", minimum=1),
             archive_queue_max_rows=_int(get("ARCHIVE_QUEUE_MAX_ROWS"), 50_000, name="ARCHIVE_QUEUE_MAX_ROWS", minimum=100),
             archive_queue_max_bytes=_int(get("ARCHIVE_QUEUE_MAX_BYTES"), 64 * 1024 * 1024, name="ARCHIVE_QUEUE_MAX_BYTES", minimum=1024),
             archive_queue_warn_rows=_int(get("ARCHIVE_QUEUE_WARN_ROWS"), 35_000, name="ARCHIVE_QUEUE_WARN_ROWS", minimum=1),
@@ -284,11 +312,19 @@ class Settings:
             archive_spool_directory=Path(get("ARCHIVE_SPOOL_DIRECTORY", "/tmp/prediction-collector-archive") or "/tmp/prediction-collector-archive"),
             archive_spool_max_bytes=_int(get("ARCHIVE_SPOOL_MAX_BYTES"), 2 * 1024 * 1024 * 1024, name="ARCHIVE_SPOOL_MAX_BYTES", minimum=1024),
             archive_upload_max_attempts=_int(get("ARCHIVE_UPLOAD_MAX_ATTEMPTS"), 6, name="ARCHIVE_UPLOAD_MAX_ATTEMPTS", minimum=1),
-            raw_ws_policy=(get("RAW_WS_POLICY", "errors") or "errors").lower(),
+            archive_compaction_enabled=_bool(get("ARCHIVE_COMPACTION_ENABLED"), True),
+            archive_compaction_interval_seconds=_int(get("ARCHIVE_COMPACTION_INTERVAL_SECONDS"), 3600, name="ARCHIVE_COMPACTION_INTERVAL_SECONDS", minimum=60),
+            archive_compaction_min_age_seconds=_int(get("ARCHIVE_COMPACTION_MIN_AGE_SECONDS"), 900, name="ARCHIVE_COMPACTION_MIN_AGE_SECONDS", minimum=0),
+            archive_compaction_min_objects=_int(get("ARCHIVE_COMPACTION_MIN_OBJECTS"), 4, name="ARCHIVE_COMPACTION_MIN_OBJECTS", minimum=2),
+            archive_compaction_target_bytes=_int(get("ARCHIVE_COMPACTION_TARGET_BYTES"), 64 * 1024 * 1024, name="ARCHIVE_COMPACTION_TARGET_BYTES", minimum=1024),
+            raw_ws_policy=(get("RAW_WS_POLICY", "errors_sample") or "errors_sample").lower(),
+            raw_ws_valid_sample_rate=_decimal(get("RAW_WS_VALID_SAMPLE_RATE"), Decimal("0.001"), name="RAW_WS_VALID_SAMPLE_RATE"),
+            reference_unchanged_heartbeat_seconds=_int(get("REFERENCE_UNCHANGED_HEARTBEAT_SECONDS"), 300, name="REFERENCE_UNCHANGED_HEARTBEAT_SECONDS", minimum=1),
             postgres_storage_warn_gb=_decimal(get("POSTGRES_STORAGE_WARN_GB"), Decimal("70"), name="POSTGRES_STORAGE_WARN_GB"),
             postgres_storage_critical_gb=_decimal(get("POSTGRES_STORAGE_CRITICAL_GB"), Decimal("85"), name="POSTGRES_STORAGE_CRITICAL_GB"),
             postgres_reference_retention_hours=_int(get("POSTGRES_REFERENCE_RETENTION_HOURS"), 6, name="POSTGRES_REFERENCE_RETENTION_HOURS", minimum=1),
             postgres_observation_retention_hours=_int(get("POSTGRES_OBSERVATION_RETENTION_HOURS"), 24, name="POSTGRES_OBSERVATION_RETENTION_HOURS", minimum=1),
+            closed_market_hot_state_grace_hours=_int(get("CLOSED_MARKET_HOT_STATE_GRACE_HOURS"), 24, name="CLOSED_MARKET_HOT_STATE_GRACE_HOURS", minimum=0),
             polymarket_equity_symbols=(_csv(get("POLYMARKET_EQUITY_SYMBOLS")) if get("POLYMARKET_EQUITY_SYMBOLS") is not None else DEFAULT_POLYMARKET_EQUITY_SYMBOLS),
             log_level=(get("LOG_LEVEL", "INFO") or "INFO").upper(),
             json_logs=_bool(get("JSON_LOGS"), True),
@@ -303,8 +339,16 @@ class Settings:
             raise ConfigurationError("DATABASE_POOL_MIN_SIZE cannot exceed DATABASE_POOL_MAX_SIZE")
         if settings.postgres_storage_critical_gb <= settings.postgres_storage_warn_gb:
             raise ConfigurationError("POSTGRES_STORAGE_CRITICAL_GB must exceed POSTGRES_STORAGE_WARN_GB")
-        if settings.raw_ws_policy not in {"none", "errors", "full_l2", "all"}:
-            raise ConfigurationError("RAW_WS_POLICY must be none, errors, full_l2, or all")
+        if settings.raw_ws_policy not in {"none", "errors", "errors_sample", "full_l2", "all"}:
+            raise ConfigurationError("RAW_WS_POLICY must be none, errors, errors_sample, full_l2, or all")
+        if not Decimal("0") <= settings.raw_ws_valid_sample_rate <= Decimal("1"):
+            raise ConfigurationError("RAW_WS_VALID_SAMPLE_RATE must be between 0 and 1")
+        if settings.sampled_demotion_score > settings.sampled_promotion_score:
+            raise ConfigurationError("SAMPLED_DEMOTION_SCORE cannot exceed SAMPLED_PROMOTION_SCORE")
+        if settings.full_l2_demotion_score > settings.full_l2_min_score:
+            raise ConfigurationError("FULL_L2_DEMOTION_SCORE cannot exceed FULL_L2_MIN_SCORE")
+        if settings.full_l2_max_markets and settings.full_l2_research_reserve > settings.full_l2_max_markets:
+            raise ConfigurationError("FULL_L2_RESEARCH_RESERVE cannot exceed FULL_L2_MAX_MARKETS")
         if settings.archive_compression != "zstd":
             raise ConfigurationError("ARCHIVE_COMPRESSION currently supports only zstd")
         if settings.s3_url_style not in {"virtual", "path", "auto"}:

@@ -118,3 +118,11 @@ async def test_comments_use_stable_oldest_first_order() -> None:
         "limit": 100,
         "offset": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_live_event_discovery_uses_documented_active_and_closed_filters() -> None:
+    http = FakeHttp([{"events": [], "next_cursor": ""}])
+    assert [page async for page in client(http).iter_live_events()] == []
+    assert http.calls[0][1]["active"] == "true"
+    assert http.calls[0][1]["closed"] == "false"

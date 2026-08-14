@@ -28,6 +28,8 @@ def test_market_candidate_decodes_gamma_json_arrays_and_exact_metrics(
 
     assert candidate.exchange == "polymarket"
     assert candidate.external_id == raw["conditionId"]
+    assert candidate.source_id == str(raw["id"])
+    assert str(raw["id"]) in candidate.selectors
     assert candidate.ticker == "nvda-above-240-on-january-30-2026"
     assert candidate.active is True
     assert candidate.tradable is True

@@ -45,6 +45,11 @@ class TierManager:
         full_l2_min_liquidity: Decimal,
         full_l2_min_recent_trades: int,
         full_l2_min_book_updates: int,
+        sampled_promotion_score: Decimal = Decimal("20"),
+        sampled_demotion_score: Decimal = Decimal("12"),
+        full_l2_demotion_score: Decimal = Decimal("45"),
+        min_dwell_seconds: int = 1800,
+        full_l2_research_reserve: int = 0,
         allowlist: frozenset[str] = frozenset(),
         blocklist: frozenset[str] = frozenset(),
         activity_window_seconds: int = 900,
@@ -55,13 +60,23 @@ class TierManager:
         self.full_l2_min_liquidity = full_l2_min_liquidity
         self.full_l2_min_recent_trades = full_l2_min_recent_trades
         self.full_l2_min_book_updates = full_l2_min_book_updates
+        self.sampled_promotion_score = sampled_promotion_score
+        self.sampled_demotion_score = sampled_demotion_score
+        self.full_l2_demotion_score = full_l2_demotion_score
+        self.min_dwell = timedelta(seconds=min_dwell_seconds)
+        self.full_l2_research_reserve = full_l2_research_reserve
         self.allowlist = allowlist
         self.blocklist = blocklist
         self.activity_window = timedelta(seconds=activity_window_seconds)
         self.assignments: dict[str, TierAssignment] = {}
+        self._tier_since: dict[str, datetime] = {}
+        self._persisted_tiers: dict[str, CollectionTier] = {}
         self._activity: dict[str, _Activity] = defaultdict(
             lambda: _Activity(deque(), deque())
         )
+        self._counts = {tier.value: 0 for tier in CollectionTier}
+        self.exclusion_counts: dict[str, int] = {}
+        self.ceiling_exclusions = 0
 
     def record_trade(
         self, market_external_id: str, size: Decimal, *, observed_at: datetime | None = None
@@ -70,6 +85,13 @@ class TierManager:
         activity = self._activity[market_external_id]
         activity.trades.append((now, size))
         self._trim(activity, now)
+
+    def seed_previous_tiers(
+        self, values: Iterable[tuple[str, str, datetime]]
+    ) -> None:
+        for external_id, tier, assigned_at in values:
+            self._persisted_tiers[external_id] = CollectionTier(tier)
+            self._tier_since[external_id] = assigned_at
 
     def record_book_update(
         self, market_external_id: str, *, observed_at: datetime | None = None
@@ -80,14 +102,23 @@ class TierManager:
         self._trim(activity, now)
 
     def evaluate(
-        self, markets: Iterable[MarketCandidate], *, observed_at: datetime | None = None
+        self,
+        markets: Iterable[MarketCandidate],
+        *,
+        observed_at: datetime | None = None,
+        retain_metadata_assignments: bool = True,
     ) -> list[TierAssignment]:
         now = observed_at or utc_now()
-        scored: list[tuple[MarketCandidate, Decimal, tuple[str, ...], bool]] = []
+        scored: list[
+            tuple[MarketCandidate, Decimal, tuple[str, ...], bool, bool, bool]
+        ] = []
         metadata_only: list[TierAssignment] = []
+        evaluated_count = 0
         for market in markets:
-            activity = self._activity[market.external_id]
-            self._trim(activity, now)
+            evaluated_count += 1
+            activity = self._activity.get(market.external_id)
+            if activity is not None:
+                self._trim(activity, now)
             selectors = market.selectors
             forced = bool(selectors & self.allowlist)
             blocked = bool(selectors & self.blocklist)
@@ -108,32 +139,80 @@ class TierManager:
             if forced:
                 score += Decimal("10000")
                 reasons.insert(0, "forced_allowlist")
-            qualifies = forced or (
-                score >= self.full_l2_min_score
+            previous = self.assignments.get(market.external_id)
+            previous_tier = (
+                previous.tier if previous is not None
+                else self._persisted_tiers.get(market.external_id)
+            )
+            tier_since = self._tier_since.get(market.external_id, now)
+            in_dwell = now - tier_since < self.min_dwell
+            externally_observable = bool(
+                (market.liquidity or Decimal("0")) >= self.full_l2_min_liquidity
+                or (market.volume_24h or Decimal("0")) > 0
+                or market.has_maker_rewards
+            )
+            activity_observable = bool(
+                activity is not None
                 and (
-                    (market.liquidity or Decimal("0")) >= self.full_l2_min_liquidity
-                    or len(activity.trades) >= self.full_l2_min_recent_trades
+                    len(activity.trades) >= self.full_l2_min_recent_trades
                     or len(activity.updates) >= self.full_l2_min_book_updates
-                    or market.has_maker_rewards
                 )
             )
-            scored.append((market, score, tuple(reasons), qualifies))
+            retained_full = bool(
+                previous_tier is CollectionTier.FULL_L2
+                and (in_dwell or score >= self.full_l2_demotion_score)
+            )
+            qualifies = forced or retained_full or (
+                score >= self.full_l2_min_score
+                and (externally_observable or activity_observable)
+            )
+            interesting = bool(
+                market.has_maker_rewards
+                or "wide_actionable_spread" in reasons
+                or "near_resolution" in reasons
+            )
+            retain_sampled = bool(
+                previous_tier is CollectionTier.SAMPLED
+                and (in_dwell or score >= self.sampled_demotion_score)
+            )
+            sampled_eligible = bool(
+                qualifies
+                or retain_sampled
+                or score >= self.sampled_promotion_score
+            )
+            scored.append(
+                (market, score, tuple(reasons), qualifies, interesting, sampled_eligible)
+            )
 
         scored.sort(key=lambda item: (-item[1], item[0].external_id))
         full_candidates = [item for item in scored if item[3]]
-        full_ids = {
-            item[0].external_id
-            for item in (
-                full_candidates[: self.full_l2_max_markets]
-                if self.full_l2_max_markets
-                else full_candidates
-            )
-        }
+        if self.full_l2_max_markets:
+            reserve = min(self.full_l2_research_reserve, self.full_l2_max_markets)
+            # The reserve is deliberately exploratory: it may admit a
+            # metadata-visible maker-reward, wide-spread, or near-resolution
+            # market that has not yet cleared the ordinary FULL_L2 threshold.
+            # Selection remains deterministic because ``scored`` is ordered by
+            # score descending then external ID.
+            research = [item for item in scored if item[4]][:reserve]
+            research_ids = {item[0].external_id for item in research}
+            general = [item for item in full_candidates if item[0].external_id not in research_ids]
+            selected_full = research + general[: self.full_l2_max_markets - len(research)]
+        else:
+            selected_full = full_candidates
+        full_ids = {item[0].external_id for item in selected_full}
         full_cap_binding = bool(
             self.full_l2_max_markets
-            and len(full_candidates) > self.full_l2_max_markets
+            and len(
+                {
+                    item[0].external_id
+                    for item in (*full_candidates, *research)
+                }
+            ) > self.full_l2_max_markets
         )
-        remaining = [item for item in scored if item[0].external_id not in full_ids]
+        remaining = [
+            item for item in scored
+            if item[0].external_id not in full_ids and item[5]
+        ]
         sampled_items = (
             remaining[: self.sampled_max_markets]
             if self.sampled_max_markets
@@ -145,10 +224,18 @@ class TierManager:
         )
 
         assignments = list(metadata_only)
-        for market, score, reasons, qualifies in scored:
+        exclusion_counts: dict[str, int] = {}
+        for item in metadata_only:
+            reason = item.reasons[-1] if item.reasons else "not_trade_ready"
+            exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
+        ceiling_exclusions = 0
+        previous_assignments = self.assignments
+        for market, score, reasons, qualifies, interesting, sampled_eligible in scored:
             if market.external_id in full_ids:
                 tier = CollectionTier.FULL_L2
                 final_reasons = reasons or ("full_l2_score",)
+                if interesting and self.full_l2_research_reserve:
+                    final_reasons = (*final_reasons, "research_bucket")
                 binding = False
             elif market.external_id in sampled_ids:
                 tier = CollectionTier.SAMPLED
@@ -158,13 +245,60 @@ class TierManager:
                     final_reasons = (*final_reasons, "full_l2_resource_ceiling")
             else:
                 tier = CollectionTier.METADATA_ONLY
-                final_reasons = (*reasons, "sampled_resource_ceiling")
-                binding = sampled_cap_binding
-            assignments.append(
-                TierAssignment(market, tier, score, final_reasons, binding)
+                if sampled_eligible:
+                    final_reasons = (*reasons, "sampled_resource_ceiling")
+                    binding = sampled_cap_binding
+                else:
+                    final_reasons = (*reasons, "below_sampled_promotion_threshold")
+                    binding = False
+            if tier is CollectionTier.METADATA_ONLY:
+                reason = final_reasons[-1]
+                exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
+                ceiling_exclusions += int(binding)
+            previous = previous_assignments.get(market.external_id)
+            previous_tier = (
+                previous.tier if previous is not None
+                else self._persisted_tiers.get(market.external_id)
             )
+            # Live collection needs full objects only for subscribed markets
+            # and for the small set of tracked markets being demoted. The
+            # complete count/reason distribution is retained separately.
+            if (
+                retain_metadata_assignments
+                or tier is not CollectionTier.METADATA_ONLY
+                or previous_tier in {
+                    CollectionTier.FULL_L2,
+                    CollectionTier.SAMPLED,
+                }
+            ):
+                assignments.append(
+                    TierAssignment(market, tier, score, final_reasons, binding)
+                )
         assignments.sort(key=lambda item: item.market.external_id)
-        self.assignments = {item.market.external_id: item for item in assignments}
+        self.assignments = {
+            item.market.external_id: item
+            for item in assignments
+            if item.tier is not CollectionTier.METADATA_ONLY
+        }
+        for item in assignments:
+            previous = previous_assignments.get(item.market.external_id)
+            previous_tier = (
+                previous.tier if previous is not None
+                else self._persisted_tiers.get(item.market.external_id)
+            )
+            if previous_tier is not item.tier:
+                self._tier_since[item.market.external_id] = now
+            if item.tier is not CollectionTier.METADATA_ONLY or previous_tier is not None:
+                self._persisted_tiers[item.market.external_id] = item.tier
+        self._counts = {
+            CollectionTier.FULL_L2.value: len(full_ids),
+            CollectionTier.SAMPLED.value: len(sampled_ids),
+            CollectionTier.METADATA_ONLY.value: (
+                evaluated_count - len(full_ids) - len(sampled_ids)
+            ),
+        }
+        self.exclusion_counts = exclusion_counts
+        self.ceiling_exclusions = ceiling_exclusions
         return assignments
 
     def tier_for(self, market_external_id: str | None) -> CollectionTier:
@@ -181,10 +315,7 @@ class TierManager:
         ]
 
     def counts(self) -> dict[str, int]:
-        counts = {tier.value: 0 for tier in CollectionTier}
-        for assignment in self.assignments.values():
-            counts[assignment.tier.value] += 1
-        return counts
+        return dict(self._counts)
 
     def activity_for(self, market_external_id: str) -> tuple[int, Decimal, int]:
         activity = self._activity[market_external_id]
@@ -234,7 +365,7 @@ class TierManager:
 
     @staticmethod
     def _score(
-        market: MarketCandidate, activity: _Activity, now: datetime
+        market: MarketCandidate, activity: _Activity | None, now: datetime
     ) -> tuple[Decimal, list[str]]:
         liquidity = float(market.liquidity or 0)
         volume_24h = float(market.volume_24h or 0)
@@ -245,8 +376,8 @@ class TierManager:
             reasons.append("liquidity")
         if volume_24h > 0:
             reasons.append("recent_volume")
-        trade_count = len(activity.trades)
-        update_count = len(activity.updates)
+        trade_count = len(activity.trades) if activity is not None else 0
+        update_count = len(activity.updates) if activity is not None else 0
         if trade_count:
             score += Decimal(min(trade_count * 4, 40))
             reasons.append("recent_trades")

@@ -335,10 +335,12 @@ class PolymarketRtdsWebSocket:
         monotonic_ns: int,
         delivery_mode: str = "live",
     ) -> None:
-        # RTDS explicitly identifies full_accuracy_value as the unrounded
-        # value.  Lead/lag research must not silently fall back to display
-        # precision when the exact value is present.
+        # Accuracy semantics differ by topic. Equity exact values are decimal;
+        # Chainlink TWAP exact values are signed E18 integers; the documented
+        # Chainlink spot contract exposes ``value`` as the quote-currency
+        # decimal and does not define full_accuracy_value.
         exact_value = as_decimal(point.get("full_accuracy_value"))
+        display_value = as_decimal(point.get("value"))
         if exact_value is not None and topic in {
             "crypto_prices_twap_thirty",
             "crypto_prices_twap_sixty",
@@ -346,12 +348,10 @@ class PolymarketRtdsWebSocket:
             # Chainlink TWAP full_accuracy_value is a signed E18 integer,
             # unlike the already-decimal exact values on the equity feed.
             price = exact_value / Decimal("1000000000000000000")
+        elif exact_value is not None and topic == "equity_prices":
+            price = exact_value
         else:
-            price = (
-                exact_value
-                if exact_value is not None
-                else as_decimal(point.get("value"))
-            )
+            price = display_value
         if price is None:
             return
         source_timestamp = parse_timestamp(point.get("timestamp"))

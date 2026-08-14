@@ -13,7 +13,6 @@ from prediction_collector.common.retry import RetryPolicy
 from prediction_collector.common.types import (
     LiveSelection,
     MarketCandidate,
-    MarketExclusion,
 )
 from prediction_collector.common.utils import utc_now
 from prediction_collector.config import Settings
@@ -52,7 +51,11 @@ class LiveCoverageState:
             "active": self.selection.active,
             "tradable": self.selection.tradable,
             "subscribed": self.confirmed_subscribed,
-            "excluded": len(self.selection.excluded),
+            "excluded": (
+                self.selection.excluded_total
+                if self.selection.excluded_total is not None
+                else len(self.selection.excluded)
+            ),
         }
 
 
@@ -62,6 +65,14 @@ class MarketSocketShard:
     subscriptions: dict[str, str]
     task: asyncio.Task[None]
     planned_stop: asyncio.Event
+
+
+def _confirmed_current_subscriptions(
+    selected: Iterable[MarketCandidate],
+    confirmed: set[tuple[str, str]],
+) -> set[tuple[str, str]]:
+    desired = {(market.exchange, market.external_id) for market in selected}
+    return confirmed & desired
 
 
 class LiveCollector:
@@ -114,6 +125,10 @@ class LiveCollector:
         if self.writer.archive is not None:
             self.writer.archive.run_id = self.run_id
         await self.writer.start()
+        if hasattr(self.database, "load_tier_state"):
+            self.tier_manager.seed_previous_tiers(
+                await self.database.load_tier_state()
+            )
         self._task_failure = asyncio.get_running_loop().create_future()
         if self.writer.task is not None:
             self._watch_task(self.writer.task)
@@ -238,12 +253,17 @@ class LiveCollector:
                     on_page=on_page,
                 )
                 self._last_discovery = discovered
-                self.discovery_state = "ready"
+                await self._persist_selected_candidates(discovered)
                 await self._apply_tiers(
                     discovered,
                     persist=True,
                     log_summary=True,
                 )
+                # "ready" means the complete crawl, selected-market hydration,
+                # tier persistence, and desired socket reconciliation all
+                # succeeded. Setting it before those operations makes health
+                # checks and benchmarks observe a half-applied discovery.
+                self.discovery_state = "ready"
                 self._schedule_absent_reconciliation(discovered)
                 await self._resolve_discovery_gaps()
                 attempt = 0
@@ -269,7 +289,41 @@ class LiveCollector:
         existing = {market.external_id: market for market in self._last_discovery}
         existing.update({market.external_id: market for market in page})
         self._last_discovery = list(existing.values())
-        await self._apply_tiers(self._last_discovery, persist=False, log_summary=False)
+        # Start sockets as soon as enough pages have filled the configured
+        # ceilings, then leave that provisional selection stable until the
+        # complete crawl can rank the whole universe. Re-ranking every page
+        # repeatedly tears down healthy shards while discovery is still in
+        # progress and can make a large crawl slower than its refresh period.
+        if not self._incremental_subscription_ceiling_reached():
+            await self._persist_selected_candidates(self._last_discovery)
+            await self._apply_tiers(
+                self._last_discovery, persist=False, log_summary=False
+            )
+
+    async def _persist_selected_candidates(
+        self, candidates: list[MarketCandidate]
+    ) -> None:
+        assignments = self.tier_manager.evaluate(
+            candidates, retain_metadata_assignments=False
+        )
+        selected = [
+            assignment.market
+            for assignment in assignments
+            if assignment.tier is not CollectionTier.METADATA_ONLY
+        ]
+        await self.polymarket_service.persist_live_candidates(selected)
+
+    def _incremental_subscription_ceiling_reached(self) -> bool:
+        full_limit = self.tier_manager.full_l2_max_markets
+        sampled_limit = self.tier_manager.sampled_max_markets
+        # Zero means uncapped, so later pages can always add subscriptions.
+        if not full_limit or not sampled_limit:
+            return False
+        counts = self.tier_manager.counts()
+        return bool(
+            counts[CollectionTier.FULL_L2.value] >= full_limit
+            and counts[CollectionTier.SAMPLED.value] >= sampled_limit
+        )
 
     async def _apply_tiers(
         self,
@@ -279,37 +333,39 @@ class LiveCollector:
         log_summary: bool,
     ) -> None:
         async with self._selection_lock:
-            assignments = self.tier_manager.evaluate(candidates)
+            assignments = self.tier_manager.evaluate(
+                candidates, retain_metadata_assignments=False
+            )
             subscribed = [
                 assignment.market
                 for assignment in assignments
                 if assignment.tier is not CollectionTier.METADATA_ONLY
-            ]
-            excluded = [
-                MarketExclusion(
-                    "polymarket",
-                    assignment.market.external_id,
-                    assignment.reasons[-1] if assignment.reasons else "metadata_only",
-                )
-                for assignment in assignments
-                if assignment.tier is CollectionTier.METADATA_ONLY
             ]
             selection = LiveSelection(
                 discovered=len(candidates),
                 active=sum(market.active for market in candidates),
                 tradable=sum(market.tradable for market in candidates),
                 subscribed=subscribed,
-                excluded=excluded,
+                excluded=[],
+                excluded_total=len(candidates) - len(subscribed),
             )
             self.coverage = LiveCoverageState(
                 candidates=list(candidates),
                 selection=selection,
-                assignments=assignments,
+                assignments=[
+                    item
+                    for item in assignments
+                    if item.tier is not CollectionTier.METADATA_ONLY
+                ],
                 confirmed_subscribed=self.coverage.confirmed_subscribed,
             )
             if persist:
                 await self.database.record_tier_assignments(assignments)
-                confirmed = await self.database.active_subscribed_market_ids(self.run_id)
+                confirmed = _confirmed_current_subscriptions(
+                    subscribed,
+                    await self.database.active_subscribed_market_ids(self.run_id),
+                )
+                self.coverage.confirmed_subscribed = len(confirmed)
                 reasons = {
                     ("polymarket", assignment.market.external_id): ",".join(
                         assignment.reasons
@@ -318,7 +374,10 @@ class LiveCollector:
                     if assignment.tier is CollectionTier.METADATA_ONLY
                 }
                 await self.database.record_live_selection(
-                    self.run_id, candidates, confirmed, reasons
+                    self.run_id,
+                    [item.market for item in assignments],
+                    confirmed,
+                    reasons,
                 )
             # Reconcile desired state against the actual running shards on
             # every pass. This is intentionally idempotent: if persistence or
@@ -327,7 +386,7 @@ class LiveCollector:
             await self._reconcile_market_shards(subscribed)
             if log_summary:
                 counts = self.tier_manager.counts()
-                bindings = sum(item.ceiling_binding for item in assignments)
+                bindings = self.tier_manager.ceiling_exclusions
                 LOGGER.info(
                     "Tier assignment summary",
                     extra={
@@ -338,6 +397,7 @@ class LiveCollector:
                         "sampled_markets": counts[CollectionTier.SAMPLED.value],
                         "metadata_only_markets": counts[CollectionTier.METADATA_ONLY.value],
                         "resource_ceiling_exclusions": bindings,
+                        "exclusion_reasons": self.tier_manager.exclusion_counts,
                         "discovery_state": self.discovery_state,
                     },
                 )
@@ -460,7 +520,9 @@ class LiveCollector:
         if self.reconciliation_task is not None and not self.reconciliation_task.done():
             LOGGER.info("Previous absent-market reconciliation is still running")
             return
-        self.reconciliation_task = self._create_watched_task(
+        # This is a one-shot maintenance task. Normal completion is expected
+        # and must not be treated like a dead perpetual collector loop.
+        self.reconciliation_task = asyncio.create_task(
             self._reconcile_absent_markets(list(candidates)),
             name="polymarket-absent-market-reconciliation",
         )
@@ -521,25 +583,41 @@ class LiveCollector:
         self._discovery_gaps = unresolved
 
     async def _economics_loop(self) -> None:
+        if not await self._wait_for_complete_discovery():
+            return
         while not self.stop.is_set():
+            await _sleep(self.stop, self.settings.economics_sync_interval_seconds)
+            if self.stop.is_set():
+                return
             await self._sync_economics(
                 channel="rest:economics_refresh",
                 include_fee_rates=False,
                 include_rewards=True,
             )
-            await _sleep(self.stop, self.settings.economics_sync_interval_seconds)
 
     async def _fee_rate_loop(self) -> None:
+        if not await self._wait_for_complete_discovery():
+            return
         while not self.stop.is_set():
+            await _sleep(
+                self.stop, self.settings.polymarket_fee_rate_sync_interval_seconds
+            )
+            if self.stop.is_set():
+                return
             await self._sync_economics(
                 channel="rest:fee_rate_refresh",
                 include_fee_rates=True,
                 include_rewards=False,
                 fee_rate_live_only=True,
             )
-            await _sleep(
-                self.stop, self.settings.polymarket_fee_rate_sync_interval_seconds
-            )
+
+    async def _wait_for_complete_discovery(self) -> bool:
+        # Live sockets and reference feeds start immediately. Reconstructible
+        # REST economics wait so they cannot starve the first complete market
+        # crawl or delay the authoritative tier ranking.
+        while not self.stop.is_set() and self.discovery_state != "ready":
+            await _sleep(self.stop, 1)
+        return not self.stop.is_set()
 
     async def _sync_economics(self, *, channel: str, **options: bool) -> None:
         try:
@@ -569,7 +647,11 @@ class LiveCollector:
     async def _tier_reevaluation_loop(self) -> None:
         while not self.stop.is_set():
             await _sleep(self.stop, self.settings.tier_reevaluation_interval_seconds)
-            if self.stop.is_set() or not self._last_discovery:
+            if (
+                self.stop.is_set()
+                or self.discovery_state != "ready"
+                or not self._last_discovery
+            ):
                 continue
             await self._apply_tiers(
                 self._last_discovery,
@@ -589,6 +671,7 @@ class LiveCollector:
             for item in self.polymarket_ws.market_snapshot_items(
                 full_l2_interval_seconds=self.settings.full_l2_observation_interval_seconds,
                 sampled_interval_seconds=self.settings.sampled_snapshot_interval_seconds,
+                sampled_heartbeat_seconds=self.settings.sampled_heartbeat_interval_seconds,
             ):
                 await self.writer.put(item)
 

@@ -7,7 +7,10 @@ from typing import Any
 import pytest
 
 from prediction_collector.common.types import MarketCandidate
-from prediction_collector.jobs.live import LiveCollector
+from prediction_collector.jobs.live import (
+    LiveCollector,
+    _confirmed_current_subscriptions,
+)
 from prediction_collector.tiering import TierManager
 
 
@@ -37,6 +40,18 @@ def tier_manager() -> TierManager:
     )
 
 
+def capped_tier_manager() -> TierManager:
+    return TierManager(
+        full_l2_max_markets=1,
+        sampled_max_markets=1,
+        full_l2_min_score=Decimal("0"),
+        full_l2_min_liquidity=Decimal("0"),
+        full_l2_min_recent_trades=0,
+        full_l2_min_book_updates=0,
+        sampled_promotion_score=Decimal("0"),
+    )
+
+
 @pytest.mark.asyncio
 async def test_incremental_discovery_retains_every_page_and_subscribes_before_completion() -> None:
     collector = LiveCollector.__new__(LiveCollector)
@@ -49,6 +64,9 @@ async def test_incremental_discovery_retains_every_page_and_subscribes_before_co
         (),
         {"selection": None, "confirmed_subscribed": 0},
     )()
+    collector._persist_selected_candidates = (  # type: ignore[method-assign]
+        lambda _: asyncio.sleep(0)
+    )
     observed: list[list[str]] = []
 
     async def apply(candidates: list[MarketCandidate], **_: Any) -> None:
@@ -58,6 +76,64 @@ async def test_incremental_discovery_retains_every_page_and_subscribes_before_co
     await collector._merge_discovery_page([candidate("A"), candidate("B")])
     await collector._merge_discovery_page([candidate("C")])
     assert observed == [["A", "B"], ["A", "B", "C"]]
+
+
+@pytest.mark.asyncio
+async def test_incremental_discovery_stops_rotating_shards_after_caps_are_full() -> None:
+    collector = LiveCollector.__new__(LiveCollector)
+    collector._last_discovery = []
+    collector._selection_lock = asyncio.Lock()
+    collector.tier_manager = capped_tier_manager()
+    collector.run_id = 1
+    collector.coverage = type(
+        "Coverage",
+        (),
+        {"selection": None, "confirmed_subscribed": 0},
+    )()
+    collector._persist_selected_candidates = (  # type: ignore[method-assign]
+        lambda _: asyncio.sleep(0)
+    )
+    observed: list[list[str]] = []
+
+    async def apply(candidates: list[MarketCandidate], **_: Any) -> None:
+        observed.append(sorted(item.external_id for item in candidates))
+        collector.tier_manager.evaluate(candidates)
+
+    collector._apply_tiers = apply  # type: ignore[method-assign]
+    await collector._merge_discovery_page([candidate("A"), candidate("B")])
+    await collector._merge_discovery_page([candidate("C")])
+    assert sorted(item.external_id for item in collector._last_discovery) == [
+        "A", "B", "C"
+    ]
+    assert observed == [["A", "B"]]
+
+
+def test_confirmed_subscriptions_are_intersected_with_current_desired_tiers() -> None:
+    selected = [candidate("still-selected")]
+    assert _confirmed_current_subscriptions(
+        selected,
+        {
+            ("polymarket", "still-selected"),
+            ("polymarket", "demoted"),
+        },
+    ) == {("polymarket", "still-selected")}
+
+
+@pytest.mark.asyncio
+async def test_one_shot_absent_reconciliation_may_complete_normally() -> None:
+    collector = LiveCollector.__new__(LiveCollector)
+    collector.reconciliation_task = None
+    collector._task_failure = asyncio.get_running_loop().create_future()
+
+    class Service:
+        async def reconcile_absent_live(self, _: list[MarketCandidate]) -> None:
+            return None
+
+    collector.polymarket_service = Service()  # type: ignore[assignment]
+    collector._schedule_absent_reconciliation([candidate("A")])
+    assert collector.reconciliation_task is not None
+    await collector.reconciliation_task
+    assert not collector._task_failure.done()
 
 
 class RunDatabase:

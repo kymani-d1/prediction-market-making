@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -74,7 +75,7 @@ def test_three_tiers_and_deterministic_resource_ceiling() -> None:
     tiers = {item.market.external_id: item for item in first}
     assert tiers["high-liquidity"].tier is CollectionTier.FULL_L2
     assert tiers["reward-wide"].tier is CollectionTier.SAMPLED
-    assert tiers["long-tail"].tier is CollectionTier.SAMPLED
+    assert tiers["long-tail"].tier is CollectionTier.METADATA_ONLY
     assert tiers["inactive"].tier is CollectionTier.METADATA_ONLY
     assert tiers["reward-wide"].ceiling_binding
     assert "maker_rewards" in tiers["reward-wide"].reasons
@@ -85,6 +86,9 @@ def test_activity_promotes_then_ages_out_and_demotes() -> None:
         full_l2_max_markets=0,
         sampled_max_markets=0,
         full_l2_min_score=Decimal("20"),
+        sampled_promotion_score=Decimal("10"),
+        sampled_demotion_score=Decimal("5"),
+        min_dwell_seconds=0,
     )
     candidate = market("moving", liquidity="1")
     assert value.evaluate([candidate], observed_at=NOW)[0].tier is CollectionTier.SAMPLED
@@ -122,3 +126,58 @@ def test_closed_archived_and_non_clob_markets_never_consume_subscription_capacit
     assignments = value.evaluate(candidates, observed_at=NOW)
     assert {item.tier for item in assignments} == {CollectionTier.METADATA_ONLY}
     assert value.subscribed_markets() == []
+
+
+def test_research_reserve_admits_deterministic_interesting_illiquid_market() -> None:
+    value = manager(
+        full_l2_max_markets=2,
+        full_l2_research_reserve=1,
+        full_l2_min_score=Decimal("55"),
+    )
+    values = value.evaluate(
+        [
+            replace(
+                market("ordinary-a", liquidity="100000", volume_24h="10000"),
+                close_time=NOW + timedelta(days=60),
+            ),
+            replace(
+                market("ordinary-b", liquidity="90000", volume_24h="9000"),
+                close_time=NOW + timedelta(days=60),
+            ),
+            replace(
+                market("research-wide", liquidity="1", spread="0.20"),
+                close_time=NOW + timedelta(days=60),
+            ),
+        ],
+        observed_at=NOW,
+    )
+    tiers = {item.market.external_id: item for item in values}
+    assert tiers["research-wide"].tier is CollectionTier.FULL_L2
+    assert "research_bucket" in tiers["research-wide"].reasons
+    assert sum(item.tier is CollectionTier.FULL_L2 for item in values) == 2
+
+
+def test_metadata_signals_promote_without_subscription_activity() -> None:
+    value = manager(full_l2_max_markets=0, sampled_max_markets=0)
+    assignment = value.evaluate(
+        [market("rest-visible", liquidity="100000", volume_24h="10000")],
+        observed_at=NOW,
+    )[0]
+    assert assignment.tier is CollectionTier.FULL_L2
+    assert value.activity_for("rest-visible") == (0, Decimal("0"), 0)
+
+
+def test_restart_seed_preserves_dwell_then_allows_demotion() -> None:
+    value = manager(
+        full_l2_max_markets=0,
+        sampled_max_markets=0,
+        min_dwell_seconds=1800,
+    )
+    candidate = replace(market("quiet"), close_time=NOW + timedelta(days=30))
+    value.seed_previous_tiers(
+        [("quiet", CollectionTier.SAMPLED.value, NOW - timedelta(minutes=5))]
+    )
+    retained = value.evaluate([candidate], observed_at=NOW)[0]
+    assert retained.tier is CollectionTier.SAMPLED
+    demoted = value.evaluate([candidate], observed_at=NOW + timedelta(minutes=31))[0]
+    assert demoted.tier is CollectionTier.METADATA_ONLY

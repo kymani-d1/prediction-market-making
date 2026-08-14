@@ -59,6 +59,7 @@ class PolymarketMarketWebSocket:
         self._unknown_types: set[str] = set()
         self.last_trade_price: dict[str, Any] = {}
         self._last_observation_at: dict[str, Any] = {}
+        self._last_observation_state: dict[str, tuple[Any, ...]] = {}
 
     async def run(
         self,
@@ -84,6 +85,8 @@ class PolymarketMarketWebSocket:
             disconnect_reason: str | None = None
             subscription_confirmed = False
             initial_assets_seen: set[str] = set()
+            confirmed_markets: set[str] = set()
+            confirmation_progress_logged = False
             try:
                 async with connect(
                     self.url,
@@ -192,17 +195,29 @@ class PolymarketMarketWebSocket:
                                     )
                                     if initial_asset is not None:
                                         initial_assets_seen.add(str(initial_asset))
-                            if (
-                                not subscription_confirmed
-                                and set(assets).issubset(initial_assets_seen)
-                            ):
+                            ready_markets = _fully_initialized_markets(
+                                asset_to_market, initial_assets_seen
+                            )
+                            newly_ready = ready_markets - confirmed_markets
+                            if newly_ready:
                                 await self.database.confirm_subscription(
                                     connection_id,
                                     exchange="polymarket",
                                     channel="market",
-                                    market_external_ids=set(asset_to_market.values()),
-                                    acknowledgement={"event_type": "initial_book_dump"},
+                                    market_external_ids=newly_ready,
+                                    acknowledgement={
+                                        "event_type": "initial_book_dump",
+                                        "confirmed_markets": len(ready_markets),
+                                        "requested_markets": len(
+                                            set(asset_to_market.values())
+                                        ),
+                                    },
                                 )
+                                confirmed_markets.update(newly_ready)
+                            all_assets_confirmed = set(assets).issubset(
+                                initial_assets_seen
+                            )
+                            if not subscription_confirmed and all_assets_confirmed:
                                 for gap_id in unresolved_connection_gaps:
                                     await self.database.resolve_gap(
                                         gap_id,
@@ -210,14 +225,27 @@ class PolymarketMarketWebSocket:
                                     )
                                 unresolved_connection_gaps.clear()
                                 subscription_confirmed = True
+                            if newly_ready and (
+                                not confirmation_progress_logged
+                                or subscription_confirmed
+                            ):
                                 LOGGER.info(
-                                    "Polymarket WebSocket subscription confirmed",
+                                    (
+                                        "Polymarket WebSocket subscription confirmed"
+                                        if subscription_confirmed
+                                        else "Polymarket WebSocket subscription partially confirmed"
+                                    ),
                                     extra={
                                         "connection": connection_label,
-                                        "markets": len(set(asset_to_market.values())),
+                                        "confirmed_markets": len(confirmed_markets),
+                                        "requested_markets": len(
+                                            set(asset_to_market.values())
+                                        ),
+                                        "confirmed_tokens": len(initial_assets_seen),
                                         "tokens": len(assets),
                                     },
                                 )
+                                confirmation_progress_logged = True
                             for envelope in envelopes:
                                 if isinstance(envelope, dict):
                                     event_type = str(
@@ -402,6 +430,36 @@ class PolymarketMarketWebSocket:
             "market_resolved",
             "best_bid_ask",
         }:
+            if event_type == "market_resolved" and market is not None:
+                for closing_asset, closing_book in self.books.items():
+                    if (
+                        closing_book.valid
+                        and self.last_market_for_asset.get(closing_asset) == str(market)
+                    ):
+                        await self.writer.put(
+                            WriteItem(
+                                "orderbook_snapshots",
+                                {
+                                    "exchange": "polymarket",
+                                    "market_external_id": str(market),
+                                    "outcome_external_id": closing_asset,
+                                    "connection_id": connection_id,
+                                    "snapshot_type": "closing",
+                                    "source_timestamp": None,
+                                    "exchange_timestamp": exchange_timestamp,
+                                    "received_at": received_at,
+                                    "received_monotonic_ns": received_monotonic_ns,
+                                    "sequence_number": closing_book.sequence,
+                                    "book_hash": closing_book.book_hash,
+                                    "bids": closing_book.serialise_bids(),
+                                    "asks": closing_book.serialise_asks(),
+                                    "best_bid": closing_book.best_bid,
+                                    "best_ask": closing_book.best_ask,
+                                    "is_reconciliation": False,
+                                    "archive_only": True,
+                                },
+                            )
+                        )
             if event_type != "best_bid_ask" and market is not None:
                 await self.writer.put(
                     WriteItem(
@@ -469,6 +527,7 @@ class PolymarketMarketWebSocket:
         *,
         full_l2_interval_seconds: int,
         sampled_interval_seconds: int,
+        sampled_heartbeat_seconds: int,
         connection_id: int | None = None,
     ) -> list[WriteItem]:
         now = utc_now()
@@ -477,22 +536,44 @@ class PolymarketMarketWebSocket:
         for asset_id, book in self.books.items():
             if not book.valid:
                 continue
+            # Ordered source deltas are always archived for exact replay, but
+            # a transiently crossed reconstruction is not a valid sampled
+            # market state. Do not turn it into a misleading observation or a
+            # predictable database constraint failure.
+            if book.spread is not None and book.spread < 0:
+                continue
             market = self.last_market_for_asset.get(asset_id)
             if not market:
                 continue
             tier = self.tier_manager.tier_for(market)
             if tier is CollectionTier.METADATA_ONLY:
                 continue
-            interval = (
-                full_l2_interval_seconds
-                if tier is CollectionTier.FULL_L2
-                else sampled_interval_seconds
-            )
             previous = self._last_observation_at.get(asset_id)
-            if previous is not None and (now - previous).total_seconds() < interval:
-                continue
-            self._last_observation_at[asset_id] = now
             recent_trades, recent_volume, recent_updates = self.tier_manager.activity_for(market)
+            state = (
+                book.revision,
+                self.last_trade_price.get(asset_id),
+                recent_trades,
+                recent_volume,
+                recent_updates,
+            )
+            elapsed = (now - previous).total_seconds() if previous is not None else None
+            if tier is CollectionTier.FULL_L2:
+                if elapsed is not None and elapsed < full_l2_interval_seconds:
+                    continue
+                observation_kind = "periodic_hot"
+            else:
+                changed = self._last_observation_state.get(asset_id) != state
+                if changed:
+                    if elapsed is not None and elapsed < sampled_interval_seconds:
+                        continue
+                    observation_kind = "change"
+                else:
+                    if elapsed is not None and elapsed < sampled_heartbeat_seconds:
+                        continue
+                    observation_kind = "heartbeat"
+            self._last_observation_at[asset_id] = now
+            self._last_observation_state[asset_id] = state
             midpoint = book.midpoint
             spread_bps = (
                 book.spread / midpoint * 10_000
@@ -517,6 +598,7 @@ class PolymarketMarketWebSocket:
                         "best_bid": book.best_bid,
                         "best_ask": book.best_ask,
                         "tier": tier.value,
+                        "observation_kind": observation_kind,
                         "midpoint": midpoint,
                         "spread": book.spread,
                         "spread_bps": spread_bps,
@@ -535,6 +617,20 @@ class PolymarketMarketWebSocket:
                 )
             )
         return items
+
+
+def _fully_initialized_markets(
+    asset_to_market: Mapping[str, str], initial_assets_seen: set[str]
+) -> set[str]:
+    """Return markets whose every requested outcome has a fresh initial book."""
+    required: dict[str, set[str]] = {}
+    for asset_id, market_external_id in asset_to_market.items():
+        required.setdefault(market_external_id, set()).add(asset_id)
+    return {
+        market_external_id
+        for market_external_id, asset_ids in required.items()
+        if asset_ids.issubset(initial_assets_seen)
+    }
 
 
 async def _stop_aware_sleep(stop: asyncio.Event, seconds: float) -> None:

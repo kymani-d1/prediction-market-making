@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -45,6 +46,7 @@ class PolymarketService:
         self.rest = rest
         self.database = database
         self.writer = writer
+        self._live_persisted_ids: set[str] = set()
 
     async def sync_metadata(self, *, include_closed: bool = True) -> dict[str, int]:
         counts = {"series": 0, "events": 0, "markets": 0, "outcomes": 0, "tags": 0}
@@ -134,10 +136,10 @@ class PolymarketService:
         on_page: Callable[[list[MarketCandidate]], Awaitable[None]] | None = None,
     ) -> list[MarketCandidate]:
         candidates_by_id: dict[str, MarketCandidate] = {}
-        diagnostics = MetadataSyncDiagnostics()
         malformed_markets = 0
         malformed_events = 0
         malformed_samples: list[dict[str, Any]] = []
+        self._live_persisted_ids.clear()
         async for items, result, cursor in self.rest.iter_live_events():
             await self._raw_page(
                 "gamma", "/events/keyset", "events", items, result, external_key=cursor
@@ -146,8 +148,6 @@ class PolymarketService:
             for raw_event in items:
                 if not bool(raw_event.get("active")) or bool(raw_event.get("closed")):
                     continue
-                event = normalise_event(raw_event)
-                await self.database.upsert_event(event)
                 nested_markets = raw_event.get("markets")
                 if not isinstance(nested_markets, list):
                     malformed_events += 1
@@ -184,19 +184,14 @@ class PolymarketService:
                         continue
                     if not candidate.active:
                         continue
-                    market, outcomes = normalise_market(
-                        raw, event_external_id=event["external_id"]
+                    candidate.source_id = (
+                        str(raw["id"]) if raw.get("id") is not None else None
                     )
-                    market["exchange_timestamp"] = result.response_timestamp
-                    market["exchange_timestamp_is_transport"] = True
-                    market["observed_at"] = (
-                        getattr(result, "requested_at", None) or utc_now()
+                    candidate.event_external_id = (
+                        str(raw_event["id"])
+                        if raw_event.get("id") is not None
+                        else None
                     )
-                    market_id = await self.database.upsert_market(
-                        market, diagnostics=diagnostics
-                    )
-                    for outcome in outcomes:
-                        await self.database.upsert_outcome(market_id, outcome)
                     candidates_by_id[candidate.external_id] = candidate
                     page_candidates.append(candidate)
             if on_page is not None and page_candidates:
@@ -240,14 +235,95 @@ class PolymarketService:
         if reconcile_absent:
             await self.reconcile_absent_live(
                 candidates,
-                diagnostics=diagnostics,
                 emit_summary=False,
             )
         LOGGER.info(
             "Polymarket live metadata sync complete",
-            extra={"markets": len(candidates), **diagnostics.as_log_fields()},
+            extra={"markets": len(candidates)},
         )
         return candidates
+
+    async def persist_live_candidates(
+        self, candidates: list[MarketCandidate]
+    ) -> dict[str, int]:
+        """Hydrate only desired live subscriptions before opening sockets.
+
+        The complete event pages are already retained as immutable raw REST
+        evidence. Normalizing every one of today's 200k+ nested markets on the
+        latency-sensitive live path is neither necessary nor operationally
+        viable; the uncapped metadata backfill remains responsible for that.
+        """
+        pending = [
+            candidate
+            for candidate in candidates
+            if candidate.external_id not in self._live_persisted_ids
+        ]
+        if not pending:
+            return {"markets": 0, "outcomes": 0}
+        semaphore = asyncio.Semaphore(8)
+        diagnostics = MetadataSyncDiagnostics()
+
+        async def persist(candidate: MarketCandidate) -> tuple[int, int]:
+            gamma_id = candidate.source_id
+            if not gamma_id:
+                raise RuntimeError(
+                    f"selected Polymarket market {candidate.external_id} has no Gamma id"
+                )
+            async with semaphore:
+                result = await self.rest.market(str(gamma_id))
+                raw = result.data
+                if not isinstance(raw, dict):
+                    raise RuntimeError(
+                        f"Polymarket market {gamma_id} detail was not an object"
+                    )
+                await self._raw_result(
+                    "gamma",
+                    f"/markets/{gamma_id}",
+                    "selected_live_market",
+                    result,
+                    str(gamma_id),
+                )
+                event_external_id: str | None = None
+                nested_events = _as_dict_list(raw.get("events"))
+                event_raw = (
+                    nested_events[0]
+                    if nested_events
+                    else (
+                        {"id": candidate.event_external_id}
+                        if candidate.event_external_id
+                        else None
+                    )
+                )
+                if isinstance(event_raw, dict):
+                    event = normalise_event(event_raw)
+                    event_external_id = event["external_id"]
+                    await self.database.upsert_event(event)
+                market, outcomes = normalise_market(
+                    raw, event_external_id=event_external_id
+                )
+                market["exchange_timestamp"] = result.response_timestamp
+                market["exchange_timestamp_is_transport"] = True
+                market["observed_at"] = (
+                    getattr(result, "requested_at", None) or utc_now()
+                )
+                market_id = await self.database.upsert_market(
+                    market, diagnostics=diagnostics
+                )
+                for outcome in outcomes:
+                    await self.database.upsert_outcome(market_id, outcome)
+                self._live_persisted_ids.add(candidate.external_id)
+                return 1, len(outcomes)
+
+        persisted = await asyncio.gather(*(persist(candidate) for candidate in pending))
+        counts = {
+            "markets": sum(value[0] for value in persisted),
+            "outcomes": sum(value[1] for value in persisted),
+        }
+        LOGGER.info(
+            "Selected live market metadata hydrated",
+            extra={**counts, **diagnostics.as_log_fields()},
+        )
+        return counts
 
     async def reconcile_absent_live(
         self,

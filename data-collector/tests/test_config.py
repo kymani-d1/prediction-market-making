@@ -13,12 +13,15 @@ def settings(env: dict[str, str] | None = None) -> Settings:
 
 def test_defaults_are_polymarket_only_and_bounded() -> None:
     value = settings()
-    assert value.full_l2_max_markets == 500
-    assert value.sampled_max_markets == 1_000
-    assert value.sampled_snapshot_interval_seconds == 60
+    assert value.full_l2_max_markets == 10
+    assert value.sampled_max_markets == 50
+    assert value.metadata_sync_interval_seconds == 900
+    assert value.sampled_snapshot_interval_seconds == 30
+    assert value.sampled_heartbeat_interval_seconds == 900
     assert value.postgres_reference_retention_hours == 6
     assert value.postgres_observation_retention_hours == 24
-    assert value.raw_ws_policy == "errors"
+    assert value.raw_ws_policy == "errors_sample"
+    assert str(value.raw_ws_valid_sample_rate) == "0.001"
     assert value.safe_summary()["scope"] == "polymarket_only"
     assert not any("kalshi" in key.lower() for key in value.safe_summary())
 

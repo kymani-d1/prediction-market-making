@@ -59,8 +59,9 @@ def market_status(raw: dict[str, Any]) -> str:
 
 
 def parse_market_candidate(raw: dict[str, Any]) -> MarketCandidate:
-    # conditionId is the cross-surface CTF/CLOB identifier. Gamma's row id is
-    # retained as an alias and in raw_data.
+    # conditionId is the cross-surface CTF/CLOB identifier. Gamma's compact row
+    # identity is retained separately so all-market discovery does not allocate
+    # one JSON dictionary per candidate.
     external_id = str(first_present(raw, "conditionId", "condition_id", "id") or "")
     token_ids = tuple(str(value) for value in _json_list(raw.get("clobTokenIds")) if value)
     closed = _bool(raw.get("closed"))
@@ -101,12 +102,17 @@ def parse_market_candidate(raw: dict[str, Any]) -> MarketCandidate:
             str(value)
             for value in (
                 first_present(raw, "conditionId", "condition_id"),
-                raw.get("id"),
                 raw.get("slug"),
             )
             if value
         ),
-        raw_data=raw,
+        source_id=str(raw["id"]) if raw.get("id") is not None else None,
+        # Live discovery may retain hundreds of thousands of candidates for
+        # deterministic global ranking. Keeping every full Gamma market object
+        # here duplicates the content-addressed raw REST archive and can consume
+        # gigabytes of RAM. The service adds the small Gamma/event identities
+        # needed to hydrate selected markets before subscription.
+        raw_data={},
     )
 
 
