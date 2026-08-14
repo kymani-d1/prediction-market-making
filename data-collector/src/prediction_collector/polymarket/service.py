@@ -48,8 +48,16 @@ class PolymarketService:
         self.writer = writer
         self._live_persisted_ids: set[str] = set()
 
-    async def sync_metadata(self, *, include_closed: bool = True) -> dict[str, int]:
-        counts = {"series": 0, "events": 0, "markets": 0, "outcomes": 0, "tags": 0}
+    async def sync_metadata(self, *, include_closed: bool = True) -> dict[str, Any]:
+        counts: dict[str, Any] = {
+            "series": 0,
+            "events": 0,
+            "markets": 0,
+            "outcomes": 0,
+            "tags": 0,
+        }
+        malformed_markets_skipped = 0
+        malformed_market_samples: list[dict[str, Any]] = []
         diagnostics = MetadataSyncDiagnostics()
         try:
             async for items, result in self.rest.iter_series():
@@ -103,6 +111,14 @@ class PolymarketService:
                     market, outcomes = normalise_market(
                         raw, event_external_id=event_external_id
                     )
+                    external_id = market.get("external_id")
+                    if not isinstance(external_id, str) or not external_id.strip():
+                        malformed_markets_skipped += 1
+                        if len(malformed_market_samples) < 10:
+                            malformed_market_samples.append(
+                                _market_identity_failure_sample(raw)
+                            )
+                        continue
                     market["exchange_timestamp"] = result.response_timestamp
                     market["exchange_timestamp_is_transport"] = True
                     market["observed_at"] = (
@@ -121,11 +137,48 @@ class PolymarketService:
                     checkpoint_key=f"closed={str(closed).lower()}",
                     cursor=cursor,
                     timestamp=utc_now(),
-                    metadata={"records": counts["markets"]},
+                    metadata={
+                        "records": counts["markets"],
+                        "malformed_markets_skipped": malformed_markets_skipped,
+                    },
                 )
+        counts["malformed_markets_skipped"] = malformed_markets_skipped
+        counts["malformed_market_samples"] = malformed_market_samples
+        if malformed_markets_skipped:
+            LOGGER.warning(
+                "Polymarket metadata backfill skipped malformed market identities",
+                extra={
+                    "malformed_markets_skipped": malformed_markets_skipped,
+                    "malformed_market_samples": malformed_market_samples,
+                },
+            )
+            await self.database.record_gap(
+                run_id=self.writer.run_id,
+                connection_id=None,
+                exchange="polymarket",
+                channel="rest:metadata_backfill",
+                market_external_id=None,
+                outcome_external_id=None,
+                gap_type="market_metadata_schema_failure",
+                reconnect_reason=(
+                    "Gamma metadata backfill contained markets without "
+                    "canonical external identities"
+                ),
+                details={
+                    "malformed_markets_skipped": malformed_markets_skipped,
+                    "samples": malformed_market_samples,
+                },
+            )
         LOGGER.info(
             "Polymarket metadata sync complete",
-            extra={**counts, **diagnostics.as_log_fields()},
+            extra={
+                **{
+                    key: value
+                    for key, value in counts.items()
+                    if key != "malformed_market_samples"
+                },
+                **diagnostics.as_log_fields(),
+            },
         )
         return counts
 
@@ -1035,3 +1088,20 @@ def _as_dict_list(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, list):
         return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _market_identity_failure_sample(raw: dict[str, Any]) -> dict[str, Any]:
+    sample: dict[str, Any] = {
+        "raw_id": raw.get("id"),
+        "slug": raw.get("slug"),
+        "reason": "market_identity_missing",
+    }
+    for canonical, keys in (
+        ("conditionId", ("conditionId", "condition_id")),
+        ("questionID", ("questionID", "questionId", "question_id")),
+    ):
+        for key in keys:
+            if key in raw:
+                sample[canonical] = raw[key]
+                break
+    return sample

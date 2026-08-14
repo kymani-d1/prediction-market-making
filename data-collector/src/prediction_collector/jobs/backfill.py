@@ -58,6 +58,12 @@ async def run_polymarket_backfill(
         isinstance(details.get("comments"), dict)
         and details["comments"].get("errors", 0)  # type: ignore[union-attr]
     )
+    incomplete_metadata = bool(
+        isinstance(details.get("metadata"), dict)
+        and details["metadata"].get(  # type: ignore[union-attr]
+            "malformed_markets_skipped", 0
+        )
+    )
     archive_degraded = bool(writer.archive and writer.archive.degraded)
     return BackfillResult(
         processed,
@@ -71,6 +77,7 @@ async def run_polymarket_backfill(
                 or incomplete_trade_history
                 or incomplete_economics
                 or incomplete_comments
+                or incomplete_metadata
             )
             else "completed"
         ),
