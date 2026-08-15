@@ -2817,7 +2817,8 @@ class Database:
             row = await (
                 await connection.execute(
                     """
-                    SELECT id, object_key, content_hash, status
+                    SELECT id, object_key, content_hash, compressed_bytes,
+                           status, local_spool_path
                     FROM archive_objects WHERE id = %s
                     """,
                     (object_id,),
@@ -2869,7 +2870,8 @@ class Database:
             await connection.execute(
                 """
                 UPDATE archive_objects SET status = 'failed', last_error = %s,
-                    updated_at = clock_timestamp() WHERE id = %s
+                    updated_at = clock_timestamp()
+                WHERE id = %s AND status <> 'uploaded'
                 """,
                 (error[:8000], object_id),
             )
@@ -2976,18 +2978,29 @@ class Database:
                 (archive_object_id, market_external_id),
             )
 
-    async def pending_archive_objects(self, *, limit: int) -> list[Mapping[str, Any]]:
+    async def pending_archive_objects(
+        self,
+        *,
+        limit: int,
+        local_content_hashes: list[str] | None = None,
+    ) -> list[Mapping[str, Any]]:
+        # Manifests are shared by collector services, but spool files are not.
+        # Prefer objects materialized in this process's spool so foreign rows
+        # cannot starve local crash recovery behind the bounded result set.
+        local_hashes = local_content_hashes or []
         async with self.pool.connection() as connection:
             rows = await (
                 await connection.execute(
                     """
-                    SELECT id, object_key, content_hash, local_spool_path
+                    SELECT id, object_key, content_hash, compressed_bytes,
+                           status, local_spool_path
                     FROM archive_objects
-                    WHERE status IN ('prepared', 'retrying', 'failed')
+                    WHERE status <> 'uploaded'
                       AND local_spool_path IS NOT NULL
-                    ORDER BY created_at LIMIT %s
+                    ORDER BY (content_hash = ANY(%s::TEXT[])) DESC, created_at
+                    LIMIT %s
                     """,
-                    (limit,),
+                    (local_hashes, limit),
                 )
             ).fetchall()
         return list(rows)

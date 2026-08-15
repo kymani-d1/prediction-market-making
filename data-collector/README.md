@@ -106,6 +106,17 @@ both bounded. Uploads use retry/backoff/jitter, remain in a bounded local spool,
 and are verified with object size plus SHA-256 metadata before the manifest is
 marked uploaded.
 
+The spool and ingress journal are only as durable as the filesystem containing
+`ARCHIVE_SPOOL_DIRECTORY`. Railway files outside a volume are ephemeral, so the
+default `/tmp/prediction-collector-archive` does **not** survive a replacement
+deployment. Attach a separate persistent Railway volume to each collector
+service, mount it at a spool-specific path such as `/archive-spool`, and set
+`ARCHIVE_SPOOL_DIRECTORY=/archive-spool`. Do not make live and backfill share a
+spool volume: PostgreSQL and immutable object storage are their coordination
+boundary. Without those volumes, this collector can recover a verified object
+that reached S3 before a crash, but it cannot recover a journal entry or Parquet
+file that existed only on the terminated container filesystem.
+
 Book streams use stable `int64` market/token keys, nanosecond `int64`
 timestamps, `int8` side/action codes, and exact `int64` mantissa plus `int8`
 scale values. This avoids repeated long IDs and decimal strings without float

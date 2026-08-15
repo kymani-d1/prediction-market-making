@@ -507,6 +507,7 @@ class ArchiveWriter:
         self.run_id: int | None = None
         self.last_error: str | None = None
         self.degraded = False
+        self._remote_recovery_errors: dict[int, str] = {}
         self._retry = RetryPolicy(
             max_attempts=settings.archive_upload_max_attempts,
             base_delay_seconds=0.5,
@@ -1300,21 +1301,99 @@ class ArchiveWriter:
         return False
 
     async def _retry_pending_once(self) -> None:
-        for value in await self.database.pending_archive_objects(limit=20):
-            local_path = Path(str(value["local_spool_path"] or ""))
+        local_hashes = [
+            path.stem.lower()
+            for path in self.settings.archive_spool_directory.glob("*.parquet")
+            if len(path.stem) == 64
+            and all(character in "0123456789abcdefABCDEF" for character in path.stem)
+        ]
+        pending = await self.database.pending_archive_objects(
+            limit=20,
+            local_content_hashes=local_hashes,
+        )
+        for value in pending:
+            object_id = int(value["id"])
+            # The pending query is only a candidate snapshot. Another collector
+            # may commit the shared manifest before this process acts on it.
+            state = await self.database.archive_object_state(object_id)
+            if state["status"] == "uploaded":
+                self._remote_recovery_errors.pop(object_id, None)
+                continue
+            local_path = Path(str(state["local_spool_path"] or ""))
             if not local_path.is_file():
-                await self.database.mark_archive_failed(
-                    int(value["id"]), "spool file is missing"
-                )
-                self.degraded = True
-                self.last_error = "archive manifest references a missing spool file"
+                verification_error = await self._remote_verification_error(state)
+                if verification_error is None:
+                    # A verified immutable object is authoritative. This also
+                    # recovers a crash after S3 PUT but before the DB commit.
+                    await self.database.mark_archive_uploaded(object_id)
+                    self._remote_recovery_errors.pop(object_id, None)
+                    LOGGER.info(
+                        "Reconciled archive manifest from verified remote object",
+                        extra={"archive_object_id": object_id,
+                               "object_key": str(state["object_key"])},
+                    )
+                    continue
+
+                # Absence in this container is not evidence that a spool file
+                # owned by another collector is gone. Keep the shared manifest
+                # unresolved and retry remote verification later. Deduplicate
+                # diagnostics to avoid a per-second cross-container log storm.
+                if self._remote_recovery_errors.get(object_id) != verification_error:
+                    self._remote_recovery_errors[object_id] = verification_error
+                    log = (
+                        LOGGER.warning
+                        if "mismatch" in verification_error
+                        else LOGGER.debug
+                    )
+                    log(
+                        "Archive manifest remains unresolved after remote verification",
+                        extra={
+                            "archive_object_id": object_id,
+                            "object_key": str(state["object_key"]),
+                            "reason": verification_error,
+                        },
+                    )
                 continue
             await self._upload_with_retry(
-                int(value["id"]),
+                object_id,
                 local_path,
-                str(value["object_key"]),
-                str(value["content_hash"]),
+                str(state["object_key"]),
+                str(state["content_hash"]),
             )
+
+    async def _remote_verification_error(
+        self, value: Mapping[str, Any]
+    ) -> str | None:
+        """Return None only when the immutable remote object matches its manifest."""
+        try:
+            head = await self.object_store.head(str(value["object_key"]))
+        except asyncio.CancelledError:
+            raise
+        except FileNotFoundError:
+            return "remote object is missing"
+        except Exception as exc:
+            return f"remote HEAD failed: {type(exc).__name__}"
+
+        try:
+            actual_bytes = int(head.get("ContentLength", -1))
+            expected_bytes = int(value["compressed_bytes"])
+        except (TypeError, ValueError):
+            return "remote object size is invalid"
+        if actual_bytes != expected_bytes:
+            return (
+                "remote object size mismatch: "
+                f"expected={expected_bytes} actual={actual_bytes}"
+            )
+
+        metadata = {
+            str(key).lower(): str(metadata_value)
+            for key, metadata_value in dict(head.get("Metadata") or {}).items()
+        }
+        remote_hash = metadata.get("sha256")
+        expected_hash = str(value["content_hash"])
+        if remote_hash is not None and remote_hash != expected_hash:
+            return "remote object sha256 metadata mismatch"
+        return None
 
     async def _retry_spilled_journal_once(self) -> None:
         if not self._spilled_record_ids or not self._journal_path.is_file():

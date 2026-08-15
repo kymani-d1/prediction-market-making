@@ -21,6 +21,7 @@ from prediction_collector.archive_reader import (
     archive_partition_prefixes,
     load_archive,
 )
+from prediction_collector.database import Database
 from prediction_collector.tiering import CollectionTier
 from prediction_collector.writer import BatchWriter
 from prediction_collector.common.retry import RetryPolicy
@@ -52,7 +53,8 @@ class ArchiveDatabase:
         return object_id
 
     async def mark_archive_upload_attempt(self, object_id: int, attempt: int) -> None:
-        self.objects[object_id].update(status="uploading", upload_attempts=attempt)
+        if self.objects[object_id]["status"] != "uploaded":
+            self.objects[object_id].update(status="uploading", upload_attempts=attempt)
 
     async def archive_object_state(self, object_id: int) -> dict[str, Any]:
         return self.objects[object_id]
@@ -64,24 +66,38 @@ class ArchiveDatabase:
         return self.objects.get(object_id) if object_id is not None else None
 
     async def mark_archive_uploaded(self, object_id: int) -> None:
-        self.objects[object_id]["status"] = "uploaded"
+        self.objects[object_id].update(
+            status="uploaded", local_spool_path=None, last_error=None
+        )
 
     async def mark_archive_retrying(self, object_id: int, error: str) -> None:
-        self.objects[object_id].update(status="retrying", last_error=error)
+        if self.objects[object_id]["status"] != "uploaded":
+            self.objects[object_id].update(status="retrying", last_error=error)
 
     async def mark_archive_failed(self, object_id: int, error: str) -> None:
-        self.objects[object_id].update(status="failed", last_error=error)
+        if self.objects[object_id]["status"] != "uploaded":
+            self.objects[object_id].update(status="failed", last_error=error)
 
     async def archive_object_counts(self, object_id: int) -> dict[str, Any]:
         return self.objects[object_id]
 
-    async def pending_archive_objects(self, *, limit: int) -> list[dict[str, Any]]:
-        return [
+    async def pending_archive_objects(
+        self,
+        *,
+        limit: int,
+        local_content_hashes: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        local_hashes = set(local_content_hashes or [])
+        values = [
             value
             for value in self.objects.values()
-            if value["status"] in {"prepared", "retrying", "failed"}
+            if value["status"] != "uploaded"
             and value.get("local_spool_path")
-        ][:limit]
+        ]
+        values.sort(
+            key=lambda value: (value["content_hash"] not in local_hashes, value["id"])
+        )
+        return values[:limit]
 
     async def record_raw_rest_provenance(self, **value: Any) -> None:
         self.provenance.append(value)
@@ -142,9 +158,10 @@ class ArchiveDatabase:
         self.compactions[compaction_id].update(status="failed", error=error)
 
     async def abandon_archive_object(self, object_id: int, error: str) -> None:
-        self.objects[object_id].update(
-            status="failed", local_spool_path=None, last_error=error
-        )
+        if self.objects[object_id]["status"] != "uploaded":
+            self.objects[object_id].update(
+                status="failed", local_spool_path=None, last_error=error
+            )
 
     async def running_archive_compactions(self) -> list[dict[str, Any]]:
         values: list[dict[str, Any]] = []
@@ -199,6 +216,60 @@ class SlowStore(LocalObjectStore):
         await super().put_file(local_path, object_key, content_hash)
 
 
+class CoordinatedArchiveDatabase(ArchiveDatabase):
+    """Return one stale pending snapshot while a second writer commits it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pending_read = asyncio.Event()
+        self.release_pending = asyncio.Event()
+
+    async def pending_archive_objects(
+        self,
+        *,
+        limit: int,
+        local_content_hashes: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        values = [
+            dict(value)
+            for value in await super().pending_archive_objects(
+                limit=limit,
+                local_content_hashes=local_content_hashes,
+            )
+        ]
+        self.pending_read.set()
+        await self.release_pending.wait()
+        return values
+
+
+class RecordingArchiveConnection:
+    def __init__(self) -> None:
+        self.query = ""
+
+    async def execute(self, query: str, _: tuple[Any, ...]) -> SimpleNamespace:
+        self.query = " ".join(query.split())
+        return SimpleNamespace(rowcount=0)
+
+
+class RecordingArchiveConnectionContext:
+    def __init__(self, connection: RecordingArchiveConnection) -> None:
+        self.connection = connection
+
+    async def __aenter__(self) -> RecordingArchiveConnection:
+        return self.connection
+
+    async def __aexit__(self, *_: Any) -> None:
+        return None
+
+
+class RecordingArchivePool:
+    def __init__(self, connection: RecordingArchiveConnection) -> None:
+        self.connection_value = connection
+
+    def connection(self) -> RecordingArchiveConnectionContext:
+        return RecordingArchiveConnectionContext(self.connection_value)
+
+
 def archive_settings(workspace_tmp_path: Path, **changes: Any) -> Settings:
     base = Settings.from_env({}, load_dotenv_file=False)
     values = {
@@ -211,6 +282,37 @@ def archive_settings(workspace_tmp_path: Path, **changes: Any) -> Settings:
     }
     values.update(changes)
     return replace(base, **values)
+
+
+def add_archive_manifest(
+    database: ArchiveDatabase,
+    workspace_tmp_path: Path,
+    payload: bytes,
+    *,
+    status: str = "retrying",
+    local_file: bool = False,
+    object_key: str = "research/recovery/object.parquet",
+) -> tuple[dict[str, Any], Path]:
+    digest = hashlib.sha256(payload).hexdigest()
+    local_path = workspace_tmp_path / "spool" / f"{digest}.parquet"
+    if local_file:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(payload)
+    manifest = {
+        "id": 1,
+        "status": status,
+        "stream": "orderbook_updates",
+        "object_key": object_key,
+        "content_hash": digest,
+        "compressed_bytes": len(payload),
+        "uncompressed_bytes": len(payload),
+        "row_count": 1,
+        "local_spool_path": str(local_path),
+        "last_error": "previous upload interruption",
+    }
+    database.objects[1] = manifest
+    database.by_hash[digest] = 1
+    return manifest, local_path
 
 
 def update_record(market: str, price: str, *, timestamp: datetime = NOW) -> ArchiveRecord:
@@ -334,6 +436,148 @@ async def test_retry_is_idempotent_and_manifest_finishes_uploaded(
     assert len(updates) == 1
     assert updates[0]["status"] == "uploaded"
     assert writer.counters.upload_failures == 2
+
+
+@pytest.mark.asyncio
+async def test_uploaded_manifest_cannot_be_downgraded_to_failed() -> None:
+    database = ArchiveDatabase()
+    database.objects[1] = {
+        "id": 1,
+        "status": "uploaded",
+        "local_spool_path": None,
+        "last_error": None,
+    }
+
+    await database.mark_archive_failed(1, "spool file is missing")
+    await database.mark_archive_retrying(1, "late retry")
+    await database.mark_archive_upload_attempt(1, 99)
+    await database.abandon_archive_object(1, "late abandonment")
+    assert database.objects[1] == {
+        "id": 1,
+        "status": "uploaded",
+        "local_spool_path": None,
+        "last_error": None,
+    }
+
+    connection = RecordingArchiveConnection()
+    real_database = Database(Settings())
+    real_database.pool = RecordingArchivePool(connection)  # type: ignore[assignment]
+    await real_database.mark_archive_failed(1, "stale retry")
+    assert "WHERE id = %s AND status <> 'uploaded'" in connection.query
+
+
+@pytest.mark.asyncio
+async def test_missing_local_spool_reconciles_verified_remote_object(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    payload = b"verified immutable parquet bytes"
+    manifest, _ = add_archive_manifest(
+        database, workspace_tmp_path, payload, status="failed"
+    )
+    store = LocalObjectStore(workspace_tmp_path / "objects")
+    source = workspace_tmp_path / "remote-source.parquet"
+    source.write_bytes(payload)
+    await store.put_file(source, manifest["object_key"], manifest["content_hash"])
+    writer = ArchiveWriter(archive_settings(workspace_tmp_path), database, object_store=store)
+
+    await writer._retry_pending_once()
+
+    assert manifest["status"] == "uploaded"
+    assert manifest["local_spool_path"] is None
+    assert manifest["last_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_missing_local_spool_wrong_remote_size_stays_unresolved(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    manifest, _ = add_archive_manifest(database, workspace_tmp_path, b"expected")
+    store = LocalObjectStore(workspace_tmp_path / "objects")
+    remote = store.root / manifest["object_key"]
+    remote.parent.mkdir(parents=True, exist_ok=True)
+    remote.write_bytes(b"wrong-size")
+    writer = ArchiveWriter(archive_settings(workspace_tmp_path), database, object_store=store)
+
+    await writer._retry_pending_once()
+
+    assert manifest["status"] == "retrying"
+    assert manifest["last_error"] == "previous upload interruption"
+    assert "size mismatch" in writer._remote_recovery_errors[1]
+
+
+@pytest.mark.asyncio
+async def test_missing_local_spool_wrong_remote_sha256_stays_unresolved(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    manifest, _ = add_archive_manifest(database, workspace_tmp_path, b"expected")
+    store = LocalObjectStore(workspace_tmp_path / "objects")
+    remote = store.root / manifest["object_key"]
+    remote.parent.mkdir(parents=True, exist_ok=True)
+    remote.write_bytes(b"tampered")
+    writer = ArchiveWriter(archive_settings(workspace_tmp_path), database, object_store=store)
+
+    await writer._retry_pending_once()
+
+    assert manifest["status"] == "retrying"
+    assert manifest["last_error"] == "previous upload interruption"
+    assert "sha256" in writer._remote_recovery_errors[1]
+
+
+@pytest.mark.asyncio
+async def test_missing_local_spool_and_remote_object_stays_visibly_unresolved(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    manifest, _ = add_archive_manifest(database, workspace_tmp_path, b"not-uploaded")
+    writer = ArchiveWriter(
+        archive_settings(workspace_tmp_path),
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+
+    await writer._retry_pending_once()
+
+    assert manifest["status"] == "retrying"
+    assert manifest["local_spool_path"] is not None
+    assert manifest["last_error"] == "previous upload interruption"
+    assert writer._remote_recovery_errors[1] == "remote object is missing"
+
+
+@pytest.mark.asyncio
+async def test_two_archive_writers_cannot_end_uploaded_object_as_failed(
+    workspace_tmp_path: Path,
+) -> None:
+    database = CoordinatedArchiveDatabase()
+    payload = b"cross-container-race"
+    manifest, local_path = add_archive_manifest(
+        database,
+        workspace_tmp_path,
+        payload,
+        status="prepared",
+        local_file=True,
+    )
+    settings = archive_settings(workspace_tmp_path)
+    store = LocalObjectStore(workspace_tmp_path / "objects")
+    stale_writer = ArchiveWriter(settings, database, object_store=store)
+    uploading_writer = ArchiveWriter(settings, database, object_store=store)
+
+    stale_retry = asyncio.create_task(stale_writer._retry_pending_once())
+    await asyncio.wait_for(database.pending_read.wait(), timeout=1)
+    assert await uploading_writer._upload_with_retry(
+        1,
+        local_path,
+        manifest["object_key"],
+        manifest["content_hash"],
+    )
+    assert not local_path.exists()
+    database.release_pending.set()
+    await asyncio.wait_for(stale_retry, timeout=1)
+
+    assert manifest["status"] == "uploaded"
+    assert manifest["last_error"] is None
 
 
 @pytest.mark.asyncio
@@ -546,7 +790,8 @@ async def test_permanent_failure_spools_durably_and_restart_recovers(
     await first.stop()
     manifest = next(iter(database.objects.values()))
     assert manifest["status"] == "retrying"
-    assert Path(manifest["local_spool_path"]).is_file()
+    spool_path = Path(manifest["local_spool_path"])
+    assert spool_path.is_file()
     assert first.degraded
     assert first.counters.max_queue_rows <= 2
 
@@ -558,7 +803,8 @@ async def test_permanent_failure_spools_durably_and_restart_recovers(
     await recovered.start()
     await recovered.stop()
     assert manifest["status"] == "uploaded"
-    assert not Path(manifest["local_spool_path"]).exists()
+    assert manifest["local_spool_path"] is None
+    assert not spool_path.exists()
     assert len(
         [value for value in database.objects.values()
          if value["stream"] == "orderbook_updates"]
