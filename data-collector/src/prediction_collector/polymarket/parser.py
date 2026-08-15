@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -20,6 +21,9 @@ from prediction_collector.common.utils import (
     trade_fingerprint,
     utc_now,
 )
+
+
+InvalidMetricRecorder = Callable[[str, Any], None]
 
 
 def _json_list(value: Any) -> list[Any]:
@@ -46,6 +50,25 @@ def _bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _optional_market_metric(
+    value: Any,
+    *,
+    metric_name: str,
+    allow_zero: bool,
+    invalid_metric_recorder: InvalidMetricRecorder | None,
+) -> Decimal | None:
+    parsed = as_decimal(value)
+    invalid_source_value = value is not None and value != "" and parsed is None
+    invalid_domain_value = parsed is not None and (
+        parsed < 0 or (not allow_zero and parsed == 0)
+    )
+    if invalid_source_value or invalid_domain_value:
+        if invalid_metric_recorder is not None:
+            invalid_metric_recorder(metric_name, value)
+        return None
+    return parsed
+
+
 def market_status(raw: dict[str, Any]) -> str:
     if _bool(raw.get("resolved")) or raw.get("resolution") or raw.get("result"):
         return "resolved"
@@ -58,7 +81,11 @@ def market_status(raw: dict[str, Any]) -> str:
     return str(raw.get("status") or "inactive").lower()
 
 
-def parse_market_candidate(raw: dict[str, Any]) -> MarketCandidate:
+def parse_market_candidate(
+    raw: dict[str, Any],
+    *,
+    invalid_metric_recorder: InvalidMetricRecorder | None = None,
+) -> MarketCandidate:
     # conditionId is the cross-surface CTF/CLOB identifier. Gamma's compact row
     # identity is retained separately so all-market discovery does not allocate
     # one JSON dictionary per candidate.
@@ -94,9 +121,24 @@ def parse_market_candidate(raw: dict[str, Any]) -> MarketCandidate:
         ),
         spread=as_decimal(raw.get("spread")),
         close_time=parse_timestamp(first_present(raw, "endDate", "endTime")),
-        volume=as_decimal(first_present(raw, "volumeNum", "volume")),
-        volume_24h=as_decimal(first_present(raw, "volume24hr", "volume_24hr")),
-        liquidity=as_decimal(first_present(raw, "liquidityNum", "liquidity")),
+        volume=_optional_market_metric(
+            first_present(raw, "volumeNum", "volume"),
+            metric_name="volume",
+            allow_zero=True,
+            invalid_metric_recorder=invalid_metric_recorder,
+        ),
+        volume_24h=_optional_market_metric(
+            first_present(raw, "volume24hr", "volume_24hr"),
+            metric_name="volume_24h",
+            allow_zero=True,
+            invalid_metric_recorder=invalid_metric_recorder,
+        ),
+        liquidity=_optional_market_metric(
+            first_present(raw, "liquidityNum", "liquidity"),
+            metric_name="liquidity",
+            allow_zero=True,
+            invalid_metric_recorder=invalid_metric_recorder,
+        ),
         outcome_token_ids=token_ids,
         aliases=tuple(
             str(value)
@@ -162,9 +204,14 @@ def _nested_id(value: Any) -> str | None:
 
 
 def normalise_market(
-    raw: dict[str, Any], *, event_external_id: str | None = None
+    raw: dict[str, Any],
+    *,
+    event_external_id: str | None = None,
+    invalid_metric_recorder: InvalidMetricRecorder | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    candidate = parse_market_candidate(raw)
+    candidate = parse_market_candidate(
+        raw, invalid_metric_recorder=invalid_metric_recorder
+    )
     open_time = parse_timestamp(first_present(raw, "startDate", "startTime"))
     close_time = parse_timestamp(first_present(raw, "endDate", "endTime"))
     # Gamma occasionally carries a stale event end date on a newly opened
@@ -200,9 +247,19 @@ def normalise_market(
         ),
         "volume": candidate.volume,
         "volume_24h": candidate.volume_24h,
-        "open_interest": as_decimal(first_present(raw, "openInterest", "open_interest")),
+        "open_interest": _optional_market_metric(
+            first_present(raw, "openInterest", "open_interest"),
+            metric_name="open_interest",
+            allow_zero=True,
+            invalid_metric_recorder=invalid_metric_recorder,
+        ),
         "liquidity": candidate.liquidity,
-        "tick_size": as_decimal(first_present(raw, "orderPriceMinTickSize", "minimumTickSize")),
+        "tick_size": _optional_market_metric(
+            first_present(raw, "orderPriceMinTickSize", "minimumTickSize"),
+            metric_name="tick_size",
+            allow_zero=False,
+            invalid_metric_recorder=invalid_metric_recorder,
+        ),
         "fee_rate": as_decimal(first_present(raw, "fee", "feeRate", "takerBaseFee")),
         "enable_order_book": _bool(raw.get("enableOrderBook")),
         "accepting_orders": _bool(raw.get("acceptingOrders")),

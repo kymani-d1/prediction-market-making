@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -114,6 +115,24 @@ def valid_market() -> dict[str, Any]:
     }
 
 
+def invalid_metric_market(index: int = 0) -> dict[str, Any]:
+    return {
+        **valid_market(),
+        "id": str(248_410 + index),
+        "slug": (
+            "will-the-buffalo-bills-win-super-bowl-lvii"
+            if index == 0
+            else f"invalid-metric-{index}"
+        ),
+        "conditionId": f"0xinvalid-metric-{index}",
+        "volumeNum": "616.31",
+        "volume24hr": 0,
+        "liquidityNum": "13.28",
+        "orderPriceMinTickSize": 0,
+        "feeRate": "16000000000000000",
+    }
+
+
 @pytest.mark.asyncio
 async def test_metadata_sync_skips_blank_identity_and_records_one_aggregate_gap() -> None:
     database = MetadataDatabase()
@@ -195,6 +214,78 @@ async def test_metadata_identity_failure_samples_are_bounded() -> None:
     assert len(database.gaps[0]["details"]["samples"]) == 10
 
 
+@pytest.mark.asyncio
+async def test_metadata_sync_normalizes_invalid_metric_and_preserves_raw_evidence() -> None:
+    raw = invalid_metric_market()
+    database = MetadataDatabase()
+    writer = MetadataWriter()
+    service = PolymarketService(
+        rest=MetadataRest([[raw]]),  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        writer=writer,  # type: ignore[arg-type]
+    )
+
+    result = await service.sync_metadata(include_closed=False)
+
+    assert len(database.markets) == 1
+    market = database.markets[0]
+    assert market["tick_size"] is None
+    assert market["fee_rate"] == Decimal("16000000000000000")
+    assert market["raw_data"]["orderPriceMinTickSize"] == 0
+    assert result["invalid_market_metric_values_normalized"] == 1
+    assert result["invalid_market_metric_counts"] == {"tick_size": 1}
+    assert result["invalid_market_metric_samples"] == [
+        {
+            "raw_id": "248410",
+            "external_id": "0xinvalid-metric-0",
+            "conditionId": "0xinvalid-metric-0",
+            "slug": "will-the-buffalo-bills-win-super-bowl-lvii",
+            "metric_name": "tick_size",
+            "raw_value": 0,
+            "reason": "invalid_market_metric_normalized",
+        }
+    ]
+    assert len(database.gaps) == 1
+    assert database.gaps[0]["channel"] == "rest:metadata_backfill"
+    assert database.gaps[0]["gap_type"] == "market_metadata_schema_failure"
+    assert database.gaps[0]["details"] == {
+        "invalid_market_metric_values_normalized": 1,
+        "invalid_market_metric_counts": {"tick_size": 1},
+        "invalid_market_metric_samples": result[
+            "invalid_market_metric_samples"
+        ],
+    }
+    assert writer.raw_items[0].data["payload"][0]["orderPriceMinTickSize"] == 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_metric_diagnostics_are_aggregated_and_bounded() -> None:
+    raw_markets = [invalid_metric_market(index) for index in range(12)]
+    for raw in raw_markets:
+        raw["volumeNum"] = "-1"
+    database = MetadataDatabase()
+    writer = MetadataWriter()
+    service = PolymarketService(
+        rest=MetadataRest([raw_markets]),  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        writer=writer,  # type: ignore[arg-type]
+    )
+
+    result = await service.sync_metadata(include_closed=False)
+
+    assert len(database.markets) == 12
+    assert all(market["tick_size"] is None for market in database.markets)
+    assert all(market["volume"] is None for market in database.markets)
+    assert result["invalid_market_metric_values_normalized"] == 24
+    assert result["invalid_market_metric_counts"] == {
+        "volume": 12,
+        "tick_size": 12,
+    }
+    assert len(result["invalid_market_metric_samples"]) == 10
+    assert len(database.gaps) == 1
+    assert len(database.gaps[0]["details"]["invalid_market_metric_samples"]) == 10
+
+
 class BackfillService:
     def __init__(self) -> None:
         self.database = None
@@ -236,6 +327,16 @@ class BackfillWriter:
         return None
 
 
+class MetricBackfillService(BackfillService):
+    async def sync_metadata(self, **_: Any) -> dict[str, Any]:
+        return {
+            "markets": 1,
+            "malformed_markets_skipped": 0,
+            "invalid_market_metric_values_normalized": 1,
+            "invalid_market_metric_counts": {"tick_size": 1},
+        }
+
+
 @pytest.mark.asyncio
 async def test_backfill_is_partial_when_metadata_identity_was_skipped() -> None:
     result = await run_polymarket_backfill(
@@ -249,4 +350,19 @@ async def test_backfill_is_partial_when_metadata_identity_was_skipped() -> None:
         "malformed_market_samples": [
             {"raw_id": "2290078", "reason": "market_identity_missing"}
         ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_backfill_is_partial_when_invalid_market_metric_was_normalized() -> None:
+    result = await run_polymarket_backfill(
+        MetricBackfillService(),  # type: ignore[arg-type]
+        BackfillWriter(),  # type: ignore[arg-type]
+    )
+    assert result.status == "partial"
+    assert result.details["metadata"] == {
+        "markets": 1,
+        "malformed_markets_skipped": 0,
+        "invalid_market_metric_values_normalized": 1,
+        "invalid_market_metric_counts": {"tick_size": 1},
     }

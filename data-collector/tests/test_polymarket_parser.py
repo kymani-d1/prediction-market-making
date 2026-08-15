@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
 from prediction_collector.polymarket.parser import (
     normalise_event,
     normalise_market,
@@ -87,6 +89,78 @@ def test_normalised_market_does_not_emit_close_before_open(
     assert market["open_time"] == datetime(2026, 7, 1, tzinfo=UTC)
     assert market["close_time"] is None
     assert market["raw_data"]["endDate"] == "2025-12-31T12:00:00Z"
+
+
+@pytest.mark.parametrize(
+    ("raw_tick_size", "expected"),
+    [
+        (0, None),
+        ("-0.01", None),
+        ("0.01", Decimal("0.01")),
+    ],
+)
+def test_market_tick_size_respects_strictly_positive_domain(
+    load_fixture: FixtureLoader,
+    raw_tick_size: object,
+    expected: Decimal | None,
+) -> None:
+    raw = load_fixture("polymarket_market.json")
+    raw["orderPriceMinTickSize"] = raw_tick_size
+
+    market, _ = normalise_market(raw)
+
+    assert market["tick_size"] == expected
+    assert market["raw_data"]["orderPriceMinTickSize"] == raw_tick_size
+
+
+def test_negative_optional_market_metrics_normalize_to_none(
+    load_fixture: FixtureLoader,
+) -> None:
+    raw = load_fixture("polymarket_market.json")
+    raw.update(
+        {
+            "volumeNum": "-1",
+            "volume24hr": "-2",
+            "openInterest": "-3",
+            "liquidityNum": "-4",
+        }
+    )
+
+    candidate = parse_market_candidate(raw)
+    market, _ = normalise_market(raw)
+
+    assert candidate.volume is None
+    assert candidate.volume_24h is None
+    assert candidate.liquidity is None
+    assert market["volume"] is None
+    assert market["volume_24h"] is None
+    assert market["open_interest"] is None
+    assert market["liquidity"] is None
+
+
+def test_zero_optional_market_metrics_remain_valid(
+    load_fixture: FixtureLoader,
+) -> None:
+    raw = load_fixture("polymarket_market.json")
+    raw.update(
+        {
+            "volumeNum": 0,
+            "volume24hr": "0",
+            "openInterest": Decimal("0"),
+            "liquidityNum": 0,
+        }
+    )
+
+    candidate = parse_market_candidate(raw)
+    market, _ = normalise_market(raw)
+
+    assert candidate.volume == Decimal("0")
+    assert candidate.volume_24h == Decimal("0")
+    assert candidate.liquidity == Decimal("0")
+    assert market["volume"] == Decimal("0")
+    assert market["volume_24h"] == Decimal("0")
+    assert market["open_interest"] == Decimal("0")
+    assert market["liquidity"] == Decimal("0")
 
 
 def test_normalised_event_does_not_emit_end_before_start() -> None:

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -35,6 +36,37 @@ from prediction_collector.writer import BatchWriter, WriteItem
 LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class _InvalidMarketMetricDiagnostics:
+    total: int = 0
+    counts: dict[str, int] = field(default_factory=dict)
+    samples: list[dict[str, Any]] = field(default_factory=list)
+
+    def recorder_for(self, raw: dict[str, Any]) -> Callable[[str, Any], None]:
+        return lambda metric_name, raw_value: self.record(
+            raw, metric_name, raw_value
+        )
+
+    def record(self, raw: dict[str, Any], metric_name: str, raw_value: Any) -> None:
+        self.total += 1
+        self.counts[metric_name] = self.counts.get(metric_name, 0) + 1
+        if len(self.samples) >= 10:
+            return
+        identity = first_present(raw, "conditionId", "condition_id", "id")
+        condition_id = first_present(raw, "conditionId", "condition_id")
+        self.samples.append(
+            {
+                "raw_id": raw.get("id"),
+                "external_id": str(identity or ""),
+                "conditionId": condition_id,
+                "slug": raw.get("slug"),
+                "metric_name": metric_name,
+                "raw_value": raw_value,
+                "reason": "invalid_market_metric_normalized",
+            }
+        )
+
+
 class PolymarketService:
     def __init__(
         self,
@@ -58,6 +90,7 @@ class PolymarketService:
         }
         malformed_markets_skipped = 0
         malformed_market_samples: list[dict[str, Any]] = []
+        invalid_metrics = _InvalidMarketMetricDiagnostics()
         diagnostics = MetadataSyncDiagnostics()
         try:
             async for items, result in self.rest.iter_series():
@@ -109,7 +142,9 @@ class PolymarketService:
                         event_external_id = event["external_id"]
                         await self.database.upsert_event(event)
                     market, outcomes = normalise_market(
-                        raw, event_external_id=event_external_id
+                        raw,
+                        event_external_id=event_external_id,
+                        invalid_metric_recorder=invalid_metrics.recorder_for(raw),
                     )
                     external_id = market.get("external_id")
                     if not isinstance(external_id, str) or not external_id.strip():
@@ -144,14 +179,38 @@ class PolymarketService:
                 )
         counts["malformed_markets_skipped"] = malformed_markets_skipped
         counts["malformed_market_samples"] = malformed_market_samples
-        if malformed_markets_skipped:
+        counts["invalid_market_metric_values_normalized"] = invalid_metrics.total
+        counts["invalid_market_metric_counts"] = dict(invalid_metrics.counts)
+        counts["invalid_market_metric_samples"] = list(invalid_metrics.samples)
+        if malformed_markets_skipped or invalid_metrics.total:
             LOGGER.warning(
-                "Polymarket metadata backfill skipped malformed market identities",
+                "Polymarket metadata backfill normalized malformed market metadata",
                 extra={
                     "malformed_markets_skipped": malformed_markets_skipped,
                     "malformed_market_samples": malformed_market_samples,
+                    "invalid_market_metric_values_normalized": invalid_metrics.total,
+                    "invalid_market_metric_counts": invalid_metrics.counts,
+                    "invalid_market_metric_samples": invalid_metrics.samples,
                 },
             )
+            quality_details: dict[str, Any] = {}
+            if malformed_markets_skipped:
+                quality_details.update(
+                    {
+                        "malformed_markets_skipped": malformed_markets_skipped,
+                        "samples": malformed_market_samples,
+                    }
+                )
+            if invalid_metrics.total:
+                quality_details.update(
+                    {
+                        "invalid_market_metric_values_normalized": (
+                            invalid_metrics.total
+                        ),
+                        "invalid_market_metric_counts": invalid_metrics.counts,
+                        "invalid_market_metric_samples": invalid_metrics.samples,
+                    }
+                )
             await self.database.record_gap(
                 run_id=self.writer.run_id,
                 connection_id=None,
@@ -161,13 +220,9 @@ class PolymarketService:
                 outcome_external_id=None,
                 gap_type="market_metadata_schema_failure",
                 reconnect_reason=(
-                    "Gamma metadata backfill contained markets without "
-                    "canonical external identities"
+                    "Gamma metadata backfill contained malformed market metadata"
                 ),
-                details={
-                    "malformed_markets_skipped": malformed_markets_skipped,
-                    "samples": malformed_market_samples,
-                },
+                details=quality_details,
             )
         LOGGER.info(
             "Polymarket metadata sync complete",
@@ -175,7 +230,10 @@ class PolymarketService:
                 **{
                     key: value
                     for key, value in counts.items()
-                    if key != "malformed_market_samples"
+                    if key not in {
+                        "malformed_market_samples",
+                        "invalid_market_metric_samples",
+                    }
                 },
                 **diagnostics.as_log_fields(),
             },

@@ -60,8 +60,13 @@ async def run_polymarket_backfill(
     )
     incomplete_metadata = bool(
         isinstance(details.get("metadata"), dict)
-        and details["metadata"].get(  # type: ignore[union-attr]
-            "malformed_markets_skipped", 0
+        and (
+            details["metadata"].get(  # type: ignore[union-attr]
+                "malformed_markets_skipped", 0
+            )
+            or details["metadata"].get(  # type: ignore[union-attr]
+                "invalid_market_metric_values_normalized", 0
+            )
         )
     )
     archive_degraded = bool(writer.archive and writer.archive.degraded)
