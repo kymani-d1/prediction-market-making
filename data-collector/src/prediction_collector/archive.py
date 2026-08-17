@@ -525,6 +525,13 @@ class ArchiveWriter:
         self._replayed_record_ids: set[str] = set()
         self._journal_lock = asyncio.Lock()
         self._spill_replay_lock = asyncio.Lock()
+        # A content-addressed spool filename is a process-local mutable resource
+        # until its immutable remote object and manifest are committed. Lanes,
+        # maintenance recovery, and compaction may run concurrently, but only
+        # one of them may publish/stat/upload/unlink a given digest at a time.
+        # Different digests remain fully concurrent.
+        self._spool_owners: dict[str, object] = {}
+        self._spool_owner_released: dict[str, asyncio.Event] = {}
         self._journal_path = settings.archive_spool_directory / "ingress-journal.jsonl"
         self._spool_bytes = 0
         self._spool_reserved_bytes = 0
@@ -919,6 +926,30 @@ class ArchiveWriter:
             return None
         return await self.database.raw_rest_archive_by_content_hash(content)
 
+    async def _claim_spool_object(
+        self, digest: str, *, wait: bool
+    ) -> object | None:
+        """Claim one content-addressed local object without blocking other hashes."""
+        while digest in self._spool_owners:
+            if not wait:
+                return None
+            released = self._spool_owner_released.setdefault(
+                digest, asyncio.Event()
+            )
+            await released.wait()
+        token = object()
+        self._spool_owners[digest] = token
+        return token
+
+    def _release_spool_object(self, digest: str, token: object) -> None:
+        """Release ownership synchronously so cancellation cannot strand it."""
+        if self._spool_owners.get(digest) is not token:
+            raise RuntimeError(f"archive spool ownership mismatch for {digest}")
+        del self._spool_owners[digest]
+        released = self._spool_owner_released.pop(digest, None)
+        if released is not None:
+            released.set()
+
     async def run(self) -> None:
         await self._retry_pending_once()
         await self._recover_compactions()
@@ -1155,6 +1186,8 @@ class ArchiveWriter:
         local_inputs: list[Path] = []
         replacement: Path | None = None
         replacement_id: int | None = None
+        digest: str | None = None
+        owner_token: object | None = None
         try:
             stream = str(candidates[0]["stream"])
             schema_version = int(candidates[0]["schema_version"])
@@ -1189,6 +1222,8 @@ class ArchiveWriter:
                 data_page_size=1024 * 1024,
             )
             digest = await asyncio.to_thread(_sha256, provisional)
+            owner_token = await self._claim_spool_object(digest, wait=True)
+            assert owner_token is not None
             replacement = self.settings.archive_spool_directory / f"{digest}.parquet"
             if replacement.exists():
                 provisional.unlink(missing_ok=True)
@@ -1293,6 +1328,8 @@ class ArchiveWriter:
                 path.unlink(missing_ok=True)
             if replacement is not None:
                 replacement.unlink(missing_ok=True)
+            if digest is not None and owner_token is not None:
+                self._release_spool_object(digest, owner_token)
             await self._release_spool_serialization(compaction_reservation)
 
     async def _prepare_and_upload(self, records: list[ArchiveRecord]) -> bool:
@@ -1361,79 +1398,92 @@ class ArchiveWriter:
                 str(records[0].data.get("content_hash")) if stream == "raw_rest" else None
             ),
         )
-        final_path = self.settings.archive_spool_directory / f"{digest}.parquet"
-        if final_path.exists():
-            provisional.unlink(missing_ok=True)
-        else:
-            provisional.replace(final_path)
-        compressed = final_path.stat().st_size
-        source_times = [
-            parsed
-            for record in records
-            if (parsed := parse_timestamp(record.data.get("source_timestamp"))) is not None
-        ]
-        received_times = [
-            parsed
-            for record in records
-            if (parsed := parse_timestamp(record.data.get("received_at"))) is not None
-        ]
-        object_id = await self.database.register_archive_object(
-            stream=stream,
-            schema_version=SCHEMA_VERSION,
-            object_key=object_key,
-            content_hash=digest,
-            compression=self.settings.archive_compression,
-            row_count=len(payload_records),
-            uncompressed_bytes=uncompressed,
-            compressed_bytes=compressed,
-            min_source_timestamp=min(source_times) if source_times else None,
-            max_source_timestamp=max(source_times) if source_times else None,
-            min_received_at=min(received_times) if received_times else None,
-            max_received_at=max(received_times) if received_times else None,
-            partition_date=timestamp.date(),
-            partition_hour=timestamp.hour,
-            local_spool_path=str(final_path),
-            payload_content_hash=(
-                str(records[0].data.get("content_hash")) if stream == "raw_rest" else None
-            ),
-            object_role=(
-                "raw_rest_blob" if stream == "raw_rest"
-                else "dictionary" if stream == "archive_dictionary"
-                else "data"
-            ),
-            compaction_generation=0,
-        )
-        uploaded = False
-        if hasattr(self.database, "archive_object_state"):
-            state = await self.database.archive_object_state(object_id)
-            object_key = str(state["object_key"])
-            if state["status"] == "uploaded":
-                # Manifest commit won a prior retry/crash race. The immutable
-                # content already exists at the manifest key; discard only the
-                # redundant local serialization and acknowledge the journal.
-                final_path.unlink(missing_ok=True)
-                uploaded = True
-        if not uploaded:
-            uploaded = await self._upload_with_retry(
-                object_id, final_path, object_key, digest
+        owner_token = await self._claim_spool_object(digest, wait=True)
+        assert owner_token is not None
+        try:
+            final_path = self.settings.archive_spool_directory / f"{digest}.parquet"
+            if final_path.exists():
+                provisional.unlink(missing_ok=True)
+            else:
+                provisional.replace(final_path)
+            compressed = final_path.stat().st_size
+            source_times = [
+                parsed
+                for record in records
+                if (
+                    parsed := parse_timestamp(record.data.get("source_timestamp"))
+                ) is not None
+            ]
+            received_times = [
+                parsed
+                for record in records
+                if (parsed := parse_timestamp(record.data.get("received_at")))
+                is not None
+            ]
+            object_id = await self.database.register_archive_object(
+                stream=stream,
+                schema_version=SCHEMA_VERSION,
+                object_key=object_key,
+                content_hash=digest,
+                compression=self.settings.archive_compression,
+                row_count=len(payload_records),
+                uncompressed_bytes=uncompressed,
+                compressed_bytes=compressed,
+                min_source_timestamp=min(source_times) if source_times else None,
+                max_source_timestamp=max(source_times) if source_times else None,
+                min_received_at=min(received_times) if received_times else None,
+                max_received_at=max(received_times) if received_times else None,
+                partition_date=timestamp.date(),
+                partition_hour=timestamp.hour,
+                local_spool_path=str(final_path),
+                payload_content_hash=(
+                    str(records[0].data.get("content_hash"))
+                    if stream == "raw_rest"
+                    else None
+                ),
+                object_role=(
+                    "raw_rest_blob" if stream == "raw_rest"
+                    else "dictionary" if stream == "archive_dictionary"
+                    else "data"
+                ),
+                compaction_generation=0,
             )
-        if uploaded and stream == "raw_rest":
-            for record in records:
-                await self.database.record_raw_rest_provenance(
-                    archive_object_id=object_id,
-                    object_key=object_key,
-                    value=record.data,
+            uploaded = False
+            if hasattr(self.database, "archive_object_state"):
+                state = await self.database.archive_object_state(object_id)
+                object_key = str(state["object_key"])
+                if state["status"] == "uploaded":
+                    # Manifest commit won a prior retry/crash race. The immutable
+                    # content already exists at the manifest key; discard only the
+                    # redundant local serialization and acknowledge the journal.
+                    final_path.unlink(missing_ok=True)
+                    uploaded = True
+            if not uploaded:
+                uploaded = await self._upload_with_retry(
+                    object_id, final_path, object_key, digest
                 )
-        if uploaded and stream == "orderbook_snapshots" and hasattr(
-            self.database, "mark_market_final_snapshot_archived"
-        ):
-            for record in records:
-                if record.data.get("snapshot_type") == "closing":
-                    await self.database.mark_market_final_snapshot_archived(
-                        market_external_id=str(record.data["market_external_id"]),
+            if uploaded and stream == "raw_rest":
+                for record in records:
+                    await self.database.record_raw_rest_provenance(
                         archive_object_id=object_id,
+                        object_key=object_key,
+                        value=record.data,
                     )
-        return True
+            if uploaded and stream == "orderbook_snapshots" and hasattr(
+                self.database, "mark_market_final_snapshot_archived"
+            ):
+                for record in records:
+                    if record.data.get("snapshot_type") == "closing":
+                        await self.database.mark_market_final_snapshot_archived(
+                            market_external_id=str(
+                                record.data["market_external_id"]
+                            ),
+                            archive_object_id=object_id,
+                        )
+            return True
+        finally:
+            provisional.unlink(missing_ok=True)
+            self._release_spool_object(digest, owner_token)
 
     async def _upload_with_retry(
         self, object_id: int, local_path: Path, object_key: str, digest: str
@@ -1499,53 +1549,71 @@ class ArchiveWriter:
         )
         for value in pending:
             object_id = int(value["id"])
-            # The pending query is only a candidate snapshot. Another collector
-            # may commit the shared manifest before this process acts on it.
-            state = await self.database.archive_object_state(object_id)
-            if state["status"] == "uploaded":
-                self._remote_recovery_errors.pop(object_id, None)
+            digest = str(value["content_hash"])
+            owner_token = await self._claim_spool_object(digest, wait=False)
+            if owner_token is None:
+                # A lane or compactor owns this local immutable object. It will
+                # either commit+clean it or release it still pending for a later
+                # maintenance pass.
                 continue
-            local_path = Path(str(state["local_spool_path"] or ""))
-            if not local_path.is_file():
-                verification_error = await self._remote_verification_error(state)
-                if verification_error is None:
-                    # A verified immutable object is authoritative. This also
-                    # recovers a crash after S3 PUT but before the DB commit.
-                    await self.database.mark_archive_uploaded(object_id)
+            try:
+                # The pending query is only a candidate snapshot. Another
+                # collector may commit the shared manifest before this process
+                # acts, or a lane may have completed before ownership was won.
+                state = await self.database.archive_object_state(object_id)
+                if state["status"] == "uploaded":
                     self._remote_recovery_errors.pop(object_id, None)
-                    LOGGER.info(
-                        "Reconciled archive manifest from verified remote object",
-                        extra={"archive_object_id": object_id,
-                               "object_key": str(state["object_key"])},
-                    )
                     continue
+                local_path = Path(str(state["local_spool_path"] or ""))
+                if not local_path.is_file():
+                    verification_error = await self._remote_verification_error(
+                        state
+                    )
+                    if verification_error is None:
+                        # A verified immutable object is authoritative. This also
+                        # recovers a crash after S3 PUT but before the DB commit.
+                        await self.database.mark_archive_uploaded(object_id)
+                        self._remote_recovery_errors.pop(object_id, None)
+                        LOGGER.info(
+                            "Reconciled archive manifest from verified remote object",
+                            extra={
+                                "archive_object_id": object_id,
+                                "object_key": str(state["object_key"]),
+                            },
+                        )
+                        continue
 
-                # Absence in this container is not evidence that a spool file
-                # owned by another collector is gone. Keep the shared manifest
-                # unresolved and retry remote verification later. Deduplicate
-                # diagnostics to avoid a per-second cross-container log storm.
-                if self._remote_recovery_errors.get(object_id) != verification_error:
-                    self._remote_recovery_errors[object_id] = verification_error
-                    log = (
-                        LOGGER.warning
-                        if "mismatch" in verification_error
-                        else LOGGER.debug
-                    )
-                    log(
-                        "Archive manifest remains unresolved after remote verification",
-                        extra={
-                            "archive_object_id": object_id,
-                            "object_key": str(state["object_key"]),
-                            "reason": verification_error,
-                        },
-                    )
-                continue
-            await self._upload_with_retry(
-                object_id,
-                local_path,
-                str(state["object_key"]),
-                str(state["content_hash"]),
-            )
+                    # Absence in this container is not evidence that a spool file
+                    # owned by another collector is gone. Keep the shared manifest
+                    # unresolved and retry remote verification later. Deduplicate
+                    # diagnostics to avoid a per-second cross-container log storm.
+                    if (
+                        self._remote_recovery_errors.get(object_id)
+                        != verification_error
+                    ):
+                        self._remote_recovery_errors[object_id] = verification_error
+                        log = (
+                            LOGGER.warning
+                            if "mismatch" in verification_error
+                            else LOGGER.debug
+                        )
+                        log(
+                            "Archive manifest remains unresolved after remote verification",
+                            extra={
+                                "archive_object_id": object_id,
+                                "object_key": str(state["object_key"]),
+                                "reason": verification_error,
+                            },
+                        )
+                    continue
+                await self._upload_with_retry(
+                    object_id,
+                    local_path,
+                    str(state["object_key"]),
+                    str(state["content_hash"]),
+                )
+            finally:
+                self._release_spool_object(digest, owner_token)
 
     async def _remote_verification_error(
         self, value: Mapping[str, Any]

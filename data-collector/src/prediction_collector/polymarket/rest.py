@@ -11,6 +11,9 @@ from prediction_collector.common.pagination import extract_items
 LOGGER = logging.getLogger(__name__)
 
 
+_PUBLIC_GAMMA_RETRYABLE_STATUSES = frozenset({403})
+
+
 def _validated_page_items(
     payload: Any,
     *,
@@ -54,22 +57,33 @@ class PolymarketRestClient:
         self.data_url = data_url.rstrip("/")
         self.clob_url = clob_url.rstrip("/")
 
+    async def _gamma_get(
+        self, path: str, *, params: dict[str, Any] | None = None
+    ) -> HttpResult:
+        """GET a public Gamma resource with its explicitly scoped WAF policy."""
+        return await self.http.get_json(
+            f"{self.gamma_url}/{path.lstrip('/')}",
+            params=params,
+            retryable_status_codes=_PUBLIC_GAMMA_RETRYABLE_STATUSES,
+        )
+
     async def _keyset(
         self,
         entity: str,
         *,
         parameters: dict[str, Any] | None = None,
         page_size: int = 100,
+        after_cursor: str | None = None,
     ) -> AsyncIterator[tuple[list[dict[str, Any]], HttpResult, str | None]]:
         params = dict(parameters or {})
         params["limit"] = page_size
-        cursor: str | None = None
+        cursor = after_cursor
         seen: set[str] = set()
         page_number = 0
         while True:
             if cursor:
                 params["after_cursor"] = cursor
-            result = await self.http.get_json(f"{self.gamma_url}/{entity}/keyset", params=params)
+            result = await self._gamma_get(f"/{entity}/keyset", params=params)
             payload = result.data
             if not isinstance(payload, dict) or not isinstance(payload.get(entity), list):
                 raise RuntimeError(
@@ -101,14 +115,20 @@ class PolymarketRestClient:
             cursor = next_cursor
 
     async def iter_events(
-        self, *, active: bool | None = None, closed: bool | None = None
+        self,
+        *,
+        active: bool | None = None,
+        closed: bool | None = None,
+        after_cursor: str | None = None,
     ) -> AsyncIterator[tuple[list[dict[str, Any]], HttpResult, str | None]]:
         params: dict[str, Any] = {}
         if active is not None:
             params["active"] = str(active).lower()
         if closed is not None:
             params["closed"] = str(closed).lower()
-        async for page in self._keyset("events", parameters=params):
+        async for page in self._keyset(
+            "events", parameters=params, after_cursor=after_cursor
+        ):
             yield page
 
     async def iter_live_events(
@@ -128,14 +148,20 @@ class PolymarketRestClient:
             yield page
 
     async def iter_markets(
-        self, *, active: bool | None = None, closed: bool | None = None
+        self,
+        *,
+        active: bool | None = None,
+        closed: bool | None = None,
+        after_cursor: str | None = None,
     ) -> AsyncIterator[tuple[list[dict[str, Any]], HttpResult, str | None]]:
         params: dict[str, Any] = {}
         if active is not None:
             params["active"] = str(active).lower()
         if closed is not None:
             params["closed"] = str(closed).lower()
-        async for page in self._keyset("markets", parameters=params):
+        async for page in self._keyset(
+            "markets", parameters=params, after_cursor=after_cursor
+        ):
             yield page
 
     async def _offset_entities(
@@ -149,7 +175,7 @@ class PolymarketRestClient:
         while True:
             query = dict(params or {})
             query.update({"limit": page_size, "offset": offset})
-            result = await self.http.get_json(f"{self.gamma_url}/{entity}", params=query)
+            result = await self._gamma_get(f"/{entity}", params=query)
             items = _validated_page_items(
                 result.data,
                 entity=entity,
@@ -222,7 +248,7 @@ class PolymarketRestClient:
         return await self.http.get_json(f"{self.clob_url}/book", params={"token_id": token_id})
 
     async def market(self, gamma_market_id: str) -> HttpResult:
-        return await self.http.get_json(f"{self.gamma_url}/markets/{gamma_market_id}")
+        return await self._gamma_get(f"/markets/{gamma_market_id}")
 
     async def price_history(
         self,

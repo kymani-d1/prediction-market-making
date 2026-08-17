@@ -2013,6 +2013,29 @@ class Database:
                 "collector_checkpoints", max(int(cursor.rowcount), 0)
             )
 
+    async def checkpoint_cursor(
+        self,
+        exchange: str,
+        job: str,
+        *,
+        checkpoint_key: str = "default",
+    ) -> str | None:
+        """Return the cursor after the last durably completed page, if any."""
+        async with self.pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    SELECT cursor
+                    FROM collector_checkpoints
+                    WHERE exchange = %s AND job = %s AND checkpoint_key = %s
+                    """,
+                    (exchange, job, checkpoint_key),
+                )
+            ).fetchone()
+        if row is None or row["cursor"] is None:
+            return None
+        return str(row["cursor"])
+
     async def live_candidates(
         self, exchange: str | None = None
     ) -> list[MarketCandidate]:

@@ -112,7 +112,18 @@ class PolymarketService:
 
         states = [False, True] if include_closed else [False]
         for closed in states:
-            async for items, result, cursor in self.rest.iter_events(closed=closed):
+            checkpoint_key = f"closed={str(closed).lower()}"
+            event_cursor = await self.database.checkpoint_cursor(
+                "polymarket", "metadata_events", checkpoint_key=checkpoint_key
+            )
+            if event_cursor:
+                LOGGER.info(
+                    "Resuming Polymarket event metadata backfill",
+                    extra={"closed": closed, "after_cursor": event_cursor},
+                )
+            async for items, result, cursor in self.rest.iter_events(
+                closed=closed, after_cursor=event_cursor
+            ):
                 await self._raw_page(
                     "gamma", "/events/keyset", "events", items, result, external_key=cursor
                 )
@@ -124,13 +135,23 @@ class PolymarketService:
                 await self.database.checkpoint(
                     "polymarket",
                     "metadata_events",
-                    checkpoint_key=f"closed={str(closed).lower()}",
+                    checkpoint_key=checkpoint_key,
                     cursor=cursor,
                     timestamp=utc_now(),
                     metadata={"records": counts["events"]},
                 )
 
-            async for items, result, cursor in self.rest.iter_markets(closed=closed):
+            market_cursor = await self.database.checkpoint_cursor(
+                "polymarket", "metadata_markets", checkpoint_key=checkpoint_key
+            )
+            if market_cursor:
+                LOGGER.info(
+                    "Resuming Polymarket market metadata backfill",
+                    extra={"closed": closed, "after_cursor": market_cursor},
+                )
+            async for items, result, cursor in self.rest.iter_markets(
+                closed=closed, after_cursor=market_cursor
+            ):
                 await self._raw_page(
                     "gamma", "/markets/keyset", "markets", items, result, external_key=cursor
                 )
@@ -169,7 +190,7 @@ class PolymarketService:
                 await self.database.checkpoint(
                     "polymarket",
                     "metadata_markets",
-                    checkpoint_key=f"closed={str(closed).lower()}",
+                    checkpoint_key=checkpoint_key,
                     cursor=cursor,
                     timestamp=utc_now(),
                     metadata={

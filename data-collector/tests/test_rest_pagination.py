@@ -17,11 +17,17 @@ class FakeHttp:
     def __init__(self, responses: list[Any]) -> None:
         self.responses = list(responses)
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.retryable_statuses: list[frozenset[int]] = []
 
     async def get_json(
-        self, url: str, *, params: dict[str, Any] | None = None
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        retryable_status_codes: frozenset[int] = frozenset(),
     ) -> FakeResult:
         self.calls.append((url, dict(params or {})))
+        self.retryable_statuses.append(retryable_status_codes)
         return FakeResult(self.responses.pop(0))
 
 
@@ -48,6 +54,27 @@ async def test_keyset_pagination_forwards_after_cursor_without_offset() -> None:
     assert [[item["id"] for item in page[0]] for page in pages] == [["1"], ["2"]]
     assert http.calls[1][1]["after_cursor"] == "cursor-A"
     assert all("offset" not in params for _, params in http.calls)
+    assert http.retryable_statuses == [frozenset({403}), frozenset({403})]
+
+
+@pytest.mark.asyncio
+async def test_keyset_pagination_can_resume_from_durable_cursor() -> None:
+    http = FakeHttp([{"markets": [{"id": "2"}]}])
+
+    pages = [
+        page
+        async for page in client(http).iter_markets(
+            closed=True, after_cursor="cursor-A"
+        )
+    ]
+
+    assert [row["id"] for row in pages[0][0]] == ["2"]
+    assert http.calls == [
+        (
+            "https://gamma.test/markets/keyset",
+            {"closed": "true", "limit": 100, "after_cursor": "cursor-A"},
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -126,3 +153,14 @@ async def test_live_event_discovery_uses_documented_active_and_closed_filters() 
     assert [page async for page in client(http).iter_live_events()] == []
     assert http.calls[0][1]["active"] == "true"
     assert http.calls[0][1]["closed"] == "false"
+
+
+@pytest.mark.asyncio
+async def test_forbidden_retry_policy_is_scoped_to_public_gamma_reads() -> None:
+    http = FakeHttp([[], []])
+    rest = client(http)
+
+    _ = [page async for page in rest.iter_series()]
+    _ = [page async for page in rest.iter_trades(market="0xcondition")]
+
+    assert http.retryable_statuses == [frozenset({403}), frozenset()]

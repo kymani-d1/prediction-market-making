@@ -246,11 +246,35 @@ class GatedStore(LocalObjectStore):
         self.blocked_stream = blocked_stream
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.attempted_keys: list[str] = []
 
     async def put_file(self, local_path: Path, object_key: str, content_hash: str) -> None:
+        self.attempted_keys.append(object_key)
         if f"stream={self.blocked_stream}" in object_key:
             self.started.set()
             await self.release.wait()
+        await super().put_file(local_path, object_key, content_hash)
+
+
+class DualGatedStore(LocalObjectStore):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.started = {
+            "orderbook_updates": asyncio.Event(),
+            "raw_rest": asyncio.Event(),
+        }
+        self.release = asyncio.Event()
+        self.attempted_keys: list[str] = []
+
+    async def put_file(
+        self, local_path: Path, object_key: str, content_hash: str
+    ) -> None:
+        self.attempted_keys.append(object_key)
+        for stream, event in self.started.items():
+            if f"stream={stream}" in object_key:
+                event.set()
+                await self.release.wait()
+                break
         await super().put_file(local_path, object_key, content_hash)
 
 
@@ -637,6 +661,242 @@ async def test_two_archive_writers_cannot_end_uploaded_object_as_failed(
 
     assert manifest["status"] == "uploaded"
     assert manifest["last_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_maintenance_skips_lane_owned_spool_and_archive_task_stays_alive(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_upload_max_attempts=1,
+    )
+    store = GatedStore(
+        workspace_tmp_path / "objects", blocked_stream="orderbook_updates"
+    )
+    writer = ArchiveWriter(settings, database, object_store=store)
+    await writer.start()
+    await writer.put(update_record("owned-by-live-lane", "0.41"))
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+
+    manifest = next(iter(database.objects.values()))
+    digest = str(manifest["content_hash"])
+    assert digest in writer._spool_owners
+    for _ in range(3):
+        await writer._retry_pending_once()
+    # Exercise the continuously running maintenance worker too.
+    await asyncio.sleep(1.05)
+
+    assert len(store.attempted_keys) == 1
+    assert writer.task is not None and not writer.task.done()
+    assert writer.counters.upload_failures == 0
+
+    store.release.set()
+    await asyncio.wait_for(writer.join(), timeout=2)
+    await writer.stop()
+
+    assert manifest["status"] == "uploaded"
+    assert manifest["local_spool_path"] is None
+    assert len(store.attempted_keys) == 1
+    assert writer._spool_owners == {}
+    assert writer.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_failed_lane_upload_releases_spool_for_maintenance_recovery(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path, archive_upload_max_attempts=1
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    store = FlakyStore(workspace_tmp_path / "objects", failures=1)
+    writer = ArchiveWriter(settings, database, object_store=store)
+
+    assert await writer._prepare_and_upload(
+        [update_record("failed-lane-owner", "0.42")]
+    )
+    manifest = next(iter(database.objects.values()))
+    spool_path = Path(str(manifest["local_spool_path"]))
+    assert manifest["status"] == "retrying"
+    assert spool_path.is_file()
+    assert writer._spool_owners == {}
+    assert store.attempts == 1
+
+    await writer._retry_pending_once()
+
+    assert store.attempts == 2
+    assert manifest["status"] == "uploaded"
+    assert manifest["local_spool_path"] is None
+    assert not spool_path.exists()
+    assert writer._spool_owners == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_lane_upload_releases_spool_for_recovery(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path, archive_upload_max_attempts=1
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    store = GatedStore(
+        workspace_tmp_path / "objects", blocked_stream="orderbook_updates"
+    )
+    writer = ArchiveWriter(settings, database, object_store=store)
+
+    upload = asyncio.create_task(
+        writer._prepare_and_upload(
+            [update_record("cancelled-lane-owner", "0.43")]
+        )
+    )
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+    upload.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+
+    manifest = next(iter(database.objects.values()))
+    spool_path = Path(str(manifest["local_spool_path"]))
+    assert writer._spool_owners == {}
+    assert spool_path.is_file()
+
+    store.release.set()
+    await writer._retry_pending_once()
+    assert manifest["status"] == "uploaded"
+    assert not spool_path.exists()
+    assert len(store.attempted_keys) == 2
+
+
+@pytest.mark.asyncio
+async def test_live_and_raw_rest_spool_owners_upload_independently(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_upload_max_attempts=1,
+    )
+    store = DualGatedStore(workspace_tmp_path / "objects")
+    writer = ArchiveWriter(settings, database, object_store=store)
+    await writer.start()
+
+    await asyncio.gather(
+        writer.put(update_record("parallel-live", "0.44")),
+        writer.put(raw_rest_record("parallel-rest")),
+    )
+    await asyncio.wait_for(
+        asyncio.gather(*(event.wait() for event in store.started.values())),
+        timeout=1,
+    )
+
+    assert len(writer._spool_owners) == 2
+    assert len(store.attempted_keys) == 2
+    assert writer.task is not None and not writer.task.done()
+
+    store.release.set()
+    await asyncio.wait_for(writer.join(), timeout=2)
+    await writer.stop()
+
+    assert writer._spool_owners == {}
+    assert {value["stream"] for value in database.objects.values()} == {
+        "orderbook_updates",
+        "raw_rest",
+    }
+    assert all(
+        value["status"] == "uploaded" for value in database.objects.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_digest_preparation_has_one_file_owner_and_upload(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path, archive_upload_max_attempts=1
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    store = GatedStore(
+        workspace_tmp_path / "objects", blocked_stream="orderbook_updates"
+    )
+    writer = ArchiveWriter(settings, database, object_store=store)
+    first = update_record("same-digest", "0.45")
+    second = update_record("same-digest", "0.45")
+
+    preparations = [
+        asyncio.create_task(writer._prepare_and_upload([first])),
+        asyncio.create_task(writer._prepare_and_upload([second])),
+    ]
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+    assert len(writer._spool_owners) == 1
+    assert len(store.attempted_keys) == 1
+
+    store.release.set()
+    assert await asyncio.gather(*preparations) == [True, True]
+
+    assert len(database.objects) == 1
+    manifest = next(iter(database.objects.values()))
+    assert manifest["status"] == "uploaded"
+    assert len(store.attempted_keys) == 1
+    assert writer.counters.upload_failures == 0
+    assert writer._spool_owners == {}
+    assert not list(settings.archive_spool_directory.glob("*.parquet"))
+
+
+@pytest.mark.asyncio
+async def test_compaction_spool_owner_excludes_maintenance_retry(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    source_store = LocalObjectStore(workspace_tmp_path / "objects")
+    source_settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+    )
+    source_writer = ArchiveWriter(
+        source_settings, database, object_store=source_store
+    )
+    await source_writer.start()
+    for index in range(3):
+        await source_writer.put(
+            update_record(f"compaction-owner-{index}", f"0.4{index}")
+        )
+    await source_writer.join()
+    await source_writer.stop()
+
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_compaction_min_objects=3,
+        archive_compaction_min_age_seconds=0,
+    )
+    store = GatedStore(
+        workspace_tmp_path / "objects", blocked_stream="orderbook_updates"
+    )
+    compactor = ArchiveWriter(settings, database, object_store=store)
+    compacting = asyncio.create_task(compactor.compact_once())
+    await asyncio.wait_for(store.started.wait(), timeout=2)
+
+    replacement = max(database.objects.values(), key=lambda value: value["id"])
+    assert replacement["object_role"] == "compacted"
+    assert str(replacement["content_hash"]) in compactor._spool_owners
+    for _ in range(3):
+        await compactor._retry_pending_once()
+    assert len(store.attempted_keys) == 1
+
+    store.release.set()
+    assert await asyncio.wait_for(compacting, timeout=2)
+    assert replacement["status"] == "uploaded"
+    assert compactor._spool_owners == {}
+    assert len(store.attempted_keys) == 1
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
 
 from prediction_collector.common.http import HttpResult
@@ -37,13 +38,13 @@ class MetadataRest:
         if False:
             yield
 
-    async def iter_events(self, *, closed: bool):
-        del closed
+    async def iter_events(self, *, closed: bool, after_cursor: str | None = None):
+        del closed, after_cursor
         if False:
             yield
 
-    async def iter_markets(self, *, closed: bool):
-        del closed
+    async def iter_markets(self, *, closed: bool, after_cursor: str | None = None):
+        del closed, after_cursor
         for index, page in enumerate(self.pages):
             yield page, market_page_result(), f"page-{index}"
 
@@ -55,6 +56,7 @@ class MetadataDatabase:
         self.outcomes: list[dict[str, Any]] = []
         self.gaps: list[dict[str, Any]] = []
         self.checkpoints: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.checkpoint_values: dict[tuple[str, str, str], str | None] = {}
 
     async def upsert_market(self, market: dict[str, Any], **_: Any) -> int:
         self.markets.append(market)
@@ -76,6 +78,14 @@ class MetadataDatabase:
 
     async def checkpoint(self, *args: Any, **kwargs: Any) -> None:
         self.checkpoints.append((args, kwargs))
+        self.checkpoint_values[(args[0], args[1], kwargs["checkpoint_key"])] = (
+            kwargs.get("cursor")
+        )
+
+    async def checkpoint_cursor(
+        self, exchange: str, job: str, *, checkpoint_key: str = "default"
+    ) -> str | None:
+        return self.checkpoint_values.get((exchange, job, checkpoint_key))
 
     async def record_gap(self, **value: Any) -> int:
         self.gaps.append(value)
@@ -187,6 +197,76 @@ async def test_metadata_sync_does_not_swallow_unrelated_market_database_error() 
         await service.sync_metadata(include_closed=False)
     assert len(writer.raw_items) == 1
     assert database.gaps == []
+    assert not any(args[1] == "metadata_markets" for args, _ in database.checkpoints)
+
+
+class CursorFailureRest(MetadataRest):
+    def __init__(self, *, fail: bool) -> None:
+        super().__init__([])
+        self.fail = fail
+        self.market_start_cursors: list[str | None] = []
+
+    async def iter_markets(
+        self, *, closed: bool, after_cursor: str | None = None
+    ):
+        del closed
+        self.market_start_cursors.append(after_cursor)
+        if after_cursor is None:
+            yield [valid_market()], market_page_result(), "cursor-A"
+        if self.fail:
+            request = httpx.Request(
+                "GET",
+                "https://gamma-api.polymarket.com/markets/keyset",
+            )
+            response = httpx.Response(403, request=request)
+            raise httpx.HTTPStatusError(
+                "persistent Gamma denial", request=request, response=response
+            )
+        yield [
+            {
+                **valid_market(),
+                "id": "2290080",
+                "conditionId": "0xresumed-condition",
+            }
+        ], market_page_result(), None
+
+
+@pytest.mark.asyncio
+async def test_metadata_checkpoint_stays_on_last_completed_page_and_restart_resumes() -> None:
+    database = MetadataDatabase()
+    writer = MetadataWriter()
+    failing_rest = CursorFailureRest(fail=True)
+    service = PolymarketService(
+        rest=failing_rest,  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        writer=writer,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(httpx.HTTPStatusError, match="persistent Gamma denial"):
+        await service.sync_metadata(include_closed=False)
+
+    checkpoint_key = ("polymarket", "metadata_markets", "closed=false")
+    assert database.checkpoint_values[checkpoint_key] == "cursor-A"
+    assert failing_rest.market_start_cursors == [None]
+    assert any(
+        market["external_id"] == "0xvalid-condition"
+        for market in database.markets
+    )
+
+    resumed_rest = CursorFailureRest(fail=False)
+    resumed_service = PolymarketService(
+        rest=resumed_rest,  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        writer=writer,  # type: ignore[arg-type]
+    )
+    await resumed_service.sync_metadata(include_closed=False)
+
+    assert resumed_rest.market_start_cursors == ["cursor-A"]
+    assert any(
+        market["external_id"] == "0xresumed-condition"
+        for market in database.markets
+    )
+    assert database.checkpoint_values[checkpoint_key] is None
 
 
 @pytest.mark.asyncio
