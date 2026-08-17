@@ -28,6 +28,18 @@ class FailingDatabase:
         self.quarantined.append((item, error, run_id))
 
 
+class GatedDatabase(FailingDatabase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_started = asyncio.Event()
+        self.release_write = asyncio.Event()
+
+    async def write_items(self, items: list[WriteItem]) -> dict[str, int]:
+        self.write_started.set()
+        await self.release_write.wait()
+        return await super().write_items(items)
+
+
 @pytest.mark.asyncio
 async def test_poison_row_is_quarantined_without_deadlocking_queue(
     monkeypatch: pytest.MonkeyPatch,
@@ -85,3 +97,42 @@ async def test_fifo_flush_boundary_does_not_wait_for_future_live_records() -> No
         "before-boundary",
         "after-boundary",
     ]
+
+
+@pytest.mark.asyncio
+async def test_batch_writer_reports_queue_put_pressure_and_task_state() -> None:
+    database = GatedDatabase()
+    writer = BatchWriter(
+        database,  # type: ignore[arg-type]
+        max_queue_size=1,
+        batch_size=1,
+        flush_interval_seconds=0.01,
+    )
+    await writer.start()
+    await writer.put(WriteItem("trades", {"id": "inflight"}))
+    await asyncio.wait_for(database.write_started.wait(), timeout=1)
+    await writer.put(WriteItem("trades", {"id": "queued"}))
+    waiting = asyncio.create_task(
+        writer.put(WriteItem("trades", {"id": "waiting"}))
+    )
+    await asyncio.sleep(0.05)
+
+    pressured = writer.metrics()
+    assert pressured["queue_depth"] == 1
+    assert pressured["queue_max_rows"] == 1
+    assert pressured["oldest_queued_seconds"] >= 0.04
+    assert pressured["queue_put_waiters"] == 1
+    assert pressured["oldest_queue_put_wait_seconds"] >= 0.04
+    assert pressured["task_state"] == "running"
+    assert not waiting.done()
+
+    database.release_write.set()
+    await asyncio.wait_for(waiting, timeout=1)
+    await asyncio.wait_for(writer.queue.join(), timeout=1)
+    drained = writer.metrics()
+    assert drained["queue_put_waiters"] == 0
+    assert drained["queue_put_blocked_count"] >= 1
+    assert drained["queue_put_wait_seconds_max"] >= 0.04
+    assert drained["max_queue_depth"] == 1
+    await writer.stop()
+    assert writer.metrics()["task_state"] == "stopped"

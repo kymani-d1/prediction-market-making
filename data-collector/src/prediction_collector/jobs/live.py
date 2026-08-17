@@ -715,6 +715,7 @@ class LiveCollector:
             snapshot["database_rows_source"] = "pg_stat_user_tables"
             if self.writer.archive is not None:
                 snapshot["archive"] = self.writer.archive.metrics()
+            snapshot["batch_writer"] = self.writer.metrics()
             self.coverage.confirmed_subscribed = (
                 await self.database.active_subscribed_market_count(self.run_id)
             )
@@ -747,8 +748,16 @@ class LiveCollector:
                 warning = int(self.settings.postgres_storage_warn_gb * Decimal(1024**3))
                 critical = int(self.settings.postgres_storage_critical_gb * Decimal(1024**3))
                 pressure = "critical" if size >= critical else "warning" if size >= warning else "normal"
-                queue_rows = int(archive.get("queue_depth", 0))
-                queue_bytes = int(archive.get("queue_bytes", 0))
+                queue_rows = int(
+                    archive.get(
+                        "total_resident_rows", archive.get("queue_depth", 0)
+                    )
+                )
+                queue_bytes = int(
+                    archive.get(
+                        "total_resident_bytes", archive.get("queue_bytes", 0)
+                    )
+                )
                 critical_sources: list[str] = []
                 if size >= critical:
                     critical_sources.append("postgres_size")

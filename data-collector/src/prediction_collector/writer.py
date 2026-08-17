@@ -51,6 +51,7 @@ class BatchWriter:
         self.tier_manager = tier_manager
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._has_started = False
         self.rows_written = 0
         self.failed_items = 0
         self.run_id: int | None = None
@@ -58,12 +59,26 @@ class BatchWriter:
         self.storage_pressure_details: dict[str, Any] = {}
         self._reference_state: dict[tuple[str, str], tuple[str, float]] = {}
         self.reference_duplicates_suppressed = 0
+        self._queued_at_monotonic: dict[int, float] = {}
+        self._queue_put_wait_started: dict[asyncio.Task[Any], float] = {}
+        self.queue_put_count = 0
+        self.queue_put_wait_seconds_total = 0.0
+        self.queue_put_wait_seconds_max = 0.0
+        self.queue_put_wait_seconds_last = 0.0
+        self.queue_put_blocked_count = 0
+        self.max_queue_depth = 0
+        self.queue_full_rejections = 0
+        self.route_count = 0
+        self.route_seconds_total = 0.0
+        self.route_seconds_max = 0.0
+        self.route_seconds_last = 0.0
 
     @property
     def task(self) -> asyncio.Task[None] | None:
         return self._task
 
     async def start(self) -> None:
+        self._has_started = True
         if self.archive is not None:
             self.archive.run_id = self.run_id
             await self.archive.start()
@@ -74,9 +89,38 @@ class BatchWriter:
         if self._task is not None and self._task.done():
             await self._task
             raise RuntimeError("database writer stopped unexpectedly")
-        routed = await self._route(item)
+        route_started = time.monotonic()
+        try:
+            routed = await self._route(item)
+        finally:
+            route_seconds = time.monotonic() - route_started
+            self.route_count += 1
+            self.route_seconds_last = route_seconds
+            self.route_seconds_total += route_seconds
+            self.route_seconds_max = max(
+                self.route_seconds_max, route_seconds
+            )
         if routed is not None:
-            await self.queue.put(routed)
+            wait_started = time.monotonic()
+            task = asyncio.current_task()
+            if task is not None:
+                self._queue_put_wait_started[task] = wait_started
+            try:
+                await self.queue.put(routed)
+            finally:
+                if task is not None:
+                    self._queue_put_wait_started.pop(task, None)
+            wait_seconds = time.monotonic() - wait_started
+            self.queue_put_count += 1
+            self.queue_put_wait_seconds_last = wait_seconds
+            self.queue_put_wait_seconds_total += wait_seconds
+            self.queue_put_wait_seconds_max = max(
+                self.queue_put_wait_seconds_max, wait_seconds
+            )
+            if wait_seconds >= 0.001:
+                self.queue_put_blocked_count += 1
+            self._queued_at_monotonic[id(routed)] = time.monotonic()
+            self.max_queue_depth = max(self.max_queue_depth, self.queue.qsize())
 
     async def _route(self, item: WriteItem) -> WriteItem | None:
         data = item.data
@@ -263,8 +307,12 @@ class BatchWriter:
     def put_nowait(self, item: WriteItem) -> bool:
         try:
             self.queue.put_nowait(item)
+            self._queued_at_monotonic[id(item)] = time.monotonic()
+            self.queue_put_count += 1
+            self.max_queue_depth = max(self.max_queue_depth, self.queue.qsize())
             return True
         except asyncio.QueueFull:
+            self.queue_full_rejections += 1
             return False
 
     async def run(self) -> None:
@@ -276,6 +324,7 @@ class BatchWriter:
             )
             try:
                 item = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+                self._queued_at_monotonic.pop(id(item), None)
                 if item.kind == "__flush__":
                     flush_event = item.data["event"]
                 else:
@@ -298,6 +347,66 @@ class BatchWriter:
             if flush_event is not None:
                 self.queue.task_done()
                 flush_event.set()
+
+    def metrics(self) -> dict[str, Any]:
+        now = time.monotonic()
+        oldest_queued = (
+            min(self._queued_at_monotonic.values())
+            if self._queued_at_monotonic
+            else None
+        )
+        oldest_waiter = (
+            min(self._queue_put_wait_started.values())
+            if self._queue_put_wait_started
+            else None
+        )
+        task_state = "stopped" if self._has_started else "not_started"
+        task_error: str | None = None
+        if self._task is not None:
+            if self._task.cancelled():
+                task_state = "cancelled"
+            elif self._task.done():
+                error = self._task.exception()
+                task_state = "failed" if error is not None else "stopped"
+                task_error = type(error).__name__ if error is not None else None
+            else:
+                task_state = "running"
+        return {
+            "queue_depth": self.queue.qsize(),
+            "queue_max_rows": self.queue.maxsize,
+            "max_queue_depth": self.max_queue_depth,
+            "oldest_queued_seconds": (
+                max(0.0, now - oldest_queued)
+                if oldest_queued is not None
+                else 0.0
+            ),
+            "queue_put_waiters": len(self._queue_put_wait_started),
+            "oldest_queue_put_wait_seconds": (
+                max(0.0, now - oldest_waiter)
+                if oldest_waiter is not None
+                else 0.0
+            ),
+            "queue_put_count": self.queue_put_count,
+            "queue_put_blocked_count": self.queue_put_blocked_count,
+            "queue_put_wait_seconds_total": round(
+                self.queue_put_wait_seconds_total, 6
+            ),
+            "queue_put_wait_seconds_max": round(
+                self.queue_put_wait_seconds_max, 6
+            ),
+            "queue_put_wait_seconds_last": round(
+                self.queue_put_wait_seconds_last, 6
+            ),
+            "queue_full_rejections": self.queue_full_rejections,
+            "route_count": self.route_count,
+            "route_seconds_total": round(self.route_seconds_total, 6),
+            "route_seconds_max": round(self.route_seconds_max, 6),
+            "route_seconds_last": round(self.route_seconds_last, 6),
+            "task_state": task_state,
+            "task_error_type": task_error,
+            "rows_written": self.rows_written,
+            "failed_items": self.failed_items,
+        }
 
     async def flush(self) -> None:
         """Wait for DB records preceding this FIFO boundary, not future traffic."""

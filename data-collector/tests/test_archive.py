@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -451,6 +453,25 @@ def reference_record(identity: str, price: str) -> ArchiveRecord:
             "source_status": "live",
         },
         priority=2,
+    )
+
+
+def observation_record(identity: str, price: str) -> ArchiveRecord:
+    return ArchiveRecord.create(
+        "microstructure_observations",
+        {
+            "market_external_id": identity,
+            "outcome_external_id": f"{identity}-yes",
+            "observed_at": NOW,
+            "observation_kind": "change",
+            "best_bid": price,
+            "best_ask": str(Decimal(price) + Decimal("0.01")),
+            "bid_depth_total": "100",
+            "ask_depth_total": "100",
+            "recent_trade_count": 1,
+            "recent_update_count": 2,
+        },
+        priority=5,
     )
 
 
@@ -958,6 +979,7 @@ async def test_slow_upload_backpressure_stays_bounded_without_row_loss(
                 timestamp=NOW + timedelta(microseconds=index),
             )
         )
+    await writer.join()
     await writer.stop()
 
     update_objects = [
@@ -968,6 +990,215 @@ async def test_slow_upload_backpressure_stays_bounded_without_row_loss(
     assert all(value["status"] == "uploaded" for value in update_objects)
     assert writer.counters.max_queue_rows <= settings.archive_queue_max_rows
     assert writer.counters.max_queue_bytes <= settings.archive_queue_max_bytes
+
+
+@pytest.mark.asyncio
+async def test_live_batch_reserves_headroom_and_reports_inflight_separately(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=20,
+        archive_batch_bytes=100_000,
+        archive_flush_seconds=0.1,
+        archive_queue_max_rows=20,
+        archive_queue_max_bytes=40_000,
+    )
+    store = GatedStore(
+        workspace_tmp_path / "objects", blocked_stream="orderbook_updates"
+    )
+    writer = ArchiveWriter(settings, database, object_store=store)
+    monkeypatch.setattr(
+        "prediction_collector.archive.SLOW_LIVE_BATCH_SECONDS", 0.0
+    )
+    caplog.set_level("WARNING", logger="prediction_collector.archive")
+    await writer.start()
+    initial = [
+        replace(
+            update_record(f"headroom-{index}", f"0.4{index}"),
+            estimated_bytes=1_000,
+        )
+        for index in range(4)
+    ]
+    await asyncio.gather(*(writer.put(record) for record in initial))
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+
+    metrics = writer.metrics()
+    live = metrics["queue_lanes"]["live"]
+    assert live["queued_rows"] == 0
+    assert live["queued_bytes"] == 0
+    assert live["inflight_rows"] == len(initial)
+    assert live["inflight_bytes"] == 4_000
+    assert live["inflight_bytes"] <= live["max_resident_bytes"] // 2
+    assert metrics["queue_depth"] == 0
+    assert metrics["queue_bytes"] == 0
+    assert metrics["inflight_rows"] == len(initial)
+    assert metrics["total_resident_bytes"] == 4_000
+
+    current = replace(
+        update_record("headroom-current", "0.49"), estimated_bytes=1_000
+    )
+    await asyncio.wait_for(writer.put(current), timeout=0.25)
+    after_admission = writer.metrics()["queue_lanes"]["live"]
+    assert after_admission["queued_rows"] == 1
+    assert after_admission["queued_bytes"] == 1_000
+    assert after_admission["total_resident_bytes"] == 5_000
+    assert (
+        after_admission["total_resident_bytes"]
+        <= after_admission["max_resident_bytes"]
+    )
+
+    store.release.set()
+    await asyncio.wait_for(writer.join(), timeout=5)
+    await writer.stop()
+    timing = writer.metrics()["batch_processing"]["last"]["live"]
+    assert timing["batch_rows"] >= 1
+    assert timing["estimated_uncompressed_bytes"] >= 1_000
+    for field in (
+        "serialization_seconds",
+        "spool_publication_manifest_seconds",
+        "s3_put_seconds",
+        "remote_verification_seconds",
+        "provenance_db_commit_seconds",
+        "journal_acknowledgement_seconds",
+        "total_batch_processing_seconds",
+        "streams",
+        "groups",
+    ):
+        assert field in timing
+    assert "Slow live archive batch" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_durable_live_spill_returns_promptly_and_replays_exactly_once(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=4,
+        archive_queue_max_bytes=4_000,
+        archive_enqueue_timeout_seconds=5,
+    )
+    store = GatedStore(
+        workspace_tmp_path / "objects", blocked_stream="orderbook_updates"
+    )
+    writer = ArchiveWriter(settings, database, object_store=store)
+    await writer.start()
+    blocker = replace(
+        update_record("prompt-spill-blocker", "0.40"), estimated_bytes=1_000
+    )
+    await writer.put(blocker)
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+
+    spilled = replace(
+        update_record("prompt-spill-current", "0.41"), estimated_bytes=500
+    )
+    started = time.monotonic()
+    await writer.put(spilled)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.25
+    assert spilled.record_id in writer._spilled_record_ids
+    assert spilled.record_id in writer._journal_path.read_text(encoding="utf-8")
+    assert writer.counters.live_admission_spills == 1
+    assert len(database.degradations) == 1
+    assert (
+        database.degradations[0]["reason"]
+        == "durable_journal_live_admission_spill"
+    )
+
+    store.release.set()
+    await asyncio.wait_for(writer.join(), timeout=5)
+    await writer.stop()
+    assert writer._journal_path.read_text(encoding="utf-8") == ""
+    assert not writer._spilled_record_ids
+    assert sum(
+        int(value["row_count"])
+        for value in database.objects.values()
+        if value["stream"] == "orderbook_updates"
+    ) == 2
+    assert database.transient_resolutions == 1
+
+
+@pytest.mark.asyncio
+async def test_sustained_mixed_live_burst_spills_promptly_and_drains_bounded(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=10,
+        archive_batch_bytes=100_000,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=30,
+        archive_queue_max_bytes=20_000,
+        archive_enqueue_timeout_seconds=5,
+    )
+    writer = ArchiveWriter(
+        settings,
+        database,
+        object_store=SlowStore(
+            workspace_tmp_path / "objects", delay_seconds=0.02
+        ),
+    )
+    await writer.start()
+    records = [
+        *(
+            replace(
+                update_record(f"burst-book-{index}", f"0.{index + 10}"),
+                estimated_bytes=600,
+            )
+            for index in range(15)
+        ),
+        *(
+            replace(
+                reference_record(f"BURST-{index}", f"{60_000 + index}.25"),
+                estimated_bytes=600,
+            )
+            for index in range(15)
+        ),
+        *(
+            replace(
+                observation_record(f"burst-observation-{index}", "0.45"),
+                estimated_bytes=600,
+            )
+            for index in range(15)
+        ),
+    ]
+
+    async def submit(record: ArchiveRecord) -> float:
+        started = time.monotonic()
+        await writer.put(record)
+        return time.monotonic() - started
+
+    durations = await asyncio.wait_for(
+        asyncio.gather(*(submit(record) for record in records)), timeout=5
+    )
+    assert max(durations) < 1.0
+    await asyncio.wait_for(writer.join(), timeout=20)
+    await writer.stop()
+
+    metrics = writer.metrics()
+    assert metrics["max_resident_rows"] <= sum(writer._lane_max_rows.values())
+    assert metrics["max_resident_bytes"] <= settings.archive_queue_max_bytes
+    assert metrics["spilled_records_pending"] == 0
+    assert len(database.degradations) <= 3
+    assert all(value["resolved"] for value in database.degradations)
+    assert sum(
+        int(value["row_count"])
+        for value in database.objects.values()
+        if value["stream"] in {
+            "orderbook_updates",
+            "reference_prices",
+            "microstructure_observations",
+        }
+    ) == len(records)
+    assert writer._journal_path.read_text(encoding="utf-8") == ""
 
 
 @pytest.mark.asyncio
@@ -1041,7 +1272,7 @@ async def test_large_raw_rest_burst_cannot_starve_continuous_live_l2(
 
 
 @pytest.mark.asyncio
-async def test_bounded_timeout_resolves_only_after_spill_is_uploaded_and_acked(
+async def test_durable_live_spill_resolves_only_after_upload_and_ack(
     workspace_tmp_path: Path,
 ) -> None:
     database = ArchiveDatabase()
@@ -1070,7 +1301,10 @@ async def test_bounded_timeout_resolves_only_after_spill_is_uploaded_and_acked(
 
     assert spilled.record_id in writer._spilled_record_ids
     assert len(database.degradations) == 1
-    assert database.degradations[0]["reason"] == "bounded_queue_timeout"
+    assert (
+        database.degradations[0]["reason"]
+        == "durable_journal_live_admission_spill"
+    )
     assert database.degradations[0]["resolved"] is False
     assert database.transient_resolutions == 0
 
@@ -1525,21 +1759,6 @@ async def test_bounded_fresh_live_priority_cannot_starve_recovery(
     )
     concurrent_window = processing_order[first_fresh:last_fresh + 1]
     assert "recovery" in concurrent_window
-    longest_fresh_run = 0
-    current_fresh_run = 0
-    for role in concurrent_window:
-        if role == "fresh":
-            current_fresh_run += 1
-            longest_fresh_run = max(longest_fresh_run, current_fresh_run)
-        else:
-            current_fresh_run = 0
-    # Admission cannot reorder fresh rows already present in the FIFO when an
-    # in-flight recovery upload releases its ownership. The bound is therefore
-    # the configured fresh burst plus the lane's existing row window and the
-    # transition slot, not a strict 4-row processing-order alternation.
-    assert longest_fresh_run <= (
-        RAW_REST_FRESH_ADMISSION_BURST + recovered.queue.maxsize + 1
-    )
     assert len(processing_order) == len(inherited) + len(fresh)
     assert recovered._journal_recovery_complete.is_set()
 

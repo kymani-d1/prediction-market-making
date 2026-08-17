@@ -34,6 +34,8 @@ from prediction_collector.config import Settings
 LOGGER = logging.getLogger(__name__)
 SCHEMA_VERSION = 2
 RAW_REST_FRESH_ADMISSION_BURST = 4
+LIVE_FRESH_ADMISSION_WAIT_SECONDS = 0.01
+SLOW_LIVE_BATCH_SECONDS = 2.0
 
 SIDE_CODES = {"buy": 1, "bid": 1, "bids": 1, "yes": 1,
               "sell": 2, "ask": 2, "asks": 2, "no": 2}
@@ -466,6 +468,10 @@ class ArchiveCounters:
     degraded_rows: int = 0
     max_queue_rows: int = 0
     max_queue_bytes: int = 0
+    max_resident_rows: int = 0
+    max_resident_bytes: int = 0
+    live_admission_spills: int = 0
+    live_admission_spills_by_stream: dict[str, int] = field(default_factory=dict)
     upload_latency_seconds_total: float = 0.0
     raw_rest_objects_reused: int = 0
     stream_rows: dict[str, int] = field(default_factory=dict)
@@ -513,10 +519,24 @@ class ArchiveWriter:
             maxsize=raw_rest_max_rows
         )
         self._queued_bytes = 0
+        self._queued_rows = 0
         self._lane_queued_bytes = {"live": 0, "raw_rest": 0}
+        self._lane_queued_rows = {"live": 0, "raw_rest": 0}
+        self._inflight_bytes = 0
+        self._inflight_rows = 0
+        self._lane_inflight_bytes = {"live": 0, "raw_rest": 0}
+        self._lane_inflight_rows = {"live": 0, "raw_rest": 0}
+        self._lane_inflight_started_monotonic: dict[str, float | None] = {
+            "live": None,
+            "raw_rest": None,
+        }
         self._lane_max_bytes = {
             "live": live_max_bytes,
             "raw_rest": raw_rest_max_bytes,
+        }
+        self._lane_max_rows = {
+            "live": live_max_rows,
+            "raw_rest": raw_rest_max_rows,
         }
         self._bytes_condition = asyncio.Condition()
         # Fresh REST pages may be on the critical path to opening market CLOB
@@ -575,6 +595,14 @@ class ArchiveWriter:
         self.degraded = False
         self._transient_degradation_pending = False
         self._remote_recovery_errors: dict[int, str] = {}
+        self._live_spill_degradation_streams: set[str] = set()
+        self._batch_timing_collectors: dict[
+            asyncio.Task[Any], list[dict[str, Any]]
+        ] = {}
+        self._last_batch_timing: dict[str, dict[str, Any]] = {}
+        self._batch_processing_count = {"live": 0, "raw_rest": 0}
+        self._slow_live_batch_count = 0
+        self._max_batch_processing_seconds = {"live": 0.0, "raw_rest": 0.0}
         self._retry = RetryPolicy(
             max_attempts=settings.archive_upload_max_attempts,
             base_delay_seconds=0.5,
@@ -709,7 +737,7 @@ class ArchiveWriter:
                         if stop_with_recovery and self._stop.is_set():
                             raise _JournalRecoveryStopped
                         if (
-                            self._has_archive_byte_capacity(record, lane)
+                            self._has_archive_resident_capacity(record, lane)
                             and not target_queue.full()
                             and self._admission_allowed(lane, admission_role)
                         ):
@@ -727,7 +755,9 @@ class ArchiveWriter:
                         except TimeoutError:
                             continue
                     self._queued_bytes += record.estimated_bytes
+                    self._queued_rows += 1
                     self._lane_queued_bytes[lane] += record.estimated_bytes
+                    self._lane_queued_rows[lane] += 1
                     self._queued_at_monotonic[record.record_id] = time.monotonic()
                     # Queue insertion is synchronous while the arbiter lock is
                     # held. Another replay/fresh producer cannot reserve the
@@ -737,7 +767,9 @@ class ArchiveWriter:
                         target_queue.put_nowait(record)
                     except BaseException:
                         self._queued_bytes -= record.estimated_bytes
+                        self._queued_rows -= 1
                         self._lane_queued_bytes[lane] -= record.estimated_bytes
+                        self._lane_queued_rows[lane] -= 1
                         self._queued_at_monotonic.pop(record.record_id, None)
                         raise
                     if recovery_admission:
@@ -763,57 +795,127 @@ class ArchiveWriter:
                 # backpressure until both row and byte capacity become free.
                 await enqueue_when_capacity_available()
             else:
-                async with asyncio.timeout(
+                admission_timeout = (
                     timeout_seconds
                     if timeout_seconds is not None
+                    else min(
+                        self.settings.archive_enqueue_timeout_seconds,
+                        LIVE_FRESH_ADMISSION_WAIT_SECONDS,
+                    )
+                    if lane == "live" and not recovery_admission
                     else self.settings.archive_enqueue_timeout_seconds
+                )
+                async with asyncio.timeout(
+                    admission_timeout
                 ):
                     await enqueue_when_capacity_available()
         except TimeoutError:
             self._active_record_ids.discard(record.record_id)
             self._spilled_record_ids.add(record.record_id)
             if report_timeout_degradation:
-                self.degraded = True
-                self._transient_degradation_pending = True
-                self.last_error = "archive queue backpressure timeout"
-                await self.database.record_archive_degradation(
-                    run_id=self.run_id,
-                    stream=record.stream,
-                    priority=record.priority,
-                    reason="bounded_queue_timeout",
-                    rows_affected=1,
-                    bytes_affected=record.estimated_bytes,
-                    details={"record_id": record.record_id, "lane": lane},
-                )
+                if lane == "live" and not recovery_admission:
+                    await self._record_live_admission_spill(record)
+                else:
+                    self.degraded = True
+                    self._transient_degradation_pending = True
+                    self.last_error = "archive queue backpressure timeout"
+                    await self.database.record_archive_degradation(
+                        run_id=self.run_id,
+                        stream=record.stream,
+                        priority=record.priority,
+                        reason="bounded_queue_timeout",
+                        rows_affected=1,
+                        bytes_affected=record.estimated_bytes,
+                        details={"record_id": record.record_id, "lane": lane},
+                    )
             # The append-only ingress journal already owns the record.  Do not
             # disconnect the source merely because the in-memory queue is
             # temporarily full; the archive task replays spilled journal rows
             # as capacity becomes available. Hard spool capacity still fails
             # explicitly before the journal append above.
             return False
-        self.counters.max_queue_rows = max(
-            self.counters.max_queue_rows, self._queue_depth()
-        )
-        self.counters.max_queue_bytes = max(self.counters.max_queue_bytes, self._queued_bytes)
+        self._record_occupancy_high_watermarks()
         if record.record_id in self._spilled_record_ids:
             self._replayed_record_ids.add(record.record_id)
         self._spilled_record_ids.discard(record.record_id)
         return True
 
-    def _has_archive_byte_capacity(
+    def _has_archive_resident_capacity(
         self, record: ArchiveRecord, lane: str
     ) -> bool:
+        resident_bytes = self._total_resident_bytes()
+        lane_resident_bytes = self._lane_resident_bytes(lane)
+        lane_resident_rows = self._lane_resident_rows(lane)
         return (
             (
-                self._queued_bytes == 0
-                or self._queued_bytes + record.estimated_bytes
+                resident_bytes == 0
+                or resident_bytes + record.estimated_bytes
                     <= self.settings.archive_queue_max_bytes
             )
             and (
-                self._lane_queued_bytes[lane] == 0
-                or self._lane_queued_bytes[lane] + record.estimated_bytes
+                lane_resident_bytes == 0
+                or lane_resident_bytes + record.estimated_bytes
                     <= self._lane_max_bytes[lane]
             )
+            and lane_resident_rows + 1 <= self._lane_max_rows[lane]
+        )
+
+    def _total_resident_bytes(self) -> int:
+        return self._queued_bytes + self._inflight_bytes
+
+    def _lane_resident_bytes(self, lane: str) -> int:
+        return self._lane_queued_bytes[lane] + self._lane_inflight_bytes[lane]
+
+    def _total_resident_rows(self) -> int:
+        return self._queued_rows + self._inflight_rows
+
+    def _lane_resident_rows(self, lane: str) -> int:
+        return self._lane_queued_rows[lane] + self._lane_inflight_rows[lane]
+
+    def _record_occupancy_high_watermarks(self) -> None:
+        self.counters.max_queue_rows = max(
+            self.counters.max_queue_rows, self._queued_rows
+        )
+        self.counters.max_queue_bytes = max(
+            self.counters.max_queue_bytes, self._queued_bytes
+        )
+        self.counters.max_resident_rows = max(
+            self.counters.max_resident_rows, self._total_resident_rows()
+        )
+        self.counters.max_resident_bytes = max(
+            self.counters.max_resident_bytes, self._total_resident_bytes()
+        )
+
+    async def _record_live_admission_spill(
+        self, record: ArchiveRecord
+    ) -> None:
+        self.counters.live_admission_spills += 1
+        self.counters.live_admission_spills_by_stream[record.stream] = (
+            self.counters.live_admission_spills_by_stream.get(record.stream, 0)
+            + 1
+        )
+        self.degraded = True
+        self._transient_degradation_pending = True
+        self.last_error = "archive live admission spilling to durable journal"
+        if record.stream in self._live_spill_degradation_streams:
+            return
+        self._live_spill_degradation_streams.add(record.stream)
+        await self.database.record_archive_degradation(
+            run_id=self.run_id,
+            stream=record.stream,
+            priority=record.priority,
+            reason="durable_journal_live_admission_spill",
+            rows_affected=1,
+            bytes_affected=record.estimated_bytes,
+            details={
+                "aggregation": "one_open_event_per_stream",
+                "live_admission_wait_seconds": LIVE_FRESH_ADMISSION_WAIT_SECONDS,
+                "queued_rows": self._lane_queued_rows["live"],
+                "queued_bytes": self._lane_queued_bytes["live"],
+                "inflight_rows": self._lane_inflight_rows["live"],
+                "inflight_bytes": self._lane_inflight_bytes["live"],
+                "total_resident_bytes": self._lane_resident_bytes("live"),
+            },
         )
 
     def _change_admission_waiters(
@@ -868,10 +970,10 @@ class ArchiveWriter:
         return self.raw_rest_queue if lane == "raw_rest" else self.queue
 
     def _queue_depth(self) -> int:
-        return self.queue.qsize() + self.raw_rest_queue.qsize()
+        return self._queued_rows
 
     def _queues_empty(self) -> bool:
-        return self.queue.empty() and self.raw_rest_queue.empty()
+        return self._queued_rows == 0
 
     async def _ensure_identifiers(self, record: ArchiveRecord) -> None:
         if record.stream in {"raw_rest", "reference_prices", "archive_dictionary"}:
@@ -1221,11 +1323,16 @@ class ArchiveWriter:
 
     async def _run_lane(self, lane: str) -> None:
         queue = self._queue_for_lane(lane)
-        while not self._stop.is_set() or not queue.empty():
+        pending: ArchiveRecord | None = None
+        while not self._stop.is_set() or not queue.empty() or pending is not None:
             records: list[ArchiveRecord] = []
             bytes_buffered = 0
             try:
-                first = await asyncio.wait_for(queue.get(), timeout=1.0)
+                if pending is not None:
+                    first = pending
+                    pending = None
+                else:
+                    first = await asyncio.wait_for(queue.get(), timeout=1.0)
                 if first.stream == "__flush__":
                     try:
                         await self._mark_dequeued(first, lane=lane)
@@ -1244,10 +1351,19 @@ class ArchiveWriter:
                 effective_batch_bytes = min(
                     self.settings.archive_batch_bytes,
                     self.settings.archive_queue_warn_bytes,
-                    self._lane_max_bytes[lane],
+                    (
+                        max(1, self._lane_max_bytes[lane] // 2)
+                        if lane == "live"
+                        else self._lane_max_bytes[lane]
+                    ),
                 )
                 effective_batch_rows = min(
-                    self.settings.archive_batch_rows, queue.maxsize
+                    self.settings.archive_batch_rows,
+                    (
+                        max(1, self._lane_max_rows[lane] // 2)
+                        if lane == "live"
+                        else self._lane_max_rows[lane]
+                    ),
                 )
                 while (
                     lane == "live"
@@ -1272,22 +1388,35 @@ class ArchiveWriter:
                     if item.stream == "__flush__":
                         flush_marker = item
                         break
+                    if bytes_buffered + item.estimated_bytes > effective_batch_bytes:
+                        # The item has left asyncio.Queue but remains logically
+                        # queued and byte-reserved. Process it first on the next
+                        # pass without reordering it behind newer arrivals.
+                        pending = item
+                        break
                     records.append(item)
                     bytes_buffered += item.estimated_bytes
                     await self._mark_dequeued(item, lane=lane)
-                await self._process_records(records)
+                await self._process_records(records, lane=lane)
             finally:
                 for record in records:
                     self._active_record_ids.discard(record.record_id)
                     queue.task_done()
                     await self._release_recovery_admission(record, lane=lane)
-                    await self._release_bytes(record.estimated_bytes, lane=lane)
+                    await self._release_inflight(record, lane=lane)
                 if flush_marker is not None:
                     queue.task_done()
                     flush_marker.data["event"].set()
                 await self._resolve_recovered_degradations_if_clean()
 
-    async def _process_records(self, records: list[ArchiveRecord]) -> None:
+    async def _process_records(
+        self, records: list[ArchiveRecord], *, lane: str
+    ) -> None:
+        batch_started = time.monotonic()
+        task = asyncio.current_task()
+        group_timings: list[dict[str, Any]] = []
+        if task is not None:
+            self._batch_timing_collectors[task] = group_timings
         grouped: dict[
             tuple[str, str, int, str | None], list[ArchiveRecord]
         ] = defaultdict(list)
@@ -1309,14 +1438,21 @@ class ArchiveWriter:
                 )
             ].append(record)
         completed: list[ArchiveRecord] = []
-        for group in grouped.values():
-            if await self._prepare_and_upload(group):
-                completed.extend(group)
-            else:
-                self._spilled_record_ids.update(
-                    record.record_id for record in group
-                )
-        await self._acknowledge_journal(completed)
+        journal_ack_seconds = 0.0
+        try:
+            for group in grouped.values():
+                if await self._prepare_and_upload(group):
+                    completed.extend(group)
+                else:
+                    self._spilled_record_ids.update(
+                        record.record_id for record in group
+                    )
+            journal_ack_started = time.monotonic()
+            await self._acknowledge_journal(completed)
+            journal_ack_seconds = time.monotonic() - journal_ack_started
+        finally:
+            if task is not None:
+                self._batch_timing_collectors.pop(task, None)
         recovered_ids = [
             record.record_id
             for record in completed
@@ -1332,6 +1468,61 @@ class ArchiveWriter:
         # Refresh once per durable batch, not once per source record. This
         # includes failed-upload Parquet files and compactor scratch files.
         await self._refresh_spool_bytes()
+        self._record_batch_timing(
+            lane=lane,
+            records=records,
+            group_timings=group_timings,
+            journal_ack_seconds=journal_ack_seconds,
+            total_seconds=time.monotonic() - batch_started,
+        )
+
+    def _record_batch_timing(
+        self,
+        *,
+        lane: str,
+        records: list[ArchiveRecord],
+        group_timings: list[dict[str, Any]],
+        journal_ack_seconds: float,
+        total_seconds: float,
+    ) -> None:
+        streams: dict[str, int] = defaultdict(int)
+        for record in records:
+            streams[record.stream] += 1
+        stage_names = (
+            "serialization_seconds",
+            "spool_publication_manifest_seconds",
+            "s3_put_seconds",
+            "remote_verification_seconds",
+            "provenance_db_commit_seconds",
+        )
+        summary: dict[str, Any] = {
+            "lane": lane,
+            "batch_rows": len(records),
+            "estimated_uncompressed_bytes": sum(
+                record.estimated_bytes for record in records
+            ),
+            "streams": dict(sorted(streams.items())),
+            **{
+                name: round(
+                    sum(float(group.get(name, 0.0)) for group in group_timings),
+                    6,
+                )
+                for name in stage_names
+            },
+            "journal_acknowledgement_seconds": round(
+                journal_ack_seconds, 6
+            ),
+            "total_batch_processing_seconds": round(total_seconds, 6),
+            "groups": [dict(group) for group in group_timings],
+        }
+        self._last_batch_timing[lane] = summary
+        self._batch_processing_count[lane] += 1
+        self._max_batch_processing_seconds[lane] = max(
+            self._max_batch_processing_seconds[lane], total_seconds
+        )
+        if lane == "live" and total_seconds >= SLOW_LIVE_BATCH_SECONDS:
+            self._slow_live_batch_count += 1
+            LOGGER.warning("Slow live archive batch", extra=summary)
 
     async def _maintenance_loop(self) -> None:
         while not self._stop.is_set():
@@ -1354,13 +1545,18 @@ class ArchiveWriter:
         if (
             self._transient_degradation_pending
             and not self._spilled_record_ids
-            and self.last_error in {None, "archive queue backpressure timeout"}
+            and self.last_error in {
+                None,
+                "archive queue backpressure timeout",
+                "archive live admission spilling to durable journal",
+            }
         ):
             if hasattr(self.database, "resolve_transient_archive_degradations"):
                 await self.database.resolve_transient_archive_degradations(
                     run_id=self.run_id
                 )
             self._transient_degradation_pending = False
+            self._live_spill_degradation_streams.clear()
             self.last_error = None
             self.degraded = False
 
@@ -1379,7 +1575,7 @@ class ArchiveWriter:
             self._compaction_task = None
 
     async def join(self) -> None:
-        """Wait for inherited recovery and both scheduling lanes to finish."""
+        """Wait for inherited recovery and all journaled work to finish."""
         while not self._journal_recovery_complete.is_set():
             if self._task is not None and self._task.done():
                 await self._task
@@ -1389,7 +1585,21 @@ class ArchiveWriter:
                 )
             except TimeoutError:
                 continue
-        await asyncio.gather(self.queue.join(), self.raw_rest_queue.join())
+        while True:
+            await asyncio.gather(self.queue.join(), self.raw_rest_queue.join())
+            if (
+                not self._spilled_record_ids
+                and self._queued_rows == 0
+                and self._inflight_rows == 0
+            ):
+                return
+            if self._task is not None and self._task.done():
+                await self._task
+            # Maintenance replays source-journal rows without duplicating them
+            # into the active journal. Give it an immediate pass rather than
+            # making join depend on the one-second maintenance cadence.
+            await self._retry_spilled_journal_once()
+            await asyncio.sleep(0.01)
 
     async def flush(self) -> None:
         """Flush records preceding lane-local FIFO markers."""
@@ -1601,16 +1811,49 @@ class ArchiveWriter:
             await self._release_spool_serialization(compaction_reservation)
 
     async def _prepare_and_upload(self, records: list[ArchiveRecord]) -> bool:
+        timing: dict[str, Any] = {
+            "stream": records[0].stream,
+            "rows": len(records),
+            "estimated_uncompressed_bytes": sum(
+                record.estimated_bytes for record in records
+            ),
+            "serialization_seconds": 0.0,
+            "spool_publication_manifest_seconds": 0.0,
+            "s3_put_seconds": 0.0,
+            "remote_verification_seconds": 0.0,
+            "provenance_db_commit_seconds": 0.0,
+        }
+        started = time.monotonic()
+        try:
+            return await self._prepare_and_upload_impl(records, timing)
+        finally:
+            timing["total_seconds"] = time.monotonic() - started
+            task = asyncio.current_task()
+            collector = (
+                self._batch_timing_collectors.get(task)
+                if task is not None
+                else None
+            )
+            if collector is not None:
+                collector.append(timing)
+
+    async def _prepare_and_upload_impl(
+        self, records: list[ArchiveRecord], timing: dict[str, Any]
+    ) -> bool:
         stream = records[0].stream
         if stream == "raw_rest":
             existing = await self._existing_raw_rest(records[0])
             if existing is not None:
+                committed_started = time.monotonic()
                 for record in records:
                     await self.database.record_raw_rest_provenance(
                         archive_object_id=int(existing["id"]),
                         object_key=str(existing["object_key"]),
                         value=record.data,
                     )
+                timing["provenance_db_commit_seconds"] += (
+                    time.monotonic() - committed_started
+                )
                 self.counters.raw_rest_objects_reused += len(records)
                 return True
         schema = STREAM_SCHEMAS.get(stream)
@@ -1642,6 +1885,7 @@ class ArchiveWriter:
             return False
         try:
             try:
+                serialization_started = time.monotonic()
                 await asyncio.to_thread(
                     _write_parquet,
                     provisional,
@@ -1652,11 +1896,15 @@ class ArchiveWriter:
                     self.settings.archive_zstd_level,
                     self.settings.archive_row_group_rows,
                 )
+                timing["serialization_seconds"] += (
+                    time.monotonic() - serialization_started
+                )
             except Exception as exc:
                 await self._quarantine_serialization_failure(records, exc)
                 return True
         finally:
             await self._release_spool_serialization(uncompressed)
+        publication_started = time.monotonic()
         digest = await asyncio.to_thread(_sha256, provisional)
         object_key = self._object_key(
             stream,
@@ -1726,20 +1974,32 @@ class ArchiveWriter:
                     # redundant local serialization and acknowledge the journal.
                     final_path.unlink(missing_ok=True)
                     uploaded = True
+            timing["spool_publication_manifest_seconds"] += (
+                time.monotonic() - publication_started
+            )
             if not uploaded:
                 uploaded = await self._upload_with_retry(
-                    object_id, final_path, object_key, digest
+                    object_id,
+                    final_path,
+                    object_key,
+                    digest,
+                    timing=timing,
                 )
             if uploaded and stream == "raw_rest":
+                committed_started = time.monotonic()
                 for record in records:
                     await self.database.record_raw_rest_provenance(
                         archive_object_id=object_id,
                         object_key=object_key,
                         value=record.data,
                     )
+                timing["provenance_db_commit_seconds"] += (
+                    time.monotonic() - committed_started
+                )
             if uploaded and stream == "orderbook_snapshots" and hasattr(
                 self.database, "mark_market_final_snapshot_archived"
             ):
+                committed_started = time.monotonic()
                 for record in records:
                     if record.data.get("snapshot_type") == "closing":
                         await self.database.mark_market_final_snapshot_archived(
@@ -1748,29 +2008,56 @@ class ArchiveWriter:
                             ),
                             archive_object_id=object_id,
                         )
+                timing["provenance_db_commit_seconds"] += (
+                    time.monotonic() - committed_started
+                )
             return True
         finally:
             provisional.unlink(missing_ok=True)
             self._release_spool_object(digest, owner_token)
 
     async def _upload_with_retry(
-        self, object_id: int, local_path: Path, object_key: str, digest: str
+        self,
+        object_id: int,
+        local_path: Path,
+        object_key: str,
+        digest: str,
+        *,
+        timing: dict[str, Any] | None = None,
     ) -> bool:
         for attempt in range(1, self.settings.archive_upload_max_attempts + 1):
             started = time.monotonic()
             try:
+                committed_started = time.monotonic()
                 await self.database.mark_archive_upload_attempt(object_id, attempt)
+                if timing is not None:
+                    timing["provenance_db_commit_seconds"] += (
+                        time.monotonic() - committed_started
+                    )
+                put_started = time.monotonic()
                 await self.object_store.put_file(local_path, object_key, digest)
+                if timing is not None:
+                    timing["s3_put_seconds"] += time.monotonic() - put_started
+                verification_started = time.monotonic()
                 head = await self.object_store.head(object_key)
                 metadata = {str(k).lower(): str(v) for k, v in dict(head.get("Metadata") or {}).items()}
                 if int(head.get("ContentLength", -1)) != local_path.stat().st_size:
                     raise IOError("uploaded object size verification failed")
                 if metadata.get("sha256") not in {None, digest}:
                     raise IOError("uploaded object hash metadata verification failed")
+                if timing is not None:
+                    timing["remote_verification_seconds"] += (
+                        time.monotonic() - verification_started
+                    )
+                committed_started = time.monotonic()
                 await self.database.mark_archive_uploaded(object_id)
                 local_path.unlink(missing_ok=True)
                 self.counters.objects_uploaded += 1
                 row = await self.database.archive_object_counts(object_id)
+                if timing is not None:
+                    timing["provenance_db_commit_seconds"] += (
+                        time.monotonic() - committed_started
+                    )
                 self.counters.rows_uploaded += int(row["row_count"])
                 self.counters.uncompressed_bytes += int(row["uncompressed_bytes"])
                 self.counters.compressed_bytes += int(row["compressed_bytes"])
@@ -1795,7 +2082,12 @@ class ArchiveWriter:
                 self.counters.upload_failures += 1
                 self.degraded = True
                 self.last_error = f"{type(exc).__name__}: {exc}"
+                committed_started = time.monotonic()
                 await self.database.mark_archive_retrying(object_id, self.last_error)
+                if timing is not None:
+                    timing["provenance_db_commit_seconds"] += (
+                        time.monotonic() - committed_started
+                    )
                 if attempt < self.settings.archive_upload_max_attempts:
                     await asyncio.sleep(self._retry.delay(attempt))
         LOGGER.error(
@@ -2062,11 +2354,35 @@ class ArchiveWriter:
         )
 
     async def _release_bytes(self, amount: int, *, lane: str = "live") -> None:
+        """Release a record removed from a queue without entering processing."""
         async with self._bytes_condition:
             self._queued_bytes = max(0, self._queued_bytes - amount)
+            self._queued_rows = max(0, self._queued_rows - 1)
             self._lane_queued_bytes[lane] = max(
                 0, self._lane_queued_bytes[lane] - amount
             )
+            self._lane_queued_rows[lane] = max(
+                0, self._lane_queued_rows[lane] - 1
+            )
+            self._bytes_condition.notify_all()
+
+    async def _release_inflight(
+        self, record: ArchiveRecord, *, lane: str
+    ) -> None:
+        async with self._bytes_condition:
+            self._inflight_bytes = max(
+                0, self._inflight_bytes - record.estimated_bytes
+            )
+            self._inflight_rows = max(0, self._inflight_rows - 1)
+            self._lane_inflight_bytes[lane] = max(
+                0,
+                self._lane_inflight_bytes[lane] - record.estimated_bytes,
+            )
+            self._lane_inflight_rows[lane] = max(
+                0, self._lane_inflight_rows[lane] - 1
+            )
+            if self._lane_inflight_rows[lane] == 0:
+                self._lane_inflight_started_monotonic[lane] = None
             self._bytes_condition.notify_all()
 
     async def _release_recovery_admission(
@@ -2086,11 +2402,32 @@ class ArchiveWriter:
     async def _mark_dequeued(
         self, record: ArchiveRecord, *, lane: str
     ) -> None:
-        self._queued_at_monotonic.pop(record.record_id, None)
-        # Admission reserves the actual queue row under this condition; wake
-        # either lane's arbiter as soon as get() frees that row, rather than
-        # waiting for the potentially slow upload to finish.
+        if record.stream == "__flush__":
+            async with self._bytes_condition:
+                self._bytes_condition.notify_all()
+            return
+        # Transfer ownership without changing total resident memory. This is
+        # the accounting boundary between the FIFO and the serializing/uploading
+        # batch, and exposes the headroom available to current producers.
         async with self._bytes_condition:
+            self._queued_at_monotonic.pop(record.record_id, None)
+            self._queued_bytes = max(
+                0, self._queued_bytes - record.estimated_bytes
+            )
+            self._queued_rows = max(0, self._queued_rows - 1)
+            self._lane_queued_bytes[lane] = max(
+                0, self._lane_queued_bytes[lane] - record.estimated_bytes
+            )
+            self._lane_queued_rows[lane] = max(
+                0, self._lane_queued_rows[lane] - 1
+            )
+            self._inflight_bytes += record.estimated_bytes
+            self._inflight_rows += 1
+            self._lane_inflight_bytes[lane] += record.estimated_bytes
+            if self._lane_inflight_rows[lane] == 0:
+                self._lane_inflight_started_monotonic[lane] = time.monotonic()
+            self._lane_inflight_rows[lane] += 1
+            self._record_occupancy_high_watermarks()
             self._bytes_condition.notify_all()
 
     def _object_key(
@@ -2113,6 +2450,7 @@ class ArchiveWriter:
 
     def metrics(self) -> dict[str, Any]:
         compressed = self.counters.compressed_bytes
+        now_monotonic = time.monotonic()
         oldest_queued = (
             min(self._queued_at_monotonic.values())
             if self._queued_at_monotonic
@@ -2122,18 +2460,58 @@ class ArchiveWriter:
             "healthy": not self.degraded,
             "queue_depth": self._queue_depth(),
             "queue_bytes": self._queued_bytes,
+            "inflight_rows": self._inflight_rows,
+            "inflight_bytes": self._inflight_bytes,
+            "total_resident_rows": self._total_resident_rows(),
+            "total_resident_bytes": self._total_resident_bytes(),
             "queue_lanes": {
                 "live": {
-                    "rows": self.queue.qsize(),
+                    "rows": self._lane_queued_rows["live"],
                     "bytes": self._lane_queued_bytes["live"],
+                    "queued_rows": self._lane_queued_rows["live"],
+                    "queued_bytes": self._lane_queued_bytes["live"],
+                    "inflight_rows": self._lane_inflight_rows["live"],
+                    "inflight_bytes": self._lane_inflight_bytes["live"],
+                    "inflight_oldest_seconds": (
+                        max(
+                            0.0,
+                            now_monotonic
+                            - self._lane_inflight_started_monotonic["live"],
+                        )
+                        if self._lane_inflight_started_monotonic["live"]
+                        is not None
+                        else 0.0
+                    ),
+                    "total_resident_rows": self._lane_resident_rows("live"),
+                    "total_resident_bytes": self._lane_resident_bytes("live"),
+                    "max_resident_rows": self._lane_max_rows["live"],
+                    "max_resident_bytes": self._lane_max_bytes["live"],
                 },
                 "raw_rest": {
-                    "rows": self.raw_rest_queue.qsize(),
+                    "rows": self._lane_queued_rows["raw_rest"],
                     "bytes": self._lane_queued_bytes["raw_rest"],
+                    "queued_rows": self._lane_queued_rows["raw_rest"],
+                    "queued_bytes": self._lane_queued_bytes["raw_rest"],
+                    "inflight_rows": self._lane_inflight_rows["raw_rest"],
+                    "inflight_bytes": self._lane_inflight_bytes["raw_rest"],
+                    "inflight_oldest_seconds": (
+                        max(
+                            0.0,
+                            now_monotonic
+                            - self._lane_inflight_started_monotonic["raw_rest"],
+                        )
+                        if self._lane_inflight_started_monotonic["raw_rest"]
+                        is not None
+                        else 0.0
+                    ),
+                    "total_resident_rows": self._lane_resident_rows("raw_rest"),
+                    "total_resident_bytes": self._lane_resident_bytes("raw_rest"),
+                    "max_resident_rows": self._lane_max_rows["raw_rest"],
+                    "max_resident_bytes": self._lane_max_bytes["raw_rest"],
                 },
             },
             "oldest_queued_seconds": (
-                max(0.0, time.monotonic() - oldest_queued)
+                max(0.0, now_monotonic - oldest_queued)
                 if oldest_queued is not None
                 else 0.0
             ),
@@ -2151,6 +2529,15 @@ class ArchiveWriter:
             "raw_rest_objects_reused": self.counters.raw_rest_objects_reused,
             "max_queue_depth": self.counters.max_queue_rows,
             "max_queue_bytes": self.counters.max_queue_bytes,
+            "max_resident_rows": self.counters.max_resident_rows,
+            "max_resident_bytes": self.counters.max_resident_bytes,
+            "durable_live_admission_spills": (
+                self.counters.live_admission_spills
+            ),
+            "durable_live_admission_spills_by_stream": dict(
+                sorted(self.counters.live_admission_spills_by_stream.items())
+            ),
+            "spilled_records_pending": len(self._spilled_record_ids),
             "last_error": self.last_error,
             "spool_bytes": self._spool_bytes + self._spool_reserved_bytes,
             "streams": {
@@ -2168,6 +2555,16 @@ class ArchiveWriter:
                 "bytes_before": self.counters.compaction_bytes_before,
                 "bytes_after": self.counters.compaction_bytes_after,
                 "failures": self.counters.compaction_failures,
+            },
+            "batch_processing": {
+                "batches_total": dict(self._batch_processing_count),
+                "slow_live_batches_total": self._slow_live_batch_count,
+                "max_total_seconds": {
+                    lane: round(value, 6)
+                    for lane, value in self._max_batch_processing_seconds.items()
+                },
+                "last": dict(self._last_batch_timing),
+                "slow_live_warning_seconds": SLOW_LIVE_BATCH_SECONDS,
             },
         }
 

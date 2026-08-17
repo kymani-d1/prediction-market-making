@@ -3283,6 +3283,7 @@ class Database:
                 WHERE event.resolved_at IS NULL
                   AND event.reason IN (
                       'bounded_queue_timeout',
+                      'durable_journal_live_admission_spill',
                       'archive_spool_capacity_exceeded'
                   )
                   AND (
@@ -3421,6 +3422,16 @@ class Database:
                             "archive_healthy": archive.get("healthy", False),
                             "streams": archive.get("streams", {}),
                             "compaction": archive.get("compaction", {}),
+                            "queue_lanes": archive.get("queue_lanes", {}),
+                            "batch_processing": archive.get(
+                                "batch_processing", {}
+                            ),
+                            "total_resident_rows": archive.get(
+                                "total_resident_rows", 0
+                            ),
+                            "total_resident_bytes": archive.get(
+                                "total_resident_bytes", 0
+                            ),
                             "raw_rest_objects_reused": archive.get(
                                 "raw_rest_objects_reused", 0
                             ),
