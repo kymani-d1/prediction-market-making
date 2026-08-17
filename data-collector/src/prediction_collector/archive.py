@@ -33,6 +33,7 @@ from prediction_collector.config import Settings
 
 LOGGER = logging.getLogger(__name__)
 SCHEMA_VERSION = 2
+RAW_REST_FRESH_ADMISSION_BURST = 4
 
 SIDE_CODES = {"buy": 1, "bid": 1, "bids": 1, "yes": 1,
               "sell": 2, "ask": 2, "asks": 2, "no": 2}
@@ -45,6 +46,10 @@ ENTITY_KIND_CODES = {"market": 1, "token": 2}
 
 class ArchiveBackpressureError(RuntimeError):
     pass
+
+
+class _JournalRecoveryStopped(RuntimeError):
+    """Internal control flow used to leave inherited journal rows on disk."""
 
 
 class ObjectStore(Protocol):
@@ -514,15 +519,43 @@ class ArchiveWriter:
             "raw_rest": raw_rest_max_bytes,
         }
         self._bytes_condition = asyncio.Condition()
+        # Fresh REST pages may be on the critical path to opening market CLOB
+        # sockets. Give them deterministic precedence over inherited/spilled
+        # replay, but grant replay one turn after a bounded fresh burst so a
+        # continuously busy discovery producer cannot starve recovery forever.
+        self._raw_rest_fresh_waiters = 0
+        self._raw_rest_recovery_waiters = 0
+        self._raw_rest_fresh_grants_with_recovery_waiting = 0
+        # Inherited live evidence is already durable in a journal. It must not
+        # occupy the entire latency-sensitive lane ahead of current WebSocket
+        # evidence, but it must still receive a bounded turn under continuous
+        # fresh traffic. Limit replay to one queued/processing live record and
+        # use the same deterministic fresh burst policy as raw REST.
+        self._live_fresh_waiters = 0
+        self._live_recovery_waiters = 0
+        self._live_fresh_grants_with_recovery_waiting = 0
+        self._live_recovery_outstanding = 0
         self._stop = asyncio.Event()
         self._flush_requested = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._compaction_task: asyncio.Task[None] | None = None
-        self._oldest_enqueued_monotonic: float | None = None
+        self._journal_recovery_task: asyncio.Task[None] | None = None
+        self._journal_recovery_admission_complete = asyncio.Event()
+        self._journal_recovery_complete = asyncio.Event()
+        self._queued_at_monotonic: dict[str, float] = {}
         self._dictionary_emitted: set[tuple[str, int]] = set()
         self._active_record_ids: set[str] = set()
         self._spilled_record_ids: set[str] = set()
         self._replayed_record_ids: set[str] = set()
+        # All replay records currently admitted to a lane. The inherited
+        # subset is tracked separately so durable startup completion is not
+        # confused with replay of a fresh-process timeout spill.
+        self._recovery_admitted_ids: set[str] = set()
+        self._inherited_recovery_admitted_ids: set[str] = set()
+        # Recovered rows are acknowledged in the immutable startup journal
+        # from which they came. The mapping contains only the bounded recovery
+        # window currently queued, processing, or waiting for queue capacity.
+        self._recovery_record_sources: dict[str, Path] = {}
         self._journal_lock = asyncio.Lock()
         self._spill_replay_lock = asyncio.Lock()
         # A content-addressed spool filename is a process-local mutable resource
@@ -533,6 +566,7 @@ class ArchiveWriter:
         self._spool_owners: dict[str, object] = {}
         self._spool_owner_released: dict[str, asyncio.Event] = {}
         self._journal_path = settings.archive_spool_directory / "ingress-journal.jsonl"
+        self._recovery_journal_pattern = "ingress-journal.recovery-*.jsonl"
         self._spool_bytes = 0
         self._spool_reserved_bytes = 0
         self.counters = ArchiveCounters()
@@ -559,7 +593,15 @@ class ArchiveWriter:
                 "preparing-*.parquet"
             ):
                 path.unlink(missing_ok=True)
+            # A journal rewrite publishes only through atomic replacement, so
+            # any uniquely named rewrite scratch file left after a crash is
+            # never authoritative and the original/replaced journal survives.
+            for path in self.settings.archive_spool_directory.glob(
+                "ingress-journal*.tmp"
+            ):
+                path.unlink(missing_ok=True)
             await self._cleanup_committed_spool_files()
+            await self._rotate_inherited_journal()
             self._spool_bytes = await asyncio.to_thread(
                 _directory_size, self.settings.archive_spool_directory
             )
@@ -568,7 +610,6 @@ class ArchiveWriter:
             # The resolver is job-type scoped in PostgreSQL.
             self._transient_degradation_pending = True
             self._task = asyncio.create_task(self.run(), name="parquet-archive-writer")
-            await self._recover_journal()
         if (
             self.settings.archive_compaction_enabled
             and self._compaction_task is None
@@ -646,6 +687,9 @@ class ArchiveWriter:
         record: ArchiveRecord,
         *,
         wait_for_raw_rest_capacity: bool = True,
+        wait_for_all_capacity: bool = False,
+        stop_with_recovery: bool = False,
+        recovery_admission: bool = False,
         report_timeout_degradation: bool = True,
         timeout_seconds: float | None = None,
     ) -> bool:
@@ -657,49 +701,63 @@ class ArchiveWriter:
         target_queue = self._queue_for_lane(lane)
 
         async def enqueue_when_capacity_available() -> None:
+            admission_role = "recovery" if recovery_admission else "fresh"
             async with self._bytes_condition:
-                while not (
-                    (
-                        self._queued_bytes == 0
-                        or self._queued_bytes + record.estimated_bytes
-                           <= self.settings.archive_queue_max_bytes
-                    )
-                    and (
-                        self._lane_queued_bytes[lane] == 0
-                        or self._lane_queued_bytes[lane] + record.estimated_bytes
-                           <= self._lane_max_bytes[lane]
-                    )
-                ):
-                    if self._task is not None and self._task.done():
-                        await self._task
-                        raise RuntimeError("archive writer stopped unexpectedly")
-                    # The bounded wait lets us notice a failed consumer even
-                    # when no future byte-release notification can arrive.
-                    try:
-                        await asyncio.wait_for(
-                            self._bytes_condition.wait(), timeout=1.0
-                        )
-                    except TimeoutError:
-                        continue
-                self._queued_bytes += record.estimated_bytes
-                self._lane_queued_bytes[lane] += record.estimated_bytes
-            try:
-                while True:
-                    try:
-                        await asyncio.wait_for(
-                            target_queue.put(record), timeout=1.0
-                        )
-                        break
-                    except TimeoutError:
+                self._change_admission_waiters(lane, admission_role, 1)
+                try:
+                    while True:
+                        if stop_with_recovery and self._stop.is_set():
+                            raise _JournalRecoveryStopped
+                        if (
+                            self._has_archive_byte_capacity(record, lane)
+                            and not target_queue.full()
+                            and self._admission_allowed(lane, admission_role)
+                        ):
+                            break
                         if self._task is not None and self._task.done():
                             await self._task
                             raise RuntimeError("archive writer stopped unexpectedly")
-            except BaseException:
-                await self._release_bytes(record.estimated_bytes, lane=lane)
-                raise
+                        # This timeout is only a task-health watchdog. Admission
+                        # itself is event-driven by byte release, a raw queue
+                        # slot opening, or waiter registration/cancellation.
+                        try:
+                            await asyncio.wait_for(
+                                self._bytes_condition.wait(), timeout=1.0
+                            )
+                        except TimeoutError:
+                            continue
+                    self._queued_bytes += record.estimated_bytes
+                    self._lane_queued_bytes[lane] += record.estimated_bytes
+                    self._queued_at_monotonic[record.record_id] = time.monotonic()
+                    # Queue insertion is synchronous while the arbiter lock is
+                    # held. Another replay/fresh producer cannot reserve the
+                    # same row slot, and asyncio.Queue wake ordering does not
+                    # participate in admission fairness.
+                    try:
+                        target_queue.put_nowait(record)
+                    except BaseException:
+                        self._queued_bytes -= record.estimated_bytes
+                        self._lane_queued_bytes[lane] -= record.estimated_bytes
+                        self._queued_at_monotonic.pop(record.record_id, None)
+                        raise
+                    if recovery_admission:
+                        self._recovery_admitted_ids.add(record.record_id)
+                        if record.record_id in self._recovery_record_sources:
+                            self._inherited_recovery_admitted_ids.add(
+                                record.record_id
+                            )
+                        if lane == "live":
+                            self._live_recovery_outstanding += 1
+                    self._record_admission(lane, admission_role)
+                    return
+                finally:
+                    self._change_admission_waiters(lane, admission_role, -1)
+                    self._bytes_condition.notify_all()
 
         try:
-            if record.stream == "raw_rest" and wait_for_raw_rest_capacity:
+            if wait_for_all_capacity or (
+                record.stream == "raw_rest" and wait_for_raw_rest_capacity
+            ):
                 # The ingress journal already owns the record durably. REST is
                 # replayable and not latency-sensitive, so exert real producer
                 # backpressure until both row and byte capacity become free.
@@ -733,9 +791,6 @@ class ArchiveWriter:
             # as capacity becomes available. Hard spool capacity still fails
             # explicitly before the journal append above.
             return False
-        self._oldest_enqueued_monotonic = (
-            self._oldest_enqueued_monotonic or time.monotonic()
-        )
         self.counters.max_queue_rows = max(
             self.counters.max_queue_rows, self._queue_depth()
         )
@@ -744,6 +799,66 @@ class ArchiveWriter:
             self._replayed_record_ids.add(record.record_id)
         self._spilled_record_ids.discard(record.record_id)
         return True
+
+    def _has_archive_byte_capacity(
+        self, record: ArchiveRecord, lane: str
+    ) -> bool:
+        return (
+            (
+                self._queued_bytes == 0
+                or self._queued_bytes + record.estimated_bytes
+                    <= self.settings.archive_queue_max_bytes
+            )
+            and (
+                self._lane_queued_bytes[lane] == 0
+                or self._lane_queued_bytes[lane] + record.estimated_bytes
+                    <= self._lane_max_bytes[lane]
+            )
+        )
+
+    def _change_admission_waiters(
+        self, lane: str, role: str, amount: int
+    ) -> None:
+        attribute = f"_{lane}_{role}_waiters"
+        setattr(self, attribute, getattr(self, attribute) + amount)
+
+    def _admission_waiters(self, lane: str, role: str) -> int:
+        return int(getattr(self, f"_{lane}_{role}_waiters"))
+
+    def _admission_allowed(self, lane: str, role: str) -> bool:
+        recovery_at_live_limit = (
+            lane == "live"
+            and self._live_recovery_outstanding >= 1
+        )
+        if role == "recovery" and recovery_at_live_limit:
+            return False
+        fresh_waiters = self._admission_waiters(lane, "fresh")
+        recovery_waiters = self._admission_waiters(lane, "recovery")
+        grants = int(
+            getattr(
+                self,
+                f"_{lane}_fresh_grants_with_recovery_waiting",
+            )
+        )
+        if role == "fresh":
+            return not (
+                recovery_waiters > 0
+                and not recovery_at_live_limit
+                and grants >= RAW_REST_FRESH_ADMISSION_BURST
+            )
+        return (
+            fresh_waiters == 0
+            or grants >= RAW_REST_FRESH_ADMISSION_BURST
+        )
+
+    def _record_admission(self, lane: str, role: str) -> None:
+        attribute = f"_{lane}_fresh_grants_with_recovery_waiting"
+        if role == "recovery":
+            setattr(self, attribute, 0)
+        elif self._admission_waiters(lane, "recovery") > 0:
+            setattr(self, attribute, getattr(self, attribute) + 1)
+        else:
+            setattr(self, attribute, 0)
 
     @staticmethod
     def _lane_for(record: ArchiveRecord) -> str:
@@ -832,64 +947,189 @@ class ArchiveWriter:
             await asyncio.to_thread(append)
             self._spool_bytes += encoded_bytes
 
+    async def _rotate_inherited_journal(self) -> None:
+        """Atomically detach the prior process's journal from new producers."""
+        async with self._journal_lock:
+            if (
+                not self._journal_path.is_file()
+                or self._journal_path.stat().st_size == 0
+            ):
+                return
+            recovery_path = self._journal_path.with_name(
+                f"ingress-journal.recovery-{uuid.uuid4().hex}.jsonl"
+            )
+            await asyncio.to_thread(
+                _atomic_replace, self._journal_path, recovery_path
+            )
+
     async def _recover_journal(self) -> None:
-        if not self._journal_path.is_file():
-            return
-
-        def read() -> list[dict[str, Any]]:
-            values: list[dict[str, Any]] = []
-            for line in self._journal_path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    values.append(json.loads(line))
-            return values
-
-        values = await asyncio.to_thread(read)
-        if values:
+        """Replay inherited rows incrementally without delaying live startup."""
+        if self._recovery_journal_paths():
             # A restarted service may be recovering timeout spills recorded by
             # its superseded run. Resolve those legacy run-scoped events only
-            # after this journal is completely uploaded and acknowledged.
+            # after every inherited row is uploaded and acknowledged.
             self._transient_degradation_pending = True
-        for value in values:
-            record = ArchiveRecord(
+        while not self._stop.is_set():
+            recovered = await self._next_recovery_record()
+            if recovered is None:
+                # This means only that every inherited row has been claimed at
+                # least once. Claimed rows can still be queued, uploading, or
+                # spilled after a failed preparation attempt. Public recovery
+                # completion is set only after their source journals are empty.
+                self._journal_recovery_admission_complete.set()
+                await self._resolve_recovered_degradations_if_clean()
+                return
+            record, source = recovered
+            self._recovery_record_sources[record.record_id] = source
+            try:
+                await self._ensure_identifiers(record)
+                await self._enqueue(
+                    record,
+                    wait_for_all_capacity=True,
+                    stop_with_recovery=True,
+                    recovery_admission=True,
+                    report_timeout_degradation=False,
+                )
+            except _JournalRecoveryStopped:
+                self._recovery_record_sources.pop(record.record_id, None)
+                self._active_record_ids.discard(record.record_id)
+                return
+            except BaseException:
+                self._recovery_record_sources.pop(record.record_id, None)
+                self._active_record_ids.discard(record.record_id)
+                raise
+
+    async def _maybe_mark_journal_recovery_complete(self) -> bool:
+        """Publish completion only after inherited source journals are empty."""
+        if not self._journal_recovery_admission_complete.is_set():
+            return False
+        if (
+            self._recovery_record_sources
+            or self._inherited_recovery_admitted_ids
+        ):
+            return False
+
+        def prune_empty() -> bool:
+            has_records = False
+            for path in self._recovery_journal_paths():
+                if any(
+                    line.strip()
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                ):
+                    has_records = True
+                    continue
+                path.unlink(missing_ok=True)
+            return has_records
+
+        async with self._journal_lock:
+            has_recovery_records = await asyncio.to_thread(prune_empty)
+        # Recheck event-loop state after yielding for the filesystem pass.
+        if (
+            has_recovery_records
+            or self._recovery_record_sources
+            or self._inherited_recovery_admitted_ids
+        ):
+            return False
+        self._journal_recovery_complete.set()
+        return True
+
+    def _recovery_journal_paths(self) -> list[Path]:
+        return sorted(
+            self.settings.archive_spool_directory.glob(
+                self._recovery_journal_pattern
+            )
+        )
+
+    async def _next_recovery_record(
+        self,
+    ) -> tuple[ArchiveRecord, Path] | None:
+        """Read at most one unclaimed row, keeping recovery memory bounded."""
+
+        def read_one() -> tuple[dict[str, Any], Path] | None:
+            for path in self._recovery_journal_paths():
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        value = json.loads(line)
+                        record_id = str(value["record_id"])
+                        if (
+                            record_id in self._recovery_record_sources
+                            or record_id in self._active_record_ids
+                        ):
+                            continue
+                        return value, path
+            return None
+
+        async with self._journal_lock:
+            recovered = await asyncio.to_thread(read_one)
+        if recovered is None:
+            return None
+        value, source = recovered
+        return (
+            ArchiveRecord(
                 record_id=str(value["record_id"]),
                 stream=str(value["stream"]),
                 data=dict(value["data"]),
                 priority=int(value["priority"]),
-                partition_timestamp=parse_timestamp(value["partition_timestamp"]) or utc_now(),
+                partition_timestamp=(
+                    parse_timestamp(value["partition_timestamp"]) or utc_now()
+                ),
                 estimated_bytes=int(value["estimated_bytes"]),
-            )
-            await self._ensure_identifiers(record)
-            await self._enqueue(record)
+            ),
+            source,
+        )
 
     async def _acknowledge_journal(self, records: list[ArchiveRecord]) -> None:
-        if not records or not self._journal_path.is_file():
+        if not records:
             return
-        acknowledged = {record.record_id for record in records}
+        by_source: dict[Path, set[str]] = defaultdict(set)
+        for record in records:
+            by_source[
+                self._recovery_record_sources.get(
+                    record.record_id, self._journal_path
+                )
+            ].add(record.record_id)
 
-        def rewrite() -> int:
-            previous_size = self._journal_path.stat().st_size
-            retained: list[str] = []
-            for line in self._journal_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    record_id = str(json.loads(line).get("record_id"))
-                except json.JSONDecodeError:
-                    retained.append(line)
-                    continue
-                if record_id not in acknowledged:
-                    retained.append(line)
-            temporary = self._journal_path.with_suffix(".tmp")
-            temporary.write_text(
-                "".join(f"{line}\n" for line in retained), encoding="utf-8"
-            )
-            temporary.replace(self._journal_path)
-            current_size = self._journal_path.stat().st_size
+        def rewrite(path: Path, acknowledged: set[str]) -> int:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            previous_size = path.stat().st_size
+            temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+            retained = 0
+            with (
+                path.open("r", encoding="utf-8") as source,
+                temporary.open("w", encoding="utf-8") as target,
+            ):
+                for line in source:
+                    if not line.strip():
+                        continue
+                    try:
+                        record_id = str(json.loads(line).get("record_id"))
+                    except json.JSONDecodeError:
+                        record_id = ""
+                    if record_id not in acknowledged:
+                        target.write(line if line.endswith("\n") else f"{line}\n")
+                        retained += 1
+                target.flush()
+                os.fsync(target.fileno())
+            _atomic_replace(temporary, path)
+            if retained == 0 and path != self._journal_path:
+                path.unlink()
+                current_size = 0
+            else:
+                current_size = path.stat().st_size
             return current_size - previous_size
 
         async with self._journal_lock:
-            size_delta = await asyncio.to_thread(rewrite)
-            self._spool_bytes = max(0, self._spool_bytes + size_delta)
+            for source, acknowledged in by_source.items():
+                size_delta = await asyncio.to_thread(
+                    rewrite, source, acknowledged
+                )
+                self._spool_bytes = max(0, self._spool_bytes + size_delta)
+                for record_id in acknowledged:
+                    if self._recovery_record_sources.get(record_id) == source:
+                        self._recovery_record_sources.pop(record_id, None)
 
     async def _refresh_spool_bytes(self) -> int:
         async with self._journal_lock:
@@ -951,8 +1191,6 @@ class ArchiveWriter:
             released.set()
 
     async def run(self) -> None:
-        await self._retry_pending_once()
-        await self._recover_compactions()
         workers = [
             asyncio.create_task(
                 self._run_lane("live"), name="parquet-archive-live-lane"
@@ -963,14 +1201,22 @@ class ArchiveWriter:
             asyncio.create_task(
                 self._maintenance_loop(), name="parquet-archive-maintenance"
             ),
+            asyncio.create_task(
+                self._recover_journal(), name="parquet-archive-journal-recovery"
+            ),
         ]
+        self._journal_recovery_task = workers[-1]
         try:
+            # Lane consumers and journal recovery are already scheduled, so
+            # compaction repair cannot hold live ingestion behind startup work.
+            await self._recover_compactions()
             await asyncio.gather(*workers)
         finally:
             for worker in workers:
                 if not worker.done():
                     worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
+            self._journal_recovery_task = None
         await self._retry_pending_once()
 
     async def _run_lane(self, lane: str) -> None:
@@ -981,54 +1227,60 @@ class ArchiveWriter:
             try:
                 first = await asyncio.wait_for(queue.get(), timeout=1.0)
                 if first.stream == "__flush__":
-                    queue.task_done()
-                    first.data["event"].set()
+                    try:
+                        await self._mark_dequeued(first, lane=lane)
+                    finally:
+                        queue.task_done()
+                        first.data["event"].set()
                     continue
                 records.append(first)
                 bytes_buffered += first.estimated_bytes
             except TimeoutError:
                 continue
-            deadline = time.monotonic() + self.settings.archive_flush_seconds
-            effective_batch_bytes = min(
-                self.settings.archive_batch_bytes,
-                self.settings.archive_queue_warn_bytes,
-                self._lane_max_bytes[lane],
-            )
-            effective_batch_rows = min(
-                self.settings.archive_batch_rows, queue.maxsize
-            )
             flush_marker: ArchiveRecord | None = None
-            while (
-                lane == "live"
-                and
-                not self._flush_requested.is_set()
-                and
-                len(records) < effective_batch_rows
-                and bytes_buffered < effective_batch_bytes
-                and time.monotonic() < deadline
-            ):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    item = await asyncio.wait_for(
-                        queue.get(), timeout=min(remaining, 0.25)
-                    )
-                except TimeoutError:
-                    if self._stop.is_set() or self._flush_requested.is_set():
-                        break
-                    continue
-                if item.stream == "__flush__":
-                    flush_marker = item
-                    break
-                records.append(item)
-                bytes_buffered += item.estimated_bytes
             try:
+                await self._mark_dequeued(first, lane=lane)
+                deadline = time.monotonic() + self.settings.archive_flush_seconds
+                effective_batch_bytes = min(
+                    self.settings.archive_batch_bytes,
+                    self.settings.archive_queue_warn_bytes,
+                    self._lane_max_bytes[lane],
+                )
+                effective_batch_rows = min(
+                    self.settings.archive_batch_rows, queue.maxsize
+                )
+                while (
+                    lane == "live"
+                    and
+                    not self._flush_requested.is_set()
+                    and
+                    len(records) < effective_batch_rows
+                    and bytes_buffered < effective_batch_bytes
+                    and time.monotonic() < deadline
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        item = await asyncio.wait_for(
+                            queue.get(), timeout=min(remaining, 0.25)
+                        )
+                    except TimeoutError:
+                        if self._stop.is_set() or self._flush_requested.is_set():
+                            break
+                        continue
+                    if item.stream == "__flush__":
+                        flush_marker = item
+                        break
+                    records.append(item)
+                    bytes_buffered += item.estimated_bytes
+                    await self._mark_dequeued(item, lane=lane)
                 await self._process_records(records)
             finally:
                 for record in records:
                     self._active_record_ids.discard(record.record_id)
                     queue.task_done()
+                    await self._release_recovery_admission(record, lane=lane)
                     await self._release_bytes(record.estimated_bytes, lane=lane)
                 if flush_marker is not None:
                     queue.task_done()
@@ -1083,17 +1335,22 @@ class ArchiveWriter:
 
     async def _maintenance_loop(self) -> None:
         while not self._stop.is_set():
+            await self._retry_pending_once()
+            await self._retry_spilled_journal_once()
+            await self._resolve_recovered_degradations_if_clean()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=1.0)
             except TimeoutError:
-                await self._retry_pending_once()
-                await self._retry_spilled_journal_once()
-                await self._resolve_recovered_degradations_if_clean()
+                continue
 
     async def _resolve_recovered_degradations_if_clean(self) -> None:
-        if not self._queues_empty() or self._active_record_ids:
+        await self._maybe_mark_journal_recovery_complete()
+        if (
+            not self._journal_recovery_complete.is_set()
+            or not self._queues_empty()
+            or self._active_record_ids
+        ):
             return
-        self._oldest_enqueued_monotonic = None
         if (
             self._transient_degradation_pending
             and not self._spilled_record_ids
@@ -1112,6 +1369,8 @@ class ArchiveWriter:
         # their cancellation boundary one final in-process drain attempt.
         await self._retry_spilled_journal_once()
         self._stop.set()
+        async with self._bytes_condition:
+            self._bytes_condition.notify_all()
         if self._task is not None:
             await self._task
             self._task = None
@@ -1120,7 +1379,16 @@ class ArchiveWriter:
             self._compaction_task = None
 
     async def join(self) -> None:
-        """Wait until records currently owned by both scheduling lanes finish."""
+        """Wait for inherited recovery and both scheduling lanes to finish."""
+        while not self._journal_recovery_complete.is_set():
+            if self._task is not None and self._task.done():
+                await self._task
+            try:
+                await asyncio.wait_for(
+                    self._journal_recovery_complete.wait(), timeout=0.1
+                )
+            except TimeoutError:
+                continue
         await asyncio.gather(self.queue.join(), self.raw_rest_queue.join())
 
     async def flush(self) -> None:
@@ -1654,27 +1922,44 @@ class ArchiveWriter:
             await self._retry_spilled_journal_locked()
 
     async def _retry_spilled_journal_locked(self) -> None:
-        if not self._spilled_record_ids or not self._journal_path.is_file():
+        if not self._spilled_record_ids:
+            return
+
+        # A failed inherited record remains authoritative in the recovery
+        # journal from which it was claimed. Never copy it into the active
+        # journal merely to make maintenance replay possible.
+        source_paths = {
+            source
+            for record_id, source in self._recovery_record_sources.items()
+            if record_id in self._spilled_record_ids
+        }
+        if self._journal_path.is_file():
+            source_paths.add(self._journal_path)
+        if not source_paths:
             return
 
         def read_spilled() -> list[dict[str, Any]]:
-            values: list[dict[str, Any]] = []
-            for line in self._journal_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
+            values_by_id: dict[str, dict[str, Any]] = {}
+            for path in sorted(source_paths):
+                if not path.is_file():
                     continue
-                try:
-                    value = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                record_id = str(value.get("record_id"))
-                if (
-                    record_id in self._spilled_record_ids
-                    and record_id not in self._active_record_ids
-                ):
-                    values.append(value)
-            return values
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    record_id = str(value.get("record_id"))
+                    if (
+                        record_id in self._spilled_record_ids
+                        and record_id not in self._active_record_ids
+                    ):
+                        values_by_id.setdefault(record_id, value)
+            return list(values_by_id.values())
 
-        values = await asyncio.to_thread(read_spilled)
+        async with self._journal_lock:
+            values = await asyncio.to_thread(read_spilled)
         # Replay latency-sensitive live evidence first, then use the dedicated
         # REST lane for replayable pages. Numeric priority remains a useful
         # ordering within the live lane, but must not put raw REST ahead of L2.
@@ -1702,6 +1987,7 @@ class ArchiveWriter:
             if not await self._enqueue(
                 record,
                 wait_for_raw_rest_capacity=False,
+                recovery_admission=True,
                 report_timeout_degradation=False,
                 timeout_seconds=min(
                     0.05, self.settings.archive_enqueue_timeout_seconds
@@ -1783,6 +2069,30 @@ class ArchiveWriter:
             )
             self._bytes_condition.notify_all()
 
+    async def _release_recovery_admission(
+        self, record: ArchiveRecord, *, lane: str
+    ) -> None:
+        async with self._bytes_condition:
+            if record.record_id not in self._recovery_admitted_ids:
+                return
+            self._recovery_admitted_ids.remove(record.record_id)
+            self._inherited_recovery_admitted_ids.discard(record.record_id)
+            if lane == "live":
+                self._live_recovery_outstanding = max(
+                    0, self._live_recovery_outstanding - 1
+                )
+            self._bytes_condition.notify_all()
+
+    async def _mark_dequeued(
+        self, record: ArchiveRecord, *, lane: str
+    ) -> None:
+        self._queued_at_monotonic.pop(record.record_id, None)
+        # Admission reserves the actual queue row under this condition; wake
+        # either lane's arbiter as soon as get() frees that row, rather than
+        # waiting for the potentially slow upload to finish.
+        async with self._bytes_condition:
+            self._bytes_condition.notify_all()
+
     def _object_key(
         self,
         stream: str,
@@ -1803,6 +2113,11 @@ class ArchiveWriter:
 
     def metrics(self) -> dict[str, Any]:
         compressed = self.counters.compressed_bytes
+        oldest_queued = (
+            min(self._queued_at_monotonic.values())
+            if self._queued_at_monotonic
+            else None
+        )
         return {
             "healthy": not self.degraded,
             "queue_depth": self._queue_depth(),
@@ -1818,9 +2133,12 @@ class ArchiveWriter:
                 },
             },
             "oldest_queued_seconds": (
-                max(0.0, time.monotonic() - self._oldest_enqueued_monotonic)
-                if self._oldest_enqueued_monotonic is not None
+                max(0.0, time.monotonic() - oldest_queued)
+                if oldest_queued is not None
                 else 0.0
+            ),
+            "journal_recovery_pending": (
+                not self._journal_recovery_complete.is_set()
             ),
             "objects_uploaded": self.counters.objects_uploaded,
             "rows_uploaded": self.counters.rows_uploaded,
@@ -1941,6 +2259,18 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _atomic_replace(source: Path, target: Path) -> None:
+    """Replace a closed file, tolerating brief Windows filesystem sharing lag."""
+    for attempt in range(5):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.01 * (2 ** attempt))
 
 
 def _directory_size(path: Path) -> int:

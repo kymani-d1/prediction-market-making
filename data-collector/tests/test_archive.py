@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,13 +16,17 @@ from prediction_collector.archive import (
     ArchiveRecord,
     ArchiveWriter,
     LocalObjectStore,
+    RAW_REST_FRESH_ADMISSION_BURST,
     _directory_size,
+    stable_archive_key,
 )
 from prediction_collector.archive_reader import (
     archive_partition_prefixes,
     load_archive,
 )
 from prediction_collector.database import Database
+from prediction_collector.jobs.live import LiveCollector
+from prediction_collector.polymarket.service import PolymarketService
 from prediction_collector.tiering import CollectionTier
 from prediction_collector.writer import BatchWriter
 from prediction_collector.common.retry import RetryPolicy
@@ -204,6 +209,18 @@ class ArchiveDatabase:
         created = self.emit_dictionary and identity not in self.dictionary_emitted
         self.dictionary_emitted.add(identity)
         return created
+
+
+class LiveRunArchiveDatabase(ArchiveDatabase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finished_runs: list[dict[str, Any]] = []
+
+    async def start_run(self, *_: Any) -> int:
+        return 1
+
+    async def finish_run(self, run_id: int, **value: Any) -> None:
+        self.finished_runs.append({"run_id": run_id, **value})
 
 
 class FlakyStore(LocalObjectStore):
@@ -413,6 +430,25 @@ def raw_rest_record(identity: str, *, payload_size: int = 0) -> ArchiveRecord:
             "record_count": 1,
             "response_bytes": payload_size,
             "payload": [{"id": identity, "padding": "x" * payload_size}],
+        },
+        priority=2,
+    )
+
+
+def reference_record(identity: str, price: str) -> ArchiveRecord:
+    return ArchiveRecord.create(
+        "reference_prices",
+        {
+            "provider": "chainlink_spot",
+            "external_instrument_id": identity,
+            "external_update_id": f"{identity}-{price}",
+            "connection_id": 2,
+            "source_timestamp": NOW,
+            "exchange_timestamp": NOW,
+            "received_at": NOW,
+            "received_monotonic_ns": 456,
+            "price": price,
+            "source_status": "live",
         },
         priority=2,
     )
@@ -1042,6 +1078,7 @@ async def test_bounded_timeout_resolves_only_after_spill_is_uploaded_and_acked(
     for _ in range(100):
         if (
             database.degradations[0]["resolved"]
+            and database.transient_resolutions == 1
             and not writer._spilled_record_ids
             and not writer._active_record_ids
             and writer._queues_empty()
@@ -1124,6 +1161,7 @@ async def test_cancelled_raw_rest_backpressure_is_recovered_from_journal(
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending
+    assert interrupted._raw_rest_fresh_waiters == 0
     assert raw_rest.record_id in interrupted._spilled_record_ids
     assert raw_rest.record_id in interrupted._journal_path.read_text(encoding="utf-8")
 
@@ -1133,6 +1171,7 @@ async def test_cancelled_raw_rest_backpressure_is_recovered_from_journal(
         object_store=LocalObjectStore(workspace_tmp_path / "objects"),
     )
     await recovered.start()
+    await recovered.join()
     await recovered.stop()
     assert any(
         value["stream"] == "raw_rest" and value["status"] == "uploaded"
@@ -1258,6 +1297,7 @@ async def test_restart_recovers_journaled_record_before_parquet_serialization(
         object_store=LocalObjectStore(workspace_tmp_path / "objects"),
     )
     await recovered.start()
+    await recovered.join()
     await recovered.stop()
 
     uploaded = [
@@ -1267,6 +1307,728 @@ async def test_restart_recovers_journaled_record_before_parquet_serialization(
     ]
     assert len(uploaded) == 1
     assert uploaded[0]["row_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_inherited_record_retries_from_its_source_before_completion(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    inherited = raw_rest_record("recovery-fails-once")
+    interrupted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    await interrupted._append_journal(inherited)
+
+    recovered = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    prepare = recovered._prepare_and_upload
+    failed_once = asyncio.Event()
+    allow_retry = asyncio.Event()
+    attempts = 0
+
+    async def fail_once(records: list[ArchiveRecord]) -> bool:
+        nonlocal attempts
+        if any(record.record_id == inherited.record_id for record in records):
+            attempts += 1
+            if attempts == 1:
+                failed_once.set()
+                return False
+            await allow_retry.wait()
+        return await prepare(records)
+
+    recovered._prepare_and_upload = fail_once  # type: ignore[method-assign]
+    await recovered.start()
+    await asyncio.wait_for(failed_once.wait(), timeout=1)
+    for _ in range(100):
+        if (
+            inherited.record_id in recovered._spilled_record_ids
+            or attempts >= 2
+        ):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("failed inherited row never entered spill replay")
+
+    source = recovered._recovery_record_sources[inherited.record_id]
+    assert source.is_file()
+    assert inherited.record_id in source.read_text(encoding="utf-8")
+    await asyncio.wait_for(
+        recovered._journal_recovery_admission_complete.wait(), timeout=1
+    )
+    assert recovered._journal_recovery_admission_complete.is_set()
+    assert not recovered._journal_recovery_complete.is_set()
+    assert recovered.metrics()["journal_recovery_pending"] is True
+
+    # Maintenance must retry from the same immutable recovery journal without
+    # copying the row into the active-process journal or restarting the writer.
+    joining = asyncio.create_task(recovered.join())
+    await asyncio.sleep(0.05)
+    assert not joining.done()
+    allow_retry.set()
+    await asyncio.wait_for(joining, timeout=5)
+    assert attempts == 2
+    assert recovered._journal_recovery_complete.is_set()
+    assert recovered.metrics()["journal_recovery_pending"] is False
+    assert not source.exists()
+    assert not recovered._recovery_journal_paths()
+    assert (
+        not recovered._journal_path.exists()
+        or recovered._journal_path.read_text(encoding="utf-8") == ""
+    )
+    assert len(database.provenance) == 1
+    assert sum(
+        int(value["row_count"])
+        for value in database.objects.values()
+        if value["stream"] == "raw_rest" and value["status"] == "uploaded"
+    ) == 1
+    await recovered.stop()
+
+
+@pytest.mark.asyncio
+async def test_fresh_live_evidence_retains_capacity_during_inherited_live_recovery(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=4,
+        archive_queue_max_bytes=1_000_000,
+        archive_enqueue_timeout_seconds=0.05,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    inherited = [
+        update_record(f"inherited-live-{index}", f"0.{index + 10}")
+        for index in range(12)
+    ]
+    interrupted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    for record in inherited:
+        await interrupted._append_journal(record)
+
+    store = GatedStore(
+        workspace_tmp_path / "objects", blocked_stream="orderbook_updates"
+    )
+    recovered = ArchiveWriter(settings, database, object_store=store)
+    await recovered.start()
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+    assert recovered._live_recovery_outstanding == 1
+
+    current_update = update_record("current-live-update", "0.91")
+    current_reference = reference_record("BTC-USD", "63250.125")
+    await asyncio.wait_for(
+        asyncio.gather(
+            recovered.put(current_update),
+            recovered.put(current_reference),
+        ),
+        timeout=0.5,
+    )
+    assert recovered.queue.qsize() == 2
+    assert not any(
+        value["reason"] == "bounded_queue_timeout"
+        and (value.get("details") or {}).get("record_id")
+            in {current_update.record_id, current_reference.record_id}
+        for value in database.degradations
+    )
+
+    store.release.set()
+    await asyncio.wait_for(recovered.join(), timeout=10)
+    await recovered.stop()
+    assert recovered._journal_recovery_complete.is_set()
+    assert not recovered._recovery_journal_paths()
+    assert sum(
+        int(value["row_count"])
+        for value in database.objects.values()
+        if value["stream"] == "orderbook_updates"
+        and value["status"] == "uploaded"
+    ) == len(inherited) + 1
+    assert sum(
+        int(value["row_count"])
+        for value in database.objects.values()
+        if value["stream"] == "reference_prices"
+        and value["status"] == "uploaded"
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_fresh_live_priority_cannot_starve_recovery(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=4,
+        archive_queue_max_bytes=1_000_000,
+        archive_enqueue_timeout_seconds=1,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    inherited = [
+        update_record(f"live-fair-recovery-{index}", f"0.{index + 10}")
+        for index in range(10)
+    ]
+    interrupted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    for record in inherited:
+        await interrupted._append_journal(record)
+
+    store = SlowStore(workspace_tmp_path / "objects", delay_seconds=0.02)
+    recovered = ArchiveWriter(settings, database, object_store=store)
+    await recovered.start()
+    fresh = [
+        update_record(f"live-continuous-fresh-{index}", f"0.{index + 40}")
+        for index in range(12)
+    ]
+    await asyncio.wait_for(
+        asyncio.gather(*(recovered.put(record) for record in fresh)),
+        timeout=5,
+    )
+    await asyncio.wait_for(recovered.join(), timeout=10)
+    await recovered.stop()
+
+    fresh_market_keys = {
+        stable_archive_key("market", f"live-continuous-fresh-{index}")
+        for index in range(len(fresh))
+    }
+    processing_order: list[str] = []
+    for value in sorted(database.objects.values(), key=lambda item: item["id"]):
+        if value["stream"] != "orderbook_updates":
+            continue
+        table = pq.read_table(store.root / value["object_key"])
+        market_key = int(table.column("market_key")[0].as_py())
+        processing_order.append(
+            "fresh" if market_key in fresh_market_keys else "recovery"
+        )
+    first_fresh = processing_order.index("fresh")
+    last_fresh = len(processing_order) - 1 - processing_order[::-1].index(
+        "fresh"
+    )
+    concurrent_window = processing_order[first_fresh:last_fresh + 1]
+    assert "recovery" in concurrent_window
+    longest_fresh_run = 0
+    current_fresh_run = 0
+    for role in concurrent_window:
+        if role == "fresh":
+            current_fresh_run += 1
+            longest_fresh_run = max(longest_fresh_run, current_fresh_run)
+        else:
+            current_fresh_run = 0
+    # Admission cannot reorder fresh rows already present in the FIFO when an
+    # in-flight recovery upload releases its ownership. The bound is therefore
+    # the configured fresh burst plus the lane's existing row window and the
+    # transition slot, not a strict 4-row processing-order alternation.
+    assert longest_fresh_run <= (
+        RAW_REST_FRESH_ADMISSION_BURST + recovered.queue.maxsize + 1
+    )
+    assert len(processing_order) == len(inherited) + len(fresh)
+    assert recovered._journal_recovery_complete.is_set()
+
+
+@pytest.mark.asyncio
+async def test_restart_drains_multiple_recovery_journals_without_loss_or_duplication(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    first_records = [
+        update_record(f"multi-recovery-a-{index}", f"0.{index + 20}")
+        for index in range(3)
+    ]
+    second_records = [
+        update_record(f"multi-recovery-b-{index}", f"0.{index + 30}")
+        for index in range(4)
+    ]
+    interrupted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    for record in first_records:
+        await interrupted._append_journal(record)
+    interrupted._journal_path.replace(
+        settings.archive_spool_directory
+        / "ingress-journal.recovery-first-crash.jsonl"
+    )
+    for record in second_records:
+        await interrupted._append_journal(record)
+    interrupted._journal_path.replace(
+        settings.archive_spool_directory
+        / "ingress-journal.recovery-second-crash.jsonl"
+    )
+
+    recovered = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    await recovered.start()
+    await asyncio.wait_for(recovered.join(), timeout=10)
+    await recovered.stop()
+
+    expected = len(first_records) + len(second_records)
+    assert sum(
+        int(value["row_count"])
+        for value in database.objects.values()
+        if value["stream"] == "orderbook_updates"
+        and value["status"] == "uploaded"
+    ) == expected
+    assert recovered.counters.stream_rows["orderbook_updates"] == expected
+    assert recovered._journal_recovery_complete.is_set()
+    assert not recovered._recovery_journal_paths()
+
+
+@pytest.mark.asyncio
+async def test_inherited_raw_rest_recovery_is_async_bounded_and_does_not_starve_live(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=20,
+        archive_queue_max_bytes=1_000_000,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    inherited = [raw_rest_record(f"inherited-{index}") for index in range(25)]
+    interrupted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    for record in inherited:
+        await interrupted._append_journal(record)
+
+    store = GatedStore(workspace_tmp_path / "objects", blocked_stream="raw_rest")
+    recovered = ArchiveWriter(settings, database, object_store=store)
+    await asyncio.wait_for(recovered.start(), timeout=0.25)
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+
+    assert not recovered._journal_recovery_complete.is_set()
+    assert recovered.task is not None and not recovered.task.done()
+    assert len(recovered._recovery_record_sources) <= (
+        recovered.raw_rest_queue.maxsize + 2
+    )
+    assert recovered.counters.max_queue_rows <= settings.archive_queue_max_rows
+    assert recovered.counters.max_queue_bytes <= settings.archive_queue_max_bytes
+
+    live = update_record("live-during-inherited-rest", "0.48")
+    await asyncio.wait_for(recovered.put(live), timeout=0.25)
+    for _ in range(100):
+        if any(
+            value["stream"] == "orderbook_updates"
+            and value["status"] == "uploaded"
+            for value in database.objects.values()
+        ):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("live archive lane was starved by inherited raw REST")
+
+    store.release.set()
+    await asyncio.wait_for(recovered.join(), timeout=10)
+    await recovered.stop()
+
+    raw_objects = [
+        value for value in database.objects.values()
+        if value["stream"] == "raw_rest"
+    ]
+    assert len(raw_objects) == len(inherited)
+    assert all(value["status"] == "uploaded" for value in raw_objects)
+    assert len(database.provenance) == len(inherited)
+    assert not recovered._recovery_journal_paths()
+    assert recovered._journal_path.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.asyncio
+async def test_live_discovery_raw_page_preempts_inherited_raw_rest_recovery(
+    workspace_tmp_path: Path,
+    load_fixture: Any,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=20,
+        archive_queue_max_bytes=1_000_000,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    inherited = [
+        raw_rest_record(f"critical-recovery-{index}") for index in range(12)
+    ]
+    interrupted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    for record in inherited:
+        await interrupted._append_journal(record)
+
+    store = GatedStore(workspace_tmp_path / "objects", blocked_stream="raw_rest")
+    archive = ArchiveWriter(settings, database, object_store=store)
+    await asyncio.wait_for(archive.start(), timeout=0.25)
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+
+    raw_market = load_fixture("polymarket_market.json")
+    event_page = [
+        {
+            "id": "current-live-event",
+            "active": True,
+            "closed": False,
+            "markets": [raw_market],
+        }
+    ]
+    result = SimpleNamespace(
+        requested_at=NOW,
+        response_timestamp=NOW,
+        status_code=200,
+        url=(
+            "https://gamma-api.polymarket.com/events/keyset"
+            "?active=true&closed=false&limit=100"
+        ),
+    )
+
+    class LiveDiscoveryRest:
+        async def iter_live_events(self) -> Any:
+            yield event_page, result, "current-live-cursor"
+
+    batch_writer = BatchWriter(
+        database,
+        max_queue_size=10,
+        batch_size=10,
+        flush_interval_seconds=0.01,
+        archive=archive,
+    )
+    service = PolymarketService(
+        rest=LiveDiscoveryRest(),  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        writer=batch_writer,
+    )
+    collector = LiveCollector.__new__(LiveCollector)
+    collector._last_discovery = []
+    collector._selection_lock = asyncio.Lock()
+    collector.run_id = 1
+    collector.coverage = type(
+        "Coverage", (), {"selection": None, "confirmed_subscribed": 0}
+    )()
+    collector.tier_manager = type(
+        "TierPolicy",
+        (),
+        {
+            "full_l2_max_markets": 10,
+            "sampled_max_markets": 50,
+            "counts": lambda self: {
+                CollectionTier.FULL_L2.value: 0,
+                CollectionTier.SAMPLED.value: 0,
+            },
+        },
+    )()
+    collector._persist_selected_candidates = (  # type: ignore[method-assign]
+        lambda _: asyncio.sleep(0)
+    )
+    shard_reconciliation_reached = asyncio.Event()
+
+    async def apply_tiers(markets: list[Any], **_: Any) -> None:
+        assert markets[0].external_id == raw_market["conditionId"]
+        shard_reconciliation_reached.set()
+
+    collector._apply_tiers = apply_tiers  # type: ignore[method-assign]
+
+    discovering = asyncio.create_task(
+        service.discover_live(
+            reconcile_absent=False,
+            on_page=collector._merge_discovery_page,
+        )
+    )
+    for _ in range(100):
+        if archive._raw_rest_fresh_waiters:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("live discovery raw page never reached admission")
+    assert not shard_reconciliation_reached.is_set()
+
+    store.release.set()
+    await asyncio.wait_for(shard_reconciliation_reached.wait(), timeout=1)
+    discovered = await asyncio.wait_for(discovering, timeout=1)
+    assert len(discovered) == 1
+    assert collector._last_discovery[0].external_id == raw_market["conditionId"]
+    assert not archive._journal_recovery_complete.is_set()
+
+    await asyncio.wait_for(archive.join(), timeout=10)
+    await archive.stop()
+    provenance_order = [
+        value["value"]["external_key"] for value in database.provenance
+    ]
+    fresh_index = provenance_order.index("current-live-cursor")
+    assert fresh_index < max(
+        provenance_order.index(f"critical-recovery-{index}")
+        for index in range(len(inherited))
+    )
+    assert len(database.provenance) == len(inherited) + 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_fresh_raw_rest_priority_cannot_starve_recovery(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=20,
+        archive_queue_max_bytes=1_000_000,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    inherited = [
+        raw_rest_record(f"fair-recovery-{index}") for index in range(20)
+    ]
+    interrupted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    for record in inherited:
+        await interrupted._append_journal(record)
+
+    store = GatedStore(workspace_tmp_path / "objects", blocked_stream="raw_rest")
+    archive = ArchiveWriter(settings, database, object_store=store)
+    await archive.start()
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+    fresh = [raw_rest_record(f"continuous-fresh-{index}") for index in range(20)]
+    producers = [asyncio.create_task(archive.put(record)) for record in fresh]
+    for _ in range(200):
+        if archive._raw_rest_fresh_waiters == len(fresh):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("fresh raw REST producers did not reach the arbiter")
+
+    store.release.set()
+    await asyncio.wait_for(asyncio.gather(*producers), timeout=10)
+    await asyncio.wait_for(archive.join(), timeout=15)
+    await archive.stop()
+
+    provenance_order = [
+        str(value["value"]["external_key"]) for value in database.provenance
+    ]
+    first_fresh = next(
+        index for index, value in enumerate(provenance_order)
+        if value.startswith("continuous-fresh-")
+    )
+    last_fresh = max(
+        index for index, value in enumerate(provenance_order)
+        if value.startswith("continuous-fresh-")
+    )
+    concurrent_window = provenance_order[first_fresh:last_fresh + 1]
+    assert any(value.startswith("fair-recovery-") for value in concurrent_window)
+    longest_fresh_run = 0
+    current_fresh_run = 0
+    for value in concurrent_window:
+        if value.startswith("continuous-fresh-"):
+            current_fresh_run += 1
+            longest_fresh_run = max(longest_fresh_run, current_fresh_run)
+        else:
+            current_fresh_run = 0
+    assert longest_fresh_run <= RAW_REST_FRESH_ADMISSION_BURST
+    assert len(database.provenance) == len(inherited) + len(fresh)
+    assert len([
+        value for value in database.objects.values()
+        if value["stream"] == "raw_rest" and value["status"] == "uploaded"
+    ]) == len(inherited) + len(fresh)
+    assert archive._journal_recovery_complete.is_set()
+    assert not archive._recovery_journal_paths()
+
+
+@pytest.mark.asyncio
+async def test_recovery_shutdown_preserves_unadmitted_rows_for_restart(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=20,
+        archive_queue_max_bytes=1_000_000,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    inherited = [raw_rest_record(f"cancelled-recovery-{index}") for index in range(12)]
+    interrupted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    for record in inherited:
+        await interrupted._append_journal(record)
+
+    gated = GatedStore(workspace_tmp_path / "objects", blocked_stream="raw_rest")
+    first = ArchiveWriter(settings, database, object_store=gated)
+    await first.start()
+    await asyncio.wait_for(gated.started.wait(), timeout=1)
+    stopping = asyncio.create_task(first.stop())
+    await asyncio.sleep(0.02)
+    assert not stopping.done()
+    gated.release.set()
+    await asyncio.wait_for(stopping, timeout=3)
+
+    remaining_paths = first._recovery_journal_paths()
+    assert remaining_paths
+    remaining_ids = {
+        str(json.loads(line)["record_id"])
+        for path in remaining_paths
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+    assert remaining_ids
+
+    restarted = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    await restarted.start()
+    await asyncio.wait_for(restarted.join(), timeout=10)
+    await restarted.stop()
+    assert len([
+        value for value in database.objects.values()
+        if value["stream"] == "raw_rest" and value["status"] == "uploaded"
+    ]) == len(inherited)
+    assert not restarted._recovery_journal_paths()
+
+
+@pytest.mark.asyncio
+async def test_journal_recovery_failure_is_supervised_by_archive_parent(
+    workspace_tmp_path: Path,
+) -> None:
+    settings = archive_settings(workspace_tmp_path)
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    journal = settings.archive_spool_directory / "ingress-journal.jsonl"
+    journal.write_text("{malformed-json\n", encoding="utf-8")
+    writer = ArchiveWriter(
+        settings,
+        ArchiveDatabase(),
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    await writer.start()
+    assert writer.task is not None
+    with pytest.raises(json.JSONDecodeError):
+        await asyncio.wait_for(writer.task, timeout=1)
+    assert writer._recovery_journal_paths()
+
+
+@pytest.mark.asyncio
+async def test_live_collector_background_tasks_start_while_recovery_is_pending(
+    workspace_tmp_path: Path,
+) -> None:
+    database = LiveRunArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=20,
+    )
+    settings.archive_spool_directory.mkdir(parents=True, exist_ok=True)
+    seed = ArchiveWriter(
+        settings,
+        database,
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    for index in range(5):
+        await seed._append_journal(raw_rest_record(f"live-start-{index}"))
+
+    store = GatedStore(workspace_tmp_path / "objects", blocked_stream="raw_rest")
+    archive = ArchiveWriter(settings, database, object_store=store)
+    batch_writer = BatchWriter(
+        database, max_queue_size=10, batch_size=10,
+        flush_interval_seconds=0.01, archive=archive,
+    )
+    collector = LiveCollector.__new__(LiveCollector)
+    collector.database = database  # type: ignore[assignment]
+    collector.writer = batch_writer
+    collector.stop = asyncio.Event()
+    collector.run_id = None
+    collector.coverage = type("Coverage", (), {"metrics": lambda self: {}})()
+    collector._task_failure = None
+    started = asyncio.Event()
+
+    async def start_background() -> None:
+        assert not archive._journal_recovery_complete.is_set()
+        started.set()
+
+    collector._start_background_tasks = start_background  # type: ignore[method-assign]
+    collector._shutdown_tasks = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+    running = asyncio.create_task(collector.run())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    collector.stop.set()
+    store.release.set()
+    await asyncio.wait_for(running, timeout=3)
+    assert database.finished_runs[0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_oldest_queued_seconds_tracks_the_actual_oldest_record(
+    workspace_tmp_path: Path,
+) -> None:
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=20,
+        archive_queue_max_bytes=1_000_000,
+    )
+    store = GatedStore(
+        workspace_tmp_path / "objects", blocked_stream="orderbook_updates"
+    )
+    writer = ArchiveWriter(
+        settings,
+        ArchiveDatabase(),
+        object_store=store,
+    )
+    await writer.start()
+    oldest = update_record("oldest-age", "0.41")
+    newest = update_record("newest-age", "0.42")
+    await writer.put(oldest)
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+    await asyncio.sleep(0.15)
+    await writer.put(newest)
+    await asyncio.sleep(0.01)
+    age = writer.metrics()["oldest_queued_seconds"]
+
+    # The first record is uploading, not queued. Its 150 ms wait must not be
+    # attributed to the second record, which entered the queue only just now.
+    assert 0 < age < 0.1
+    store.release.set()
+    await asyncio.wait_for(writer.join(), timeout=2)
+    assert writer.metrics()["oldest_queued_seconds"] == 0.0
+    await writer.stop()
 
 
 @pytest.mark.asyncio
