@@ -3232,18 +3232,50 @@ class Database:
                 ),
             )
 
-    async def resolve_transient_archive_degradations(self) -> None:
+    async def resolve_archive_record_degradations(
+        self, record_ids: list[str]
+    ) -> None:
+        if not record_ids:
+            return
         async with self.pool.connection() as connection:
             await connection.execute(
                 """
                 UPDATE archive_degradation_events
                 SET resolved_at = clock_timestamp()
                 WHERE resolved_at IS NULL
-                  AND reason IN (
+                  AND reason = 'bounded_queue_timeout'
+                  AND details->>'record_id' = ANY(%s::TEXT[])
+                """,
+                (record_ids,),
+            )
+
+    async def resolve_transient_archive_degradations(
+        self, *, run_id: int | None
+    ) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE archive_degradation_events event
+                SET resolved_at = clock_timestamp()
+                WHERE event.resolved_at IS NULL
+                  AND event.reason IN (
                       'bounded_queue_timeout',
                       'archive_spool_capacity_exceeded'
                   )
-                """
+                  AND (
+                      event.collector_run_id IS NOT DISTINCT FROM %s
+                      OR EXISTS (
+                          SELECT 1
+                          FROM collector_runs current_run
+                          JOIN collector_runs previous_run
+                            ON previous_run.id = event.collector_run_id
+                          WHERE current_run.id = %s
+                            AND previous_run.job_type = current_run.job_type
+                            AND previous_run.status <> 'running'
+                      )
+                  )
+                """,
+                (run_id, run_id),
             )
 
     async def resolve_optional_hot_write_degradations(self) -> None:

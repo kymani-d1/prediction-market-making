@@ -37,7 +37,7 @@ async def run_polymarket_backfill(
         details["market_data"] = await service.backfill_market_data()
         await writer.queue.join()
         if writer.archive is not None:
-            await writer.archive.queue.join()
+            await writer.archive.join()
     finally:
         await writer.stop()
     details["write_failures"] = writer.failed_items

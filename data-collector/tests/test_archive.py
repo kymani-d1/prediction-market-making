@@ -103,10 +103,23 @@ class ArchiveDatabase:
         self.provenance.append(value)
 
     async def record_archive_degradation(self, **value: Any) -> None:
-        self.degradations.append(value)
+        self.degradations.append({**value, "resolved": False})
 
-    async def resolve_transient_archive_degradations(self) -> None:
+    async def resolve_archive_record_degradations(
+        self, record_ids: list[str]
+    ) -> None:
+        identities = set(record_ids)
+        for event in self.degradations:
+            if (event.get("details") or {}).get("record_id") in identities:
+                event["resolved"] = True
+
+    async def resolve_transient_archive_degradations(
+        self, *, run_id: int | None
+    ) -> None:
         self.transient_resolutions += 1
+        for event in self.degradations:
+            if event.get("run_id") == run_id:
+                event["resolved"] = True
 
     async def raw_rest_archive_by_content_hash(
         self, content_hash: str
@@ -213,6 +226,31 @@ class SlowStore(LocalObjectStore):
 
     async def put_file(self, local_path: Path, object_key: str, content_hash: str) -> None:
         await asyncio.sleep(self.delay_seconds)
+        await super().put_file(local_path, object_key, content_hash)
+
+
+class SlowRawRestStore(LocalObjectStore):
+    def __init__(self, root: Path, delay_seconds: float) -> None:
+        super().__init__(root)
+        self.delay_seconds = delay_seconds
+
+    async def put_file(self, local_path: Path, object_key: str, content_hash: str) -> None:
+        if "stream=raw_rest" in object_key:
+            await asyncio.sleep(self.delay_seconds)
+        await super().put_file(local_path, object_key, content_hash)
+
+
+class GatedStore(LocalObjectStore):
+    def __init__(self, root: Path, blocked_stream: str) -> None:
+        super().__init__(root)
+        self.blocked_stream = blocked_stream
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def put_file(self, local_path: Path, object_key: str, content_hash: str) -> None:
+        if f"stream={self.blocked_stream}" in object_key:
+            self.started.set()
+            await self.release.wait()
         await super().put_file(local_path, object_key, content_hash)
 
 
@@ -335,6 +373,27 @@ def update_record(market: str, price: str, *, timestamp: datetime = NOW) -> Arch
     )
 
 
+def raw_rest_record(identity: str, *, payload_size: int = 0) -> ArchiveRecord:
+    return ArchiveRecord.create(
+        "raw_rest",
+        {
+            "source": "gamma",
+            "endpoint": "/markets",
+            "entity_type": "markets",
+            "external_key": identity,
+            "requested_at": NOW,
+            "received_at": NOW,
+            "parameters": {"limit": 100},
+            "http_status": 200,
+            "content_hash": f"raw-rest-{identity}",
+            "record_count": 1,
+            "response_bytes": payload_size,
+            "payload": [{"id": identity, "padding": "x" * payload_size}],
+        },
+        priority=2,
+    )
+
+
 @pytest.mark.asyncio
 async def test_row_threshold_flushes_readable_zstd_parquet(workspace_tmp_path: Path) -> None:
     database = ArchiveDatabase()
@@ -343,7 +402,7 @@ async def test_row_threshold_flushes_readable_zstd_parquet(workspace_tmp_path: P
     await writer.start()
     await writer.put(update_record("market-a", "0.41"))
     await writer.put(update_record("market-b", "0.42"))
-    await writer.queue.join()
+    await writer.join()
     await writer.stop()
 
     keys = await store.list_keys("research/")
@@ -378,7 +437,7 @@ async def test_byte_and_interval_and_shutdown_flushes_are_bounded(workspace_tmp_
     writer = ArchiveWriter(settings, database, object_store=store)
     await writer.start()
     await writer.put(update_record("byte-threshold", "0.43"))
-    await writer.queue.join()
+    await writer.join()
     # The first record exceeds the byte threshold and flushes without a second row.
     assert writer.counters.stream_rows["orderbook_updates"] == 1
     await writer.put(update_record("shutdown", "0.44", timestamp=NOW + timedelta(hours=1)))
@@ -616,7 +675,134 @@ async def test_slow_upload_backpressure_stays_bounded_without_row_loss(
 
 
 @pytest.mark.asyncio
-async def test_raw_rest_waits_for_capacity_while_websocket_stream_times_out(
+async def test_large_raw_rest_burst_cannot_starve_continuous_live_l2(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=20,
+        archive_batch_bytes=80_000,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=40,
+        archive_queue_max_bytes=200_000,
+        archive_enqueue_timeout_seconds=0.05,
+    )
+    store = SlowRawRestStore(
+        workspace_tmp_path / "objects", delay_seconds=0.03
+    )
+    writer = ArchiveWriter(settings, database, object_store=store)
+    await writer.start()
+
+    raw_records = [
+        raw_rest_record(f"burst-{index}", payload_size=30_000)
+        for index in range(12)
+    ]
+
+    async def produce_raw_rest() -> None:
+        for record in raw_records:
+            await writer.put(record)
+
+    raw_producer = asyncio.create_task(produce_raw_rest())
+    await asyncio.sleep(0.01)
+    live_records = [
+        update_record(
+            f"live-{index}",
+            f"0.{index % 100:02d}",
+            timestamp=NOW + timedelta(microseconds=index),
+        )
+        for index in range(200)
+    ]
+    for record in live_records:
+        await writer.put(record)
+
+    await asyncio.wait_for(raw_producer, timeout=5)
+    await asyncio.wait_for(writer.join(), timeout=5)
+    await writer.stop()
+
+    assert not [
+        event
+        for event in database.degradations
+        if event["reason"] == "bounded_queue_timeout"
+    ]
+    assert sum(
+        int(value["row_count"])
+        for value in database.objects.values()
+        if value["stream"] == "orderbook_updates"
+    ) == len(live_records)
+    assert sum(
+        int(value["row_count"])
+        for value in database.objects.values()
+        if value["stream"] == "raw_rest"
+    ) == len(raw_records)
+    assert len(database.provenance) == len(raw_records)
+    assert len({value["value"]["content_hash"] for value in database.provenance}) == len(
+        raw_records
+    )
+    assert writer.counters.max_queue_rows <= settings.archive_queue_max_rows
+    assert writer.counters.max_queue_bytes <= settings.archive_queue_max_bytes
+    assert writer._journal_path.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.asyncio
+async def test_bounded_timeout_resolves_only_after_spill_is_uploaded_and_acked(
+    workspace_tmp_path: Path,
+) -> None:
+    database = ArchiveDatabase()
+    settings = archive_settings(
+        workspace_tmp_path,
+        archive_batch_rows=1,
+        archive_flush_seconds=0.01,
+        archive_queue_max_rows=2,
+        archive_queue_max_bytes=10_000,
+        archive_enqueue_timeout_seconds=0.01,
+    )
+    store = GatedStore(
+        workspace_tmp_path / "objects", blocked_stream="orderbook_updates"
+    )
+    writer = ArchiveWriter(settings, database, object_store=store)
+    writer.run_id = 34
+    await writer.start()
+
+    blocker = update_record("degradation-blocker", "0.40")
+    await writer.put(blocker)
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+    queued = update_record("degradation-queued", "0.405")
+    await writer.put(queued)
+    spilled = update_record("degradation-spill", "0.41")
+    await writer.put(spilled)
+
+    assert spilled.record_id in writer._spilled_record_ids
+    assert len(database.degradations) == 1
+    assert database.degradations[0]["reason"] == "bounded_queue_timeout"
+    assert database.degradations[0]["resolved"] is False
+    assert database.transient_resolutions == 0
+
+    store.release.set()
+    for _ in range(100):
+        if (
+            database.degradations[0]["resolved"]
+            and not writer._spilled_record_ids
+            and not writer._active_record_ids
+            and writer._queues_empty()
+        ):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("spilled archive record did not recover")
+
+    assert database.transient_resolutions == 1
+    assert writer._journal_path.read_text(encoding="utf-8") == ""
+    assert sum(
+        int(value["row_count"])
+        for value in database.objects.values()
+        if value["stream"] == "orderbook_updates"
+    ) == 3
+    await writer.stop()
+
+
+@pytest.mark.asyncio
+async def test_raw_rest_backpressure_does_not_consume_live_lane_capacity(
     workspace_tmp_path: Path,
 ) -> None:
     database = ArchiveDatabase()
@@ -632,42 +818,26 @@ async def test_raw_rest_waits_for_capacity_while_websocket_stream_times_out(
         database,
         object_store=LocalObjectStore(workspace_tmp_path / "objects"),
     )
-    blocker = update_record("blocker", "0.40")
-    await writer.put(blocker)
-
-    raw_rest = ArchiveRecord.create(
-        "raw_rest",
-        {
-            "source": "gamma",
-            "endpoint": "/events",
-            "entity_type": "events",
-            "external_key": "page-2",
-            "requested_at": NOW,
-            "received_at": NOW,
-            "parameters": {"limit": 100},
-            "http_status": 200,
-            "content_hash": "raw-rest-backpressure",
-            "record_count": 1,
-            "response_bytes": 20,
-            "payload": [{"id": "event"}],
-        },
-        priority=2,
-    )
-    raw_put = asyncio.create_task(writer.put(raw_rest))
+    raw_blocker = raw_rest_record("raw-blocker")
+    await writer.put(raw_blocker)
+    raw_waiter = raw_rest_record("raw-waiter")
+    raw_put = asyncio.create_task(writer.put(raw_waiter))
     await asyncio.sleep(0.03)
     assert not raw_put.done()
 
-    dequeued = writer.queue.get_nowait()
-    assert dequeued.record_id == blocker.record_id
+    live = update_record("live-while-rest-blocked", "0.41")
+    await asyncio.wait_for(writer.put(live), timeout=1)
+    assert writer.queue.get_nowait().record_id == live.record_id
     writer.queue.task_done()
-    await writer._release_bytes(dequeued.estimated_bytes)
-    await asyncio.wait_for(raw_put, timeout=1)
-    assert next(iter(writer.queue._queue)).record_id == raw_rest.record_id
+    await writer._release_bytes(live.estimated_bytes, lane="live")
+    assert database.degradations == []
 
-    websocket_record = update_record("websocket", "0.41")
-    await asyncio.wait_for(writer.put(websocket_record), timeout=1)
-    assert database.degradations[-1]["reason"] == "bounded_queue_timeout"
-    assert database.degradations[-1]["stream"] == "orderbook_updates"
+    dequeued = writer.raw_rest_queue.get_nowait()
+    assert dequeued.record_id == raw_blocker.record_id
+    writer.raw_rest_queue.task_done()
+    await writer._release_bytes(dequeued.estimated_bytes, lane="raw_rest")
+    await asyncio.wait_for(raw_put, timeout=1)
+    assert next(iter(writer.raw_rest_queue._queue)).record_id == raw_waiter.record_id
 
 
 @pytest.mark.asyncio
@@ -687,25 +857,8 @@ async def test_cancelled_raw_rest_backpressure_is_recovered_from_journal(
         database,
         object_store=LocalObjectStore(workspace_tmp_path / "objects"),
     )
-    await interrupted.put(update_record("journal-blocker", "0.42"))
-    raw_rest = ArchiveRecord.create(
-        "raw_rest",
-        {
-            "source": "gamma",
-            "endpoint": "/markets",
-            "entity_type": "markets",
-            "external_key": "cancelled-page",
-            "requested_at": NOW,
-            "received_at": NOW,
-            "parameters": {"limit": 100},
-            "http_status": 200,
-            "content_hash": "cancelled-raw-rest",
-            "record_count": 1,
-            "response_bytes": 20,
-            "payload": [{"id": "market"}],
-        },
-        priority=2,
-    )
+    await interrupted.put(raw_rest_record("journal-blocker"))
+    raw_rest = raw_rest_record("cancelled-page")
     pending = asyncio.create_task(interrupted.put(raw_rest))
     await asyncio.sleep(0.03)
     pending.cancel()
@@ -744,31 +897,14 @@ async def test_internal_spilled_raw_rest_replay_does_not_wait_on_its_own_queue(
         database,
         object_store=LocalObjectStore(workspace_tmp_path / "objects"),
     )
-    await writer.put(update_record("replay-blocker", "0.43"))
-    spilled = ArchiveRecord.create(
-        "raw_rest",
-        {
-            "source": "gamma",
-            "endpoint": "/events",
-            "entity_type": "events",
-            "external_key": "spilled-page",
-            "requested_at": NOW,
-            "received_at": NOW,
-            "parameters": {"limit": 100},
-            "http_status": 200,
-            "content_hash": "spilled-raw-rest",
-            "record_count": 1,
-            "response_bytes": 20,
-            "payload": [{"id": "event"}],
-        },
-        priority=2,
-    )
+    await writer.put(raw_rest_record("replay-blocker"))
+    spilled = raw_rest_record("spilled-page")
     await writer._append_journal(spilled)
     writer._spilled_record_ids.add(spilled.record_id)
 
     await asyncio.wait_for(writer._retry_spilled_journal_once(), timeout=1)
     assert spilled.record_id in writer._spilled_record_ids
-    assert database.degradations[-1]["reason"] == "bounded_queue_timeout"
+    assert database.degradations == []
 
 
 @pytest.mark.asyncio
@@ -936,7 +1072,7 @@ async def test_raw_rest_body_is_content_addressed_and_provenance_is_not_lost(
     }
     await writer.start()
     await writer.put(ArchiveRecord.create("raw_rest", body, priority=2))
-    await writer.queue.join()
+    await writer.join()
     await writer.put(
         ArchiveRecord.create(
             "raw_rest",
@@ -971,7 +1107,7 @@ async def test_compaction_replaces_small_objects_only_after_verified_upload(
     await writer.start()
     for index in range(4):
         await writer.put(update_record(f"compact-{index}", f"0.4{index}"))
-    await writer.queue.join()
+    await writer.join()
     assert len(await database.archive_compaction_candidates()) == 4
     assert await writer.compact_once()
     await writer.stop()
@@ -1002,7 +1138,7 @@ async def test_archive_reader_resolves_compact_keys_through_dictionary(
     await writer.start()
     await writer.put(update_record("market-a", "0.41"))
     await writer.put(update_record("market-b", "0.42"))
-    await writer.queue.join()
+    await writer.join()
     await writer.stop()
     keys = await store.list_keys("research/")
     update_paths = [store.root / key for key in keys if "stream=orderbook_updates" in key]

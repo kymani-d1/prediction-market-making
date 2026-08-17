@@ -106,6 +106,15 @@ both bounded. Uploads use retry/backoff/jitter, remain in a bounded local spool,
 and are verified with object size plus SHA-256 metadata before the manifest is
 marked uploaded.
 
+Raw REST and live evidence use separate scheduling lanes and archive workers
+behind the same fsynced ingress journal and manifest protocol. The live lane
+retains 95% of row slots and a reserved 25% of queue bytes; the smaller number
+of large raw REST records receives 5% of row slots and 75% of bytes. Both shares
+sum to the existing `ARCHIVE_QUEUE_MAX_*` limits. Raw REST backpressures only
+its replayable producer, while live L2, reference prices, and sampled
+observations continue draining independently. Metrics expose per-lane rows and
+bytes under `queue_lanes` as well as aggregate queue pressure.
+
 The spool and ingress journal are only as durable as the filesystem containing
 `ARCHIVE_SPOOL_DIRECTORY`. Railway files outside a volume are ephemeral, so the
 default `/tmp/prediction-collector-archive` does **not** survive a replacement
