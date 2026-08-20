@@ -54,7 +54,7 @@ async def test_keyset_pagination_forwards_after_cursor_without_offset() -> None:
     assert [[item["id"] for item in page[0]] for page in pages] == [["1"], ["2"]]
     assert http.calls[1][1]["after_cursor"] == "cursor-A"
     assert all("offset" not in params for _, params in http.calls)
-    assert http.retryable_statuses == [frozenset({403}), frozenset({403})]
+    assert http.retryable_statuses == [frozenset({403, 422}), frozenset({403, 422})]
 
 
 @pytest.mark.asyncio
@@ -150,7 +150,10 @@ async def test_comments_use_stable_oldest_first_order() -> None:
 @pytest.mark.asyncio
 async def test_live_event_discovery_uses_documented_active_and_closed_filters() -> None:
     http = FakeHttp([{"events": [], "next_cursor": ""}])
-    assert [page async for page in client(http).iter_live_events()] == []
+    pages = [page async for page in client(http).iter_live_events()]
+    assert len(pages) == 1
+    assert pages[0][0] == []
+    assert pages[0][2] is None
     assert http.calls[0][1]["active"] == "true"
     assert http.calls[0][1]["closed"] == "false"
 
@@ -164,3 +167,20 @@ async def test_forbidden_retry_policy_is_scoped_to_public_gamma_reads() -> None:
     _ = [page async for page in rest.iter_trades(market="0xcondition")]
 
     assert http.retryable_statuses == [frozenset({403}), frozenset()]
+
+
+@pytest.mark.asyncio
+async def test_empty_keyset_exhaustion_is_yielded_for_durable_checkpoint_clear() -> None:
+    http = FakeHttp([{"markets": [], "next_cursor": ""}])
+
+    pages = [
+        page
+        async for page in client(http).iter_markets(
+            closed=True, after_cursor="opaque-persisted-cursor"
+        )
+    ]
+
+    assert len(pages) == 1
+    assert pages[0][0] == []
+    assert pages[0][2] is None
+    assert http.retryable_statuses == [frozenset({403, 422})]

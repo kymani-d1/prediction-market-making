@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -267,6 +268,298 @@ async def test_metadata_checkpoint_stays_on_last_completed_page_and_restart_resu
         for market in database.markets
     )
     assert database.checkpoint_values[checkpoint_key] is None
+
+
+def _status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request(
+        "GET", "https://gamma-api.polymarket.com/markets/keyset"
+    )
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"persistent Gamma denial {status_code}",
+        request=request,
+        response=response,
+    )
+
+
+Page = tuple[list[dict[str, Any]], str | None]
+
+
+class ScriptedCursorRest(MetadataRest):
+    def __init__(
+        self,
+        scripts: list[tuple[str | None, list[Page | BaseException]]],
+    ) -> None:
+        super().__init__([])
+        self.scripts = list(scripts)
+        self.market_start_cursors: list[str | None] = []
+
+    async def iter_markets(
+        self, *, closed: bool, after_cursor: str | None = None
+    ):
+        del closed
+        self.market_start_cursors.append(after_cursor)
+        expected_cursor, steps = self.scripts.pop(0)
+        assert after_cursor == expected_cursor
+        for step in steps:
+            if isinstance(step, BaseException):
+                raise step
+            items, cursor = step
+            yield items, market_page_result(), cursor
+
+
+def _service_with_persisted_cursor(
+    rest: ScriptedCursorRest,
+    *,
+    cursor: str | None = "opaque-stale-cursor",
+) -> tuple[PolymarketService, MetadataDatabase, MetadataWriter]:
+    database = MetadataDatabase()
+    database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] = cursor
+    writer = MetadataWriter()
+    service = PolymarketService(
+        rest=rest,  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        writer=writer,  # type: ignore[arg-type]
+    )
+    return service, database, writer
+
+
+@pytest.mark.asyncio
+async def test_persisted_cursor_success_does_not_replay() -> None:
+    rest = ScriptedCursorRest(
+        [("opaque-stale-cursor", [([valid_market()], None)])]
+    )
+    service, database, _ = _service_with_persisted_cursor(rest)
+
+    result = await service.sync_metadata(include_closed=False)
+
+    assert rest.market_start_cursors == ["opaque-stale-cursor"]
+    assert result["stale_checkpoint_cursor_replays"] == 0
+    assert service.stale_checkpoint_cursor_replays == 0
+    assert database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [403, 422])
+async def test_stale_persisted_cursor_replays_once_from_start(
+    status_code: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rest = ScriptedCursorRest(
+        [
+            ("opaque-stale-cursor", [_status_error(status_code)]),
+            (None, [([valid_market()], None)]),
+        ]
+    )
+    service, database, _ = _service_with_persisted_cursor(rest)
+
+    with caplog.at_level(logging.WARNING):
+        result = await service.sync_metadata(include_closed=False)
+
+    assert rest.market_start_cursors == ["opaque-stale-cursor", None]
+    assert result["stale_checkpoint_cursor_replays"] == 1
+    assert service.stale_checkpoint_cursor_replays == 1
+    assert database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] is None
+    warning = next(
+        record
+        for record in caplog.records
+        if record.message
+        == "Persisted Polymarket keyset cursor rejected; replaying cohort from start"
+    )
+    assert warning.entity == "markets"
+    assert warning.closed is False
+    assert warning.status_code == status_code
+    assert warning.checkpoint_key == "closed=false"
+    assert warning.run_id == 71
+    assert warning.fallback_attempt == 1
+    assert warning.stale_checkpoint_cursor_replays == 1
+    assert not hasattr(warning, "after_cursor")
+
+
+@pytest.mark.asyncio
+async def test_transient_resume_failure_recovered_inside_rest_does_not_replay() -> None:
+    # The REST client owns ordinary bounded retries.  From the service's point
+    # of view the persisted-cursor iterator succeeds without a terminal error.
+    rest = ScriptedCursorRest(
+        [("opaque-stale-cursor", [([valid_market()], None)])]
+    )
+    service, _, _ = _service_with_persisted_cursor(rest)
+
+    result = await service.sync_metadata(include_closed=False)
+
+    assert rest.market_start_cursors == ["opaque-stale-cursor"]
+    assert result["stale_checkpoint_cursor_replays"] == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_failure_before_first_page_preserves_original_checkpoint() -> None:
+    rest = ScriptedCursorRest(
+        [
+            ("opaque-stale-cursor", [_status_error(403)]),
+            (None, [RuntimeError("fresh replay failed before first page")]),
+        ]
+    )
+    service, database, _ = _service_with_persisted_cursor(rest)
+
+    with pytest.raises(RuntimeError, match="fresh replay failed"):
+        await service.sync_metadata(include_closed=False)
+
+    assert rest.market_start_cursors == ["opaque-stale-cursor", None]
+    assert service.stale_checkpoint_cursor_replays == 1
+    assert database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] == "opaque-stale-cursor"
+
+
+@pytest.mark.asyncio
+async def test_fresh_replay_first_page_advances_before_later_failure() -> None:
+    rest = ScriptedCursorRest(
+        [
+            ("opaque-stale-cursor", [_status_error(403)]),
+            (
+                None,
+                [
+                    ([valid_market()], "fresh-cursor-A"),
+                    RuntimeError("later fresh crawl failure"),
+                ],
+            ),
+        ]
+    )
+    service, database, writer = _service_with_persisted_cursor(rest)
+
+    with pytest.raises(RuntimeError, match="later fresh crawl failure"):
+        await service.sync_metadata(include_closed=False)
+
+    assert rest.market_start_cursors == ["opaque-stale-cursor", None]
+    assert database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] == "fresh-cursor-A"
+    assert len(writer.raw_items) == 1
+    assert database.markets[0]["external_id"] == "0xvalid-condition"
+
+
+@pytest.mark.asyncio
+async def test_mid_crawl_cursor_rejection_does_not_restart_from_zero() -> None:
+    rest = ScriptedCursorRest(
+        [
+            (
+                None,
+                [
+                    ([valid_market()], "fresh-cursor-A"),
+                    _status_error(403),
+                ],
+            )
+        ]
+    )
+    service, database, _ = _service_with_persisted_cursor(rest, cursor=None)
+
+    with pytest.raises(httpx.HTTPStatusError, match="persistent Gamma denial"):
+        await service.sync_metadata(include_closed=False)
+
+    assert rest.market_start_cursors == [None]
+    assert service.stale_checkpoint_cursor_replays == 0
+    assert database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] == "fresh-cursor-A"
+
+
+@pytest.mark.asyncio
+async def test_rejected_fresh_replay_does_not_loop_or_clear_checkpoint() -> None:
+    rest = ScriptedCursorRest(
+        [
+            ("opaque-stale-cursor", [_status_error(403)]),
+            (None, [_status_error(422)]),
+        ]
+    )
+    service, database, _ = _service_with_persisted_cursor(rest)
+
+    with pytest.raises(httpx.HTTPStatusError, match="persistent Gamma denial 422"):
+        await service.sync_metadata(include_closed=False)
+
+    assert rest.market_start_cursors == ["opaque-stale-cursor", None]
+    assert service.stale_checkpoint_cursor_replays == 1
+    assert database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] == "opaque-stale-cursor"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("unrelated failure"), _status_error(401)],
+    ids=["unrelated-exception", "unapproved-http-status"],
+)
+async def test_persisted_cursor_does_not_replay_for_unapproved_failure(
+    failure: BaseException,
+) -> None:
+    rest = ScriptedCursorRest([("opaque-stale-cursor", [failure])])
+    service, database, _ = _service_with_persisted_cursor(rest)
+
+    with pytest.raises(type(failure)):
+        await service.sync_metadata(include_closed=False)
+
+    assert rest.market_start_cursors == ["opaque-stale-cursor"]
+    assert service.stale_checkpoint_cursor_replays == 0
+    assert database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] == "opaque-stale-cursor"
+
+
+@pytest.mark.asyncio
+async def test_empty_successful_exhaustion_clears_persisted_cursor() -> None:
+    rest = ScriptedCursorRest([("opaque-stale-cursor", [([], None)])])
+    service, database, writer = _service_with_persisted_cursor(rest)
+
+    await service.sync_metadata(include_closed=False)
+
+    assert len(writer.raw_items) == 1
+    assert writer.raw_items[0].data["payload"] == []
+    assert database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] is None
+
+
+class IdempotentMetadataDatabase(MetadataDatabase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.logical_markets: dict[str, dict[str, Any]] = {}
+
+    async def upsert_market(self, market: dict[str, Any], **_: Any) -> int:
+        self.logical_markets[market["external_id"]] = market
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_replay_is_idempotent_for_logical_normalised_market_state() -> None:
+    rest = ScriptedCursorRest(
+        [
+            ("opaque-stale-cursor", [_status_error(403)]),
+            (None, [([valid_market(), valid_market()], None)]),
+        ]
+    )
+    database = IdempotentMetadataDatabase()
+    database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] = "opaque-stale-cursor"
+    writer = MetadataWriter()
+    service = PolymarketService(
+        rest=rest,  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        writer=writer,  # type: ignore[arg-type]
+    )
+
+    await service.sync_metadata(include_closed=False)
+
+    assert list(database.logical_markets) == ["0xvalid-condition"]
+    assert database.checkpoint_values[
+        ("polymarket", "metadata_markets", "closed=false")
+    ] is None
 
 
 @pytest.mark.asyncio

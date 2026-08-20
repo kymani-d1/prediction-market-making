@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+
+import httpx
 
 from prediction_collector.common.records import book_snapshot_item, trade_item
 from prediction_collector.common.types import MarketCandidate
@@ -79,6 +81,7 @@ class PolymarketService:
         self.database = database
         self.writer = writer
         self._live_persisted_ids: set[str] = set()
+        self.stale_checkpoint_cursor_replays = 0
 
     async def sync_metadata(self, *, include_closed: bool = True) -> dict[str, Any]:
         counts: dict[str, Any] = {
@@ -87,6 +90,7 @@ class PolymarketService:
             "markets": 0,
             "outcomes": 0,
             "tags": 0,
+            "stale_checkpoint_cursor_replays": 0,
         }
         malformed_markets_skipped = 0
         malformed_market_samples: list[dict[str, Any]] = []
@@ -119,7 +123,7 @@ class PolymarketService:
             if event_cursor:
                 LOGGER.info(
                     "Resuming Polymarket event metadata backfill",
-                    extra={"closed": closed, "after_cursor": event_cursor},
+                    extra={"closed": closed, "has_persisted_cursor": True},
                 )
             async for items, result, cursor in self.rest.iter_events(
                 closed=closed, after_cursor=event_cursor
@@ -147,10 +151,13 @@ class PolymarketService:
             if market_cursor:
                 LOGGER.info(
                     "Resuming Polymarket market metadata backfill",
-                    extra={"closed": closed, "after_cursor": market_cursor},
+                    extra={"closed": closed, "has_persisted_cursor": True},
                 )
-            async for items, result, cursor in self.rest.iter_markets(
-                closed=closed, after_cursor=market_cursor
+            replay_count_before = self.stale_checkpoint_cursor_replays
+            async for items, result, cursor in self._iter_markets_with_stale_checkpoint_replay(
+                closed=closed,
+                checkpoint_key=checkpoint_key,
+                persisted_cursor=market_cursor,
             ):
                 await self._raw_page(
                     "gamma", "/markets/keyset", "markets", items, result, external_key=cursor
@@ -198,6 +205,9 @@ class PolymarketService:
                         "malformed_markets_skipped": malformed_markets_skipped,
                     },
                 )
+            counts["stale_checkpoint_cursor_replays"] += (
+                self.stale_checkpoint_cursor_replays - replay_count_before
+            )
         counts["malformed_markets_skipped"] = malformed_markets_skipped
         counts["malformed_market_samples"] = malformed_market_samples
         counts["invalid_market_metric_values_normalized"] = invalid_metrics.total
@@ -260,6 +270,61 @@ class PolymarketService:
             },
         )
         return counts
+
+    async def _iter_markets_with_stale_checkpoint_replay(
+        self,
+        *,
+        closed: bool,
+        checkpoint_key: str,
+        persisted_cursor: str | None,
+    ) -> AsyncIterator[tuple[list[dict[str, Any]], Any, str | None]]:
+        """Resume a cohort, replaying once only when its initial cursor is stale.
+
+        The page counter advances only after the caller finishes processing a
+        yielded page.  In ``sync_metadata`` that boundary is after raw evidence,
+        normalised upserts, and the durable checkpoint update have all succeeded.
+        """
+
+        cursor = persisted_cursor
+        fallback_attempted = False
+        completed_pages = 0
+        while True:
+            try:
+                async for page in self.rest.iter_markets(
+                    closed=closed, after_cursor=cursor
+                ):
+                    yield page
+                    completed_pages += 1
+                return
+            except httpx.HTTPStatusError as exc:
+                status_code = (
+                    exc.response.status_code if exc.response is not None else None
+                )
+                eligible = (
+                    persisted_cursor is not None
+                    and not fallback_attempted
+                    and completed_pages == 0
+                    and status_code in {403, 422}
+                )
+                if not eligible:
+                    raise
+                fallback_attempted = True
+                cursor = None
+                self.stale_checkpoint_cursor_replays += 1
+                LOGGER.warning(
+                    "Persisted Polymarket keyset cursor rejected; replaying cohort from start",
+                    extra={
+                        "entity": "markets",
+                        "closed": closed,
+                        "status_code": status_code,
+                        "checkpoint_key": checkpoint_key,
+                        "run_id": self.writer.run_id,
+                        "fallback_attempt": 1,
+                        "stale_checkpoint_cursor_replays": (
+                            self.stale_checkpoint_cursor_replays
+                        ),
+                    },
+                )
 
     async def discover_live(
         self,

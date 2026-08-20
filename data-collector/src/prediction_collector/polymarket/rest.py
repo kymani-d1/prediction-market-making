@@ -12,6 +12,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 _PUBLIC_GAMMA_RETRYABLE_STATUSES = frozenset({403})
+_PUBLIC_GAMMA_KEYSET_RETRYABLE_STATUSES = frozenset({422})
 
 
 def _validated_page_items(
@@ -58,13 +59,19 @@ class PolymarketRestClient:
         self.clob_url = clob_url.rstrip("/")
 
     async def _gamma_get(
-        self, path: str, *, params: dict[str, Any] | None = None
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        retryable_status_codes: frozenset[int] = frozenset(),
     ) -> HttpResult:
         """GET a public Gamma resource with its explicitly scoped WAF policy."""
         return await self.http.get_json(
             f"{self.gamma_url}/{path.lstrip('/')}",
             params=params,
-            retryable_status_codes=_PUBLIC_GAMMA_RETRYABLE_STATUSES,
+            retryable_status_codes=(
+                _PUBLIC_GAMMA_RETRYABLE_STATUSES | retryable_status_codes
+            ),
         )
 
     async def _keyset(
@@ -83,7 +90,11 @@ class PolymarketRestClient:
         while True:
             if cursor:
                 params["after_cursor"] = cursor
-            result = await self._gamma_get(f"/{entity}/keyset", params=params)
+            result = await self._gamma_get(
+                f"/{entity}/keyset",
+                params=params,
+                retryable_status_codes=_PUBLIC_GAMMA_KEYSET_RETRYABLE_STATUSES,
+            )
             payload = result.data
             if not isinstance(payload, dict) or not isinstance(payload.get(entity), list):
                 raise RuntimeError(
@@ -104,8 +115,10 @@ class PolymarketRestClient:
                 "Fetched Polymarket page",
                 extra={"entity": entity, "page": page_number, "records": len(items)},
             )
-            if items:
-                yield items, result, str(next_cursor) if next_cursor else None
+            # Yield an empty terminal page as durable evidence too.  A persisted
+            # cursor can legitimately resume exactly at exhaustion; the service
+            # must archive that response before it can safely clear the cursor.
+            yield items, result, str(next_cursor) if next_cursor else None
             if not next_cursor:
                 return
             next_cursor = str(next_cursor)
