@@ -175,6 +175,7 @@ Important groups:
   thresholds, allowlist/blocklist, and reevaluation interval.
 - Retention/audit: `RAW_WS_POLICY`, `RAW_WS_VALID_SAMPLE_RATE`,
   `REFERENCE_UNCHANGED_HEARTBEAT_SECONDS`,
+  `POLYMARKET_RTDS_REFERENCE_STALE_AFTER_SECONDS`,
   `POSTGRES_REFERENCE_RETENTION_HOURS`, and
   `POSTGRES_OBSERVATION_RETENTION_HOURS`. Reference prices default to six hot
   hours and observations to 24 hours; normalized references and SAMPLED

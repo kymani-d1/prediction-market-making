@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from prediction_collector.config import Settings
+from prediction_collector.common.types import MarketCandidate
 from prediction_collector.database import (
     Database,
     _CURRENT_TIER_STATUS_SQL,
+    _EXPECTED_POLYMARKET_CRYPTO_REFERENCE_PROVIDERS,
     _discovery_status,
+    _reference_data_status,
 )
 from prediction_collector.jobs.live import LiveCollector
 from prediction_collector.writer import BatchWriter, WriteItem
@@ -66,6 +70,56 @@ def test_current_tier_status_excludes_stale_evaluation_cohorts() -> None:
     rows = connection.execute(_CURRENT_TIER_STATUS_SQL).fetchall()
     counts = {row["tier"]: row["markets"] for row in rows}
     assert counts == {"full_l2": 10, "sampled": 50}
+
+
+def test_reference_health_requires_every_expected_crypto_provider_to_be_fresh() -> None:
+    latest = {
+        provider: NOW - timedelta(seconds=index + 1)
+        for index, provider in enumerate(
+            _EXPECTED_POLYMARKET_CRYPTO_REFERENCE_PROVIDERS
+        )
+    }
+    status = _reference_data_status(
+        configured=True,
+        connected=True,
+        latest_message=NOW - timedelta(seconds=1),
+        latest_valid_by_provider=latest,
+        stale_after_seconds=600,
+        observed_at=NOW,
+    )
+    assert status["status"] == "healthy"
+    assert status["healthy"] is True
+    assert status["fresh_crypto_providers"] == 4
+    assert "pyth" not in status["providers"]
+    assert status["latest_message"] == NOW - timedelta(seconds=1)
+
+
+def test_reference_health_distinguishes_partial_and_complete_staleness() -> None:
+    partial = _reference_data_status(
+        configured=True,
+        connected=True,
+        latest_message=NOW,
+        latest_valid_by_provider={"binance": NOW},
+        stale_after_seconds=600,
+        observed_at=NOW,
+    )
+    assert partial["status"] == "degraded"
+    assert partial["healthy"] is False
+
+    stale = _reference_data_status(
+        configured=True,
+        connected=True,
+        latest_message=NOW,
+        latest_valid_by_provider={
+            provider: NOW - timedelta(seconds=601)
+            for provider in _EXPECTED_POLYMARKET_CRYPTO_REFERENCE_PROVIDERS
+        },
+        stale_after_seconds=600,
+        observed_at=NOW,
+    )
+    assert stale["status"] == "stale"
+    assert stale["healthy"] is False
+    assert stale["fresh_crypto_providers"] == 0
 
 
 class _Cursor:
@@ -145,6 +199,49 @@ class _Pool:
 
     def connection(self) -> _ConnectionContext:
         return _ConnectionContext(self.connection_value)
+
+
+class _SelectionConnection:
+    def __init__(self) -> None:
+        self.query = ""
+        self.params: tuple[Any, ...] = ()
+
+    async def execute(
+        self, query: str, params: tuple[Any, ...] | None = None
+    ) -> _Cursor:
+        self.query = query
+        self.params = params or ()
+        return _Cursor(rowcount=1)
+
+
+@pytest.mark.asyncio
+async def test_live_selection_rows_share_one_explicit_evaluation_cohort() -> None:
+    connection = _SelectionConnection()
+    database = Database(Settings())
+    database.pool = _Pool(connection)  # type: ignore[assignment]
+    market = MarketCandidate(
+        exchange="polymarket",
+        external_id="market-1",
+        ticker="market-1",
+        status="active",
+        active=True,
+        tradable=True,
+        accepting_orders=True,
+        enable_order_book=True,
+        liquidity=Decimal("100"),
+    )
+
+    await database.record_live_selection(
+        7,
+        [market],
+        {("polymarket", "market-1")},
+        {},
+    )
+
+    normalized = " ".join(connection.query.split())
+    assert "market_external_id, evaluated_at, is_active" in normalized
+    assert connection.params[1] == 7
+    assert isinstance(connection.params[2], datetime)
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from prediction_collector.writer import BatchWriter, WriteItem
 
 
 LOGGER = logging.getLogger(__name__)
+CONNECTION_STATS_FLUSH_SECONDS = 30.0
 
 
 class PolymarketRtdsWebSocket:
@@ -82,6 +83,7 @@ class PolymarketRtdsWebSocket:
             dropped = 0
             first_message_at: Any | None = None
             last_message_at: Any | None = None
+            stats_flushed_monotonic: float | None = None
             reason: str | None = None
             try:
                 async with connect(
@@ -124,6 +126,20 @@ class PolymarketRtdsWebSocket:
                                 continue
                             messages += 1
                             await self.metrics.message("polymarket_rtds")
+                            now_monotonic = time.monotonic()
+                            if (
+                                stats_flushed_monotonic is None
+                                or now_monotonic - stats_flushed_monotonic
+                                >= CONNECTION_STATS_FLUSH_SECONDS
+                            ):
+                                await self.database.update_connection_stats(
+                                    connection_id,
+                                    messages_received=messages,
+                                    messages_dropped=dropped,
+                                    first_message_at=first_message_at,
+                                    last_message_at=last_message_at,
+                                )
+                                stats_flushed_monotonic = now_monotonic
                             try:
                                 decoded = json.loads(frame)
                             except json.JSONDecodeError:

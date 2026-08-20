@@ -44,6 +44,13 @@ _CURRENT_TIER_STATUS_SQL = """
     GROUP BY tier
 """
 
+_EXPECTED_POLYMARKET_CRYPTO_REFERENCE_PROVIDERS = (
+    "binance",
+    "chainlink_spot",
+    "chainlink_twap_30s",
+    "chainlink_twap_60s",
+)
+
 
 def _discovery_state(
     *, latest_complete_discovery: datetime | None, open_refresh_failures: int
@@ -71,6 +78,71 @@ def _discovery_status(
             "open_total": open_coverage_warnings,
             "market_metadata_schema_failure": open_metadata_schema_warnings,
         },
+    }
+
+
+def _reference_data_status(
+    *,
+    configured: bool,
+    connected: bool,
+    latest_message: datetime | None,
+    latest_valid_by_provider: Mapping[str, datetime],
+    stale_after_seconds: int,
+    observed_at: datetime | None = None,
+) -> dict[str, Any]:
+    now = observed_at or utc_now()
+    providers: dict[str, dict[str, Any]] = {}
+    fresh_count = 0
+    latest_valid_reference: datetime | None = None
+    for provider in _EXPECTED_POLYMARKET_CRYPTO_REFERENCE_PROVIDERS:
+        latest_valid = latest_valid_by_provider.get(provider)
+        age_seconds = (
+            max(0.0, (now - latest_valid).total_seconds())
+            if latest_valid is not None
+            else None
+        )
+        fresh = bool(
+            latest_valid is not None and age_seconds is not None
+            and age_seconds <= stale_after_seconds
+        )
+        fresh_count += int(fresh)
+        if latest_valid is not None and (
+            latest_valid_reference is None or latest_valid > latest_valid_reference
+        ):
+            latest_valid_reference = latest_valid
+        providers[provider] = {
+            "latest_valid_reference": latest_valid,
+            "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+            "fresh": fresh,
+        }
+
+    expected_count = len(_EXPECTED_POLYMARKET_CRYPTO_REFERENCE_PROVIDERS)
+    if not configured:
+        status = "disabled"
+        healthy = True
+    elif not connected:
+        status = "disconnected"
+        healthy = False
+    elif fresh_count == expected_count:
+        status = "healthy"
+        healthy = True
+    elif fresh_count:
+        status = "degraded"
+        healthy = False
+    else:
+        status = "stale"
+        healthy = False
+    return {
+        "configured": configured,
+        "connected": connected,
+        "status": status,
+        "healthy": healthy,
+        "stale_after_seconds": stale_after_seconds,
+        "latest_message": latest_message,
+        "latest_valid_reference": latest_valid_reference,
+        "expected_crypto_providers": expected_count,
+        "fresh_crypto_providers": fresh_count,
+        "providers": providers,
     }
 
 if TYPE_CHECKING:
@@ -2516,6 +2588,7 @@ class Database:
             }
             for market in market_list
         ]
+        evaluated_at = utc_now()
         async with self.pool.connection() as connection:
             cursor = await connection.execute(
                 """
@@ -2543,10 +2616,11 @@ class Database:
                 )
                 INSERT INTO live_market_subscription_decisions
                     (collector_run_id, exchange, market_id, market_external_id,
+                     evaluated_at,
                      is_active, is_tradable, is_eligible, is_subscribed,
                      exclusion_reason, ranking_criterion, ranking_position,
                      observed_volume, observed_liquidity, config_snapshot, details)
-                SELECT %s, 'polymarket', market_id, external_id, is_active,
+                SELECT %s, 'polymarket', market_id, external_id, %s, is_active,
                        is_tradable, COALESCE(is_eligible, FALSE), is_subscribed,
                        exclusion_reason, 'tier_score_desc_external_id_asc',
                        ranking_position, observed_volume, observed_liquidity,
@@ -2556,6 +2630,7 @@ class Database:
                 (
                     _json(json.loads(canonical_json(payload))),
                     run_id,
+                    evaluated_at,
                     _json(config),
                 ),
             )
@@ -3703,9 +3778,15 @@ class Database:
                         ],
                     }
                 )
-            archive["healthy"] = bool(
+            archive["operational_healthy"] = bool(
                 int(archive.get("objects_failed") or 0) == 0
-                and int(archive.get("open_degradation_events") or 0) == 0
+            )
+            archive["historical_data_quality_healthy"] = bool(
+                int(archive.get("open_degradation_events") or 0) == 0
+            )
+            archive["healthy"] = bool(
+                archive["operational_healthy"]
+                and archive["historical_data_quality_healthy"]
             )
             result["archive"] = archive
 
@@ -3734,6 +3815,16 @@ class Database:
                              WHERE collector_run_id = %s AND exchange = 'polymarket'
                                AND status = 'connected' AND disconnected_at IS NULL)
                                 AS connections_active,
+                            (SELECT count(*) FROM collector_connections
+                             WHERE collector_run_id = %s AND exchange = 'polymarket'
+                               AND channel = 'rtds' AND status = 'connected'
+                               AND disconnected_at IS NULL)
+                                AS rtds_connections_active,
+                            (SELECT max(last_message_at) FROM collector_connections
+                             WHERE collector_run_id = %s AND exchange = 'polymarket'
+                               AND channel = 'rtds' AND status = 'connected'
+                               AND disconnected_at IS NULL)
+                                AS rtds_latest_message,
                             (SELECT count(DISTINCT ccm.market_external_id)
                              FROM collector_connections cc
                              JOIN collector_connection_markets ccm
@@ -3788,10 +3879,42 @@ class Database:
                                AND g.status IN ('open', 'reconciling'))
                                 AS open_discovery_coverage_warnings
                         """,
-                        tuple(live_run["id"] for _ in range(8)),
+                        tuple(live_run["id"] for _ in range(10)),
                     )
                 ).fetchone()
                 state = dict(row or {})
+                reference_rows = await (
+                    await connection.execute(
+                        """
+                        SELECT prices.provider,
+                               max(prices.received_at) AS latest_valid_reference
+                        FROM reference_price_updates prices
+                        JOIN collector_connections connection
+                          ON connection.id = prices.collector_connection_id
+                        WHERE connection.collector_run_id = %s
+                          AND prices.delivery_exchange = 'polymarket'
+                          AND prices.provider = ANY(%s)
+                        GROUP BY prices.provider
+                        """,
+                        (
+                            live_run["id"],
+                            list(_EXPECTED_POLYMARKET_CRYPTO_REFERENCE_PROVIDERS),
+                        ),
+                    )
+                ).fetchall()
+                state["reference_data"] = _reference_data_status(
+                    configured=self.settings.polymarket_rtds_enabled,
+                    connected=int(state.get("rtds_connections_active") or 0) > 0,
+                    latest_message=state.get("rtds_latest_message"),
+                    latest_valid_by_provider={
+                        str(item["provider"]): item["latest_valid_reference"]
+                        for item in reference_rows
+                        if item.get("latest_valid_reference") is not None
+                    },
+                    stale_after_seconds=(
+                        self.settings.polymarket_rtds_reference_stale_after_seconds
+                    ),
+                )
                 state.update(
                     _discovery_status(
                         latest_complete_discovery=state.get(
@@ -3813,6 +3936,7 @@ class Database:
                     and int(state.get("connections_active") or 0) > 0
                     and int(state.get("markets_confirmed_subscribed") or 0) > 0
                     and state.get("latest_ws_message") is not None
+                    and state["reference_data"]["healthy"]
                 )
                 live["polymarket"] = state
                 result["live_run"] = {

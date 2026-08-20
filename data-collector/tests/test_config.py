@@ -22,6 +22,7 @@ def test_defaults_are_polymarket_only_and_bounded() -> None:
     assert value.postgres_observation_retention_hours == 24
     assert value.raw_ws_policy == "errors_sample"
     assert str(value.raw_ws_valid_sample_rate) == "0.001"
+    assert value.polymarket_rtds_reference_stale_after_seconds == 600
     assert value.safe_summary()["scope"] == "polymarket_only"
     assert not any("kalshi" in key.lower() for key in value.safe_summary())
 
@@ -75,6 +76,14 @@ def test_allowlist_and_blocklist_cannot_overlap() -> None:
                 "LIVE_MARKET_BLOCKLIST": "same",
             }
         )
+
+
+def test_rtds_reference_staleness_threshold_is_configurable() -> None:
+    value = settings({"POLYMARKET_RTDS_REFERENCE_STALE_AFTER_SECONDS": "900"})
+    assert value.polymarket_rtds_reference_stale_after_seconds == 900
+
+    with pytest.raises(ConfigurationError):
+        settings({"POLYMARKET_RTDS_REFERENCE_STALE_AFTER_SECONDS": "29"})
 
 
 def test_env_example_is_polymarket_only_and_parses() -> None:

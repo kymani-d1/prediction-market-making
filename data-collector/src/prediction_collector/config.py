@@ -169,6 +169,7 @@ class Settings:
     raw_ws_policy: str = "errors_sample"
     raw_ws_valid_sample_rate: Decimal = Decimal("0.001")
     reference_unchanged_heartbeat_seconds: int = 300
+    polymarket_rtds_reference_stale_after_seconds: int = 600
 
     postgres_storage_warn_gb: Decimal = Decimal("70")
     postgres_storage_critical_gb: Decimal = Decimal("85")
@@ -320,6 +321,7 @@ class Settings:
             raw_ws_policy=(get("RAW_WS_POLICY", "errors_sample") or "errors_sample").lower(),
             raw_ws_valid_sample_rate=_decimal(get("RAW_WS_VALID_SAMPLE_RATE"), Decimal("0.001"), name="RAW_WS_VALID_SAMPLE_RATE"),
             reference_unchanged_heartbeat_seconds=_int(get("REFERENCE_UNCHANGED_HEARTBEAT_SECONDS"), 300, name="REFERENCE_UNCHANGED_HEARTBEAT_SECONDS", minimum=1),
+            polymarket_rtds_reference_stale_after_seconds=_int(get("POLYMARKET_RTDS_REFERENCE_STALE_AFTER_SECONDS"), 600, name="POLYMARKET_RTDS_REFERENCE_STALE_AFTER_SECONDS", minimum=30),
             postgres_storage_warn_gb=_decimal(get("POSTGRES_STORAGE_WARN_GB"), Decimal("70"), name="POSTGRES_STORAGE_WARN_GB"),
             postgres_storage_critical_gb=_decimal(get("POSTGRES_STORAGE_CRITICAL_GB"), Decimal("85"), name="POSTGRES_STORAGE_CRITICAL_GB"),
             postgres_reference_retention_hours=_int(get("POSTGRES_REFERENCE_RETENTION_HOURS"), 6, name="POSTGRES_REFERENCE_RETENTION_HOURS", minimum=1),
