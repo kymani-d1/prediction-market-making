@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from prediction_collector.common.diagnostics import process_memory_snapshot
 from prediction_collector.common.records import book_snapshot_item
 from prediction_collector.common.retry import RetryPolicy
 from prediction_collector.common.types import (
@@ -110,7 +112,14 @@ class LiveCollector:
         self._next_market_shard_id = 1
         self.background_tasks: list[asyncio.Task[None]] = []
         self.reconciliation_task: asyncio.Task[None] | None = None
-        self._task_failure: asyncio.Future[tuple[str, BaseException | None]] | None = None
+        self._task_failure: (
+            asyncio.Future[tuple[str, BaseException | None]] | None
+        ) = None
+        self._discovery_cycle = 0
+        self._discovery_page_count = 0
+        self._discovery_stage_timings: dict[
+            str, dict[str, float | int]
+        ] = {}
         self.polymarket_ws = PolymarketMarketWebSocket(
             url=settings.polymarket_ws_url,
             writer=writer,
@@ -121,6 +130,13 @@ class LiveCollector:
 
     async def run(self) -> None:
         self.run_id = await self.database.start_run("live", "polymarket")
+        LOGGER.info(
+            "Live collector lifecycle started",
+            extra={
+                "run_id": self.run_id,
+                "process_memory": process_memory_snapshot(),
+            },
+        )
         self.writer.run_id = self.run_id
         if self.writer.archive is not None:
             self.writer.archive.run_id = self.run_id
@@ -131,12 +147,22 @@ class LiveCollector:
             )
         self._task_failure = asyncio.get_running_loop().create_future()
         if self.writer.task is not None:
+            LOGGER.info(
+                "Live collector supervised task started",
+                extra={"task_name": self.writer.task.get_name()},
+            )
             self._watch_task(self.writer.task)
         if self.writer.archive is not None and self.writer.archive.task is not None:
+            LOGGER.info(
+                "Live collector supervised task started",
+                extra={"task_name": self.writer.archive.task.get_name()},
+            )
             self._watch_task(self.writer.archive.task)
         try:
             await self._start_background_tasks()
-            stop_waiter = asyncio.create_task(self.stop.wait(), name="collector-stop-waiter")
+            stop_waiter = asyncio.create_task(
+                self.stop.wait(), name="collector-stop-waiter"
+            )
             assert self._task_failure is not None
             done, _ = await asyncio.wait(
                 [stop_waiter, self._task_failure],
@@ -144,9 +170,27 @@ class LiveCollector:
             )
             if self._task_failure in done:
                 task_name, error = self._task_failure.result()
+                stop_waiter.cancel()
+                await asyncio.gather(stop_waiter, return_exceptions=True)
+                LOGGER.error(
+                    "Live collector terminating after supervised task exit",
+                    extra={
+                        "task_name": task_name,
+                        "task_outcome": "failed" if error is not None else "returned",
+                        "error_type": type(error).__name__ if error else None,
+                        "process_memory": process_memory_snapshot(),
+                    },
+                )
                 if error is not None:
                     raise RuntimeError(f"collector task failed: {task_name}") from error
                 raise RuntimeError(f"collector task stopped unexpectedly: {task_name}")
+            LOGGER.info(
+                "Live collector requested shutdown started",
+                extra={
+                    "run_id": self.run_id,
+                    "process_memory": process_memory_snapshot(),
+                },
+            )
             await self._shutdown_tasks()
             await self.writer.stop()
             archive_degraded = bool(
@@ -163,7 +207,21 @@ class LiveCollector:
                 rows_written=self.writer.rows_written,
                 coverage=self.coverage.metrics(),
             )
+            LOGGER.info(
+                "Live collector requested shutdown completed",
+                extra={
+                    "run_id": self.run_id,
+                    "process_memory": process_memory_snapshot(),
+                },
+            )
         except asyncio.CancelledError:
+            LOGGER.warning(
+                "Live collector task cancelled",
+                extra={
+                    "run_id": self.run_id,
+                    "process_memory": process_memory_snapshot(),
+                },
+            )
             self.stop.set()
             await self._shutdown_tasks()
             await self.writer.stop()
@@ -176,6 +234,14 @@ class LiveCollector:
             )
             raise
         except Exception as exc:
+            LOGGER.exception(
+                "Live collector lifecycle failed",
+                extra={
+                    "run_id": self.run_id,
+                    "error_type": type(exc).__name__,
+                    "process_memory": process_memory_snapshot(),
+                },
+            )
             self.stop.set()
             await self._shutdown_tasks()
             try:
@@ -242,28 +308,70 @@ class LiveCollector:
     async def _discovery_loop(self) -> None:
         attempt = 0
         while not self.stop.is_set():
+            cycle_started = time.monotonic()
             try:
+                self._discovery_cycle += 1
+                self._discovery_page_count = 0
                 self.discovery_state = "discovering"
+                LOGGER.info(
+                    "Live discovery cycle started",
+                    extra=self._discovery_diagnostics(),
+                )
 
                 async def on_page(page: list[MarketCandidate]) -> None:
+                    page_started = time.monotonic()
+                    self._discovery_page_count += 1
                     await self._merge_discovery_page(page)
+                    page_seconds = time.monotonic() - page_started
+                    self._record_discovery_stage("merge_page", page_seconds)
+                    if (
+                        self._discovery_page_count == 1
+                        or self._discovery_page_count % 25 == 0
+                    ):
+                        LOGGER.info(
+                            "Live discovery page applied",
+                            extra={
+                                **self._discovery_diagnostics(),
+                                "page_candidates": len(page),
+                                "stage_seconds": round(page_seconds, 6),
+                            },
+                        )
 
+                crawl_started = time.monotonic()
                 discovered = await self.polymarket_service.discover_live(
                     reconcile_absent=False,
                     on_page=on_page,
                 )
+                self._record_discovery_stage(
+                    "crawl", time.monotonic() - crawl_started
+                )
                 self._last_discovery = discovered
+                persist_started = time.monotonic()
                 await self._persist_selected_candidates(discovered)
+                self._record_discovery_stage(
+                    "persist_selected", time.monotonic() - persist_started
+                )
+                tiers_started = time.monotonic()
                 await self._apply_tiers(
                     discovered,
                     persist=True,
                     log_summary=True,
+                )
+                self._record_discovery_stage(
+                    "apply_tiers", time.monotonic() - tiers_started
                 )
                 # "ready" means the complete crawl, selected-market hydration,
                 # tier persistence, and desired socket reconciliation all
                 # succeeded. Setting it before those operations makes health
                 # checks and benchmarks observe a half-applied discovery.
                 self.discovery_state = "ready"
+                self._record_discovery_stage(
+                    "cycle", time.monotonic() - cycle_started
+                )
+                LOGGER.info(
+                    "Live discovery cycle completed",
+                    extra=self._discovery_diagnostics(),
+                )
                 self._schedule_absent_reconciliation(discovered)
                 await self._resolve_discovery_gaps()
                 attempt = 0
@@ -280,6 +388,12 @@ class LiveCollector:
                         "attempt": attempt,
                         "retry_delay_seconds": round(delay, 3),
                         "retained_partial_markets": len(self._last_discovery),
+                        "discovery_cycle": self._discovery_cycle,
+                        "discovery_pages": self._discovery_page_count,
+                        "cycle_seconds": round(
+                            time.monotonic() - cycle_started, 6
+                        ),
+                        "process_memory": process_memory_snapshot(),
                     },
                 )
                 await self._record_discovery_gap(exc, attempt, delay)
@@ -716,6 +830,8 @@ class LiveCollector:
             if self.writer.archive is not None:
                 snapshot["archive"] = self.writer.archive.metrics()
             snapshot["batch_writer"] = self.writer.metrics()
+            snapshot["discovery"] = self._discovery_diagnostics()
+            snapshot["process_memory"] = process_memory_snapshot()
             self.coverage.confirmed_subscribed = (
                 await self.database.active_subscribed_market_count(self.run_id)
             )
@@ -827,17 +943,75 @@ class LiveCollector:
 
     def _create_watched_task(self, coroutine: Any, *, name: str) -> asyncio.Task[None]:
         task = asyncio.create_task(coroutine, name=name)
+        LOGGER.info(
+            "Live collector supervised task started",
+            extra={"task_name": name},
+        )
         self._watch_task(task)
         return task
 
     def _watch_task(self, task: asyncio.Task[None]) -> None:
         def completed(done: asyncio.Task[None]) -> None:
-            if done.cancelled() or self.stop.is_set():
+            expected = self.stop.is_set()
+            if done.cancelled():
+                LOGGER.info(
+                    "Live collector supervised task exited",
+                    extra={
+                        "task_name": done.get_name(),
+                        "task_outcome": "cancelled",
+                        "expected_shutdown": expected,
+                    },
+                )
+                return
+            error = done.exception()
+            log = LOGGER.info if expected and error is None else LOGGER.error
+            log(
+                "Live collector supervised task exited",
+                extra={
+                    "task_name": done.get_name(),
+                    "task_outcome": "failed" if error is not None else "returned",
+                    "error_type": type(error).__name__ if error else None,
+                    "expected_shutdown": expected,
+                    "process_memory": process_memory_snapshot(),
+                },
+            )
+            if expected:
                 return
             if self._task_failure is not None and not self._task_failure.done():
-                self._task_failure.set_result((done.get_name(), done.exception()))
+                self._task_failure.set_result((done.get_name(), error))
 
         task.add_done_callback(completed)
+
+    def _record_discovery_stage(self, stage: str, seconds: float) -> None:
+        timing = self._discovery_stage_timings.setdefault(
+            stage,
+            {
+                "count": 0,
+                "seconds_total": 0.0,
+                "seconds_max": 0.0,
+                "seconds_last": 0.0,
+            },
+        )
+        timing["count"] = int(timing["count"]) + 1
+        timing["seconds_total"] = float(timing["seconds_total"]) + seconds
+        timing["seconds_max"] = max(float(timing["seconds_max"]), seconds)
+        timing["seconds_last"] = seconds
+
+    def _discovery_diagnostics(self) -> dict[str, Any]:
+        return {
+            "discovery_cycle": self._discovery_cycle,
+            "discovery_pages": self._discovery_page_count,
+            "retained_candidates": len(self._last_discovery),
+            "discovery_state": self.discovery_state,
+            "discovery_stages": {
+                stage: {
+                    key: round(float(value), 6) if key != "count" else int(value)
+                    for key, value in timing.items()
+                }
+                for stage, timing in sorted(self._discovery_stage_timings.items())
+            },
+            "process_memory": process_memory_snapshot(),
+        }
 
     async def _stop_market_tasks(self) -> None:
         shards = list(self.market_shards.values())

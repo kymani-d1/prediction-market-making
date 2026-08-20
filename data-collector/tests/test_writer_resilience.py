@@ -136,3 +136,30 @@ async def test_batch_writer_reports_queue_put_pressure_and_task_state() -> None:
     assert drained["max_queue_depth"] == 1
     await writer.stop()
     assert writer.metrics()["task_state"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_batch_writer_reports_route_timing_by_item_kind(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr("prediction_collector.writer.SLOW_ROUTE_SECONDS", 0.0)
+    caplog.set_level("WARNING", logger="prediction_collector.writer")
+    writer = BatchWriter(
+        FailingDatabase(),  # type: ignore[arg-type]
+        max_queue_size=10,
+        batch_size=10,
+        flush_interval_seconds=1,
+    )
+
+    await writer.put(WriteItem("trades", {"id": "trade", "raw_data": {}}))
+    await writer.put(
+        WriteItem("sports_feed_updates", {"id": "sport", "raw_data": {}})
+    )
+
+    metrics = writer.metrics()
+    assert metrics["route_count"] == 2
+    assert metrics["route_by_kind"]["trades"]["count"] == 1
+    assert metrics["route_by_kind"]["sports_feed_updates"]["count"] == 1
+    assert metrics["slow_route_warning_seconds"] == 0.0
+    assert "Slow writer route" in caplog.text

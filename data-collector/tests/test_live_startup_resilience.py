@@ -181,3 +181,47 @@ async def test_run_starts_background_feeds_without_initial_discovery_barrier() -
     await collector.run()
     assert started.is_set()
     assert collector.database.finished[0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_supervised_task_normal_return_is_reported_as_unexpected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    collector = LiveCollector.__new__(LiveCollector)
+    collector.stop = asyncio.Event()
+    collector._task_failure = asyncio.get_running_loop().create_future()
+    caplog.set_level("ERROR", logger="prediction_collector.jobs.live")
+
+    task = collector._create_watched_task(
+        asyncio.sleep(0), name="unexpected-return"
+    )
+    await task
+    await asyncio.sleep(0)
+
+    assert collector._task_failure.done()
+    assert collector._task_failure.result() == ("unexpected-return", None)
+    assert "Live collector supervised task exited" in caplog.text
+
+
+def test_discovery_diagnostics_are_bounded_stage_aggregates() -> None:
+    collector = LiveCollector.__new__(LiveCollector)
+    collector._discovery_cycle = 3
+    collector._discovery_page_count = 25
+    collector._last_discovery = [candidate("A")]
+    collector.discovery_state = "discovering"
+    collector._discovery_stage_timings = {}
+
+    collector._record_discovery_stage("crawl", 1.25)
+    collector._record_discovery_stage("crawl", 0.75)
+
+    diagnostics = collector._discovery_diagnostics()
+    assert diagnostics["discovery_cycle"] == 3
+    assert diagnostics["discovery_pages"] == 25
+    assert diagnostics["retained_candidates"] == 1
+    assert diagnostics["discovery_stages"]["crawl"] == {
+        "count": 2,
+        "seconds_total": 2.0,
+        "seconds_max": 1.25,
+        "seconds_last": 0.75,
+    }
+    assert "pid" in diagnostics["process_memory"]

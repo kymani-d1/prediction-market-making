@@ -365,6 +365,31 @@ def archive_settings(workspace_tmp_path: Path, **changes: Any) -> Settings:
     return replace(base, **values)
 
 
+@pytest.mark.asyncio
+async def test_journal_metrics_report_lock_append_and_fsync_by_stream(
+    workspace_tmp_path: Path,
+) -> None:
+    settings = archive_settings(workspace_tmp_path)
+    settings.archive_spool_directory.mkdir(parents=True)
+    writer = ArchiveWriter(
+        settings,
+        ArchiveDatabase(),
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+
+    await writer._append_journal(update_record("journal-metrics", "0.42"))
+
+    metrics = writer.metrics()
+    append = metrics["journal_append"]["orderbook_updates"]
+    assert append["count"] == 1
+    assert append["fsync_seconds_total"] >= 0
+    assert append["total_seconds_max"] >= append["fsync_seconds_total"]
+    lock = metrics["journal_lock"]
+    assert lock["locked"] is False
+    assert lock["owner"] is None
+    assert lock["stages"]["append"]["count"] == 1
+
+
 def add_archive_manifest(
     database: ArchiveDatabase,
     workspace_tmp_path: Path,

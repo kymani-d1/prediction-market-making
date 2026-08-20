@@ -11,6 +11,7 @@ from dataclasses import asdict
 from typing import Any
 
 from prediction_collector.archive import ArchiveWriter
+from prediction_collector.common.diagnostics import process_memory_snapshot
 from prediction_collector.common.http import AsyncHttpClient
 from prediction_collector.config import Settings
 from prediction_collector.database import Database
@@ -243,7 +244,14 @@ async def _live(
         )
         loop = asyncio.get_running_loop()
 
-        def request_stop(*_: object) -> None:
+        def request_stop(signum: int, *_: object) -> None:
+            LOGGER.warning(
+                "Collector process shutdown signal received",
+                extra={
+                    "signal_number": signum,
+                    "process_memory": process_memory_snapshot(),
+                },
+            )
             loop.call_soon_threadsafe(collector.stop.set)
 
         shutdown_signals = [signal.SIGINT, signal.SIGTERM]
@@ -255,6 +263,13 @@ async def _live(
             except (ValueError, OSError):
                 pass
         await collector.run()
+        LOGGER.info(
+            "Live collector returned to process entrypoint",
+            extra={
+                "requested_shutdown": collector.stop.is_set(),
+                "process_memory": process_memory_snapshot(),
+            },
+        )
 
 
 async def _smoke(settings: Settings) -> None:

@@ -13,6 +13,7 @@ from prediction_collector.archive import (
     ArchiveRecord,
     ArchiveWriter,
 )
+from prediction_collector.common.diagnostics import process_memory_snapshot
 from prediction_collector.common.utils import content_hash
 from prediction_collector.tiering import CollectionTier, TierManager
 
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
 
 
 LOGGER = logging.getLogger(__name__)
+SLOW_ROUTE_SECONDS = 0.5
+MAX_ROUTE_KINDS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +75,7 @@ class BatchWriter:
         self.route_seconds_total = 0.0
         self.route_seconds_max = 0.0
         self.route_seconds_last = 0.0
+        self._route_by_kind: dict[str, dict[str, float | int]] = {}
 
     @property
     def task(self) -> asyncio.Task[None] | None:
@@ -100,6 +104,36 @@ class BatchWriter:
             self.route_seconds_max = max(
                 self.route_seconds_max, route_seconds
             )
+            route_kind = item.kind
+            if (
+                route_kind not in self._route_by_kind
+                and len(self._route_by_kind) >= MAX_ROUTE_KINDS
+            ):
+                route_kind = "__other__"
+            timing = self._route_by_kind.setdefault(
+                route_kind,
+                {
+                    "count": 0,
+                    "seconds_total": 0.0,
+                    "seconds_max": 0.0,
+                    "seconds_last": 0.0,
+                },
+            )
+            timing["count"] = int(timing["count"]) + 1
+            timing["seconds_last"] = route_seconds
+            timing["seconds_total"] = float(timing["seconds_total"]) + route_seconds
+            timing["seconds_max"] = max(
+                float(timing["seconds_max"]), route_seconds
+            )
+            if route_seconds >= SLOW_ROUTE_SECONDS:
+                LOGGER.warning(
+                    "Slow writer route",
+                    extra={
+                        "item_kind": item.kind,
+                        "route_seconds": round(route_seconds, 6),
+                        "process_memory": process_memory_snapshot(),
+                    },
+                )
         if routed is not None:
             wait_started = time.monotonic()
             task = asyncio.current_task()
@@ -402,6 +436,16 @@ class BatchWriter:
             "route_seconds_total": round(self.route_seconds_total, 6),
             "route_seconds_max": round(self.route_seconds_max, 6),
             "route_seconds_last": round(self.route_seconds_last, 6),
+            "route_by_kind": {
+                kind: {
+                    "count": int(timing["count"]),
+                    "seconds_total": round(float(timing["seconds_total"]), 6),
+                    "seconds_max": round(float(timing["seconds_max"]), 6),
+                    "seconds_last": round(float(timing["seconds_last"]), 6),
+                }
+                for kind, timing in sorted(self._route_by_kind.items())
+            },
+            "slow_route_warning_seconds": SLOW_ROUTE_SECONDS,
             "task_state": task_state,
             "task_error_type": task_error,
             "rows_written": self.rows_written,

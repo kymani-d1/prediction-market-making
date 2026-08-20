@@ -10,6 +10,8 @@ import shutil
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -21,6 +23,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from botocore.config import Config
 
+from prediction_collector.common.diagnostics import process_memory_snapshot
 from prediction_collector.common.retry import RetryPolicy
 from prediction_collector.common.utils import (
     as_decimal,
@@ -36,6 +39,7 @@ SCHEMA_VERSION = 2
 RAW_REST_FRESH_ADMISSION_BURST = 4
 LIVE_FRESH_ADMISSION_WAIT_SECONDS = 0.01
 SLOW_LIVE_BATCH_SECONDS = 2.0
+SLOW_JOURNAL_OPERATION_SECONDS = 0.5
 
 SIDE_CODES = {"buy": 1, "bid": 1, "bids": 1, "yes": 1,
               "sell": 2, "ask": 2, "asks": 2, "no": 2}
@@ -577,6 +581,9 @@ class ArchiveWriter:
         # window currently queued, processing, or waiting for queue capacity.
         self._recovery_record_sources: dict[str, Path] = {}
         self._journal_lock = asyncio.Lock()
+        self._journal_lock_owner: dict[str, Any] | None = None
+        self._journal_lock_timings: dict[str, dict[str, float | int]] = {}
+        self._journal_append_timings: dict[str, dict[str, float | int]] = {}
         self._spill_replay_lock = asyncio.Lock()
         # A content-addressed spool filename is a process-local mutable resource
         # until its immutable remote object and manifest are committed. Lanes,
@@ -603,6 +610,7 @@ class ArchiveWriter:
         self._batch_processing_count = {"live": 0, "raw_rest": 0}
         self._slow_live_batch_count = 0
         self._max_batch_processing_seconds = {"live": 0.0, "raw_rest": 0.0}
+        self._last_compaction_diagnostics: dict[str, Any] = {}
         self._retry = RetryPolicy(
             max_attempts=settings.archive_upload_max_attempts,
             base_delay_seconds=0.5,
@@ -1017,6 +1025,8 @@ class ArchiveWriter:
             await self._durable_enqueue(dictionary_record)
 
     async def _append_journal(self, record: ArchiveRecord) -> None:
+        total_started = time.monotonic()
+        encoding_started = time.monotonic()
         entry = canonical_json(
             {
                 "record_id": record.record_id,
@@ -1028,14 +1038,20 @@ class ArchiveWriter:
             }
         )
         encoded_bytes = len((entry + "\n").encode("utf-8"))
+        encoding_seconds = time.monotonic() - encoding_started
 
-        def append() -> None:
+        def append() -> tuple[float, float]:
             with self._journal_path.open("a", encoding="utf-8") as handle:
+                write_started = time.monotonic()
                 handle.write(entry + "\n")
                 handle.flush()
+                write_flush_seconds = time.monotonic() - write_started
+                fsync_started = time.monotonic()
                 os.fsync(handle.fileno())
+                fsync_seconds = time.monotonic() - fsync_started
+            return write_flush_seconds, fsync_seconds
 
-        async with self._journal_lock:
+        async with self._journal_lock_scope("append"):
             if (
                 self._spool_bytes
                 + self._spool_reserved_bytes
@@ -1046,12 +1062,110 @@ class ArchiveWriter:
                 raise ArchiveBackpressureError(
                     "archive spool hard capacity exceeded before journal append"
                 )
-            await asyncio.to_thread(append)
+            write_flush_seconds, fsync_seconds = await asyncio.to_thread(append)
             self._spool_bytes += encoded_bytes
+        total_seconds = time.monotonic() - total_started
+        timing = self._journal_append_timings.setdefault(
+            record.stream,
+            {
+                "count": 0,
+                "encoding_seconds_total": 0.0,
+                "write_flush_seconds_total": 0.0,
+                "fsync_seconds_total": 0.0,
+                "total_seconds_total": 0.0,
+                "total_seconds_max": 0.0,
+                "total_seconds_last": 0.0,
+            },
+        )
+        timing["count"] = int(timing["count"]) + 1
+        timing["encoding_seconds_total"] = (
+            float(timing["encoding_seconds_total"]) + encoding_seconds
+        )
+        timing["write_flush_seconds_total"] = (
+            float(timing["write_flush_seconds_total"]) + write_flush_seconds
+        )
+        timing["fsync_seconds_total"] = (
+            float(timing["fsync_seconds_total"]) + fsync_seconds
+        )
+        timing["total_seconds_total"] = (
+            float(timing["total_seconds_total"]) + total_seconds
+        )
+        timing["total_seconds_last"] = total_seconds
+        timing["total_seconds_max"] = max(
+            float(timing["total_seconds_max"]), total_seconds
+        )
+        if total_seconds >= SLOW_JOURNAL_OPERATION_SECONDS:
+            LOGGER.warning(
+                "Slow durable journal append",
+                extra={
+                    "stream": record.stream,
+                    "encoded_bytes": encoded_bytes,
+                    "encoding_seconds": round(encoding_seconds, 6),
+                    "write_flush_seconds": round(write_flush_seconds, 6),
+                    "fsync_seconds": round(fsync_seconds, 6),
+                    "total_seconds": round(total_seconds, 6),
+                    "process_memory": process_memory_snapshot(),
+                },
+            )
+
+    @asynccontextmanager
+    async def _journal_lock_scope(self, stage: str) -> AsyncIterator[None]:
+        waiting_task = asyncio.current_task()
+        observed_owner = dict(self._journal_lock_owner or {})
+        wait_started = time.monotonic()
+        await self._journal_lock.acquire()
+        wait_seconds = time.monotonic() - wait_started
+        acquired_monotonic = time.monotonic()
+        self._journal_lock_owner = {
+            "stage": stage,
+            "task_name": waiting_task.get_name() if waiting_task else None,
+            "acquired_monotonic": acquired_monotonic,
+        }
+        try:
+            yield
+        finally:
+            hold_seconds = time.monotonic() - acquired_monotonic
+            self._journal_lock_owner = None
+            self._journal_lock.release()
+            timing = self._journal_lock_timings.setdefault(
+                stage,
+                {
+                    "count": 0,
+                    "wait_seconds_total": 0.0,
+                    "wait_seconds_max": 0.0,
+                    "wait_seconds_last": 0.0,
+                    "hold_seconds_total": 0.0,
+                    "hold_seconds_max": 0.0,
+                    "hold_seconds_last": 0.0,
+                },
+            )
+            timing["count"] = int(timing["count"]) + 1
+            for prefix, value in (("wait", wait_seconds), ("hold", hold_seconds)):
+                timing[f"{prefix}_seconds_last"] = value
+                timing[f"{prefix}_seconds_total"] = (
+                    float(timing[f"{prefix}_seconds_total"]) + value
+                )
+                timing[f"{prefix}_seconds_max"] = max(
+                    float(timing[f"{prefix}_seconds_max"]), value
+                )
+            if (
+                wait_seconds >= SLOW_JOURNAL_OPERATION_SECONDS
+                or hold_seconds >= SLOW_JOURNAL_OPERATION_SECONDS
+            ):
+                LOGGER.warning(
+                    "Slow durable journal lock operation",
+                    extra={
+                        "journal_stage": stage,
+                        "wait_seconds": round(wait_seconds, 6),
+                        "hold_seconds": round(hold_seconds, 6),
+                        "observed_owner": observed_owner or None,
+                        "process_memory": process_memory_snapshot(),
+                    },
+                )
 
     async def _rotate_inherited_journal(self) -> None:
         """Atomically detach the prior process's journal from new producers."""
-        async with self._journal_lock:
+        async with self._journal_lock_scope("rotate_inherited"):
             if (
                 not self._journal_path.is_file()
                 or self._journal_path.stat().st_size == 0
@@ -1123,7 +1237,7 @@ class ArchiveWriter:
                 path.unlink(missing_ok=True)
             return has_records
 
-        async with self._journal_lock:
+        async with self._journal_lock_scope("prune_recovery"):
             has_recovery_records = await asyncio.to_thread(prune_empty)
         # Recheck event-loop state after yielding for the filesystem pass.
         if (
@@ -1163,7 +1277,7 @@ class ArchiveWriter:
                         return value, path
             return None
 
-        async with self._journal_lock:
+        async with self._journal_lock_scope("read_recovery"):
             recovered = await asyncio.to_thread(read_one)
         if recovered is None:
             return None
@@ -1223,7 +1337,7 @@ class ArchiveWriter:
                 current_size = path.stat().st_size
             return current_size - previous_size
 
-        async with self._journal_lock:
+        async with self._journal_lock_scope("acknowledge"):
             for source, acknowledged in by_source.items():
                 size_delta = await asyncio.to_thread(
                     rewrite, source, acknowledged
@@ -1234,7 +1348,7 @@ class ArchiveWriter:
                         self._recovery_record_sources.pop(record_id, None)
 
     async def _refresh_spool_bytes(self) -> int:
-        async with self._journal_lock:
+        async with self._journal_lock_scope("refresh_spool_bytes"):
             size = await asyncio.to_thread(
                 _directory_size, self.settings.archive_spool_directory
             )
@@ -1242,7 +1356,7 @@ class ArchiveWriter:
         return size
 
     async def _reserve_spool_serialization(self, amount: int) -> bool:
-        async with self._journal_lock:
+        async with self._journal_lock_scope("reserve_spool"):
             if (
                 self._spool_bytes + self._spool_reserved_bytes + amount
                 > self.settings.archive_spool_max_bytes
@@ -1252,7 +1366,7 @@ class ArchiveWriter:
             return True
 
     async def _release_spool_serialization(self, amount: int) -> None:
-        async with self._journal_lock:
+        async with self._journal_lock_scope("release_spool"):
             self._spool_reserved_bytes = max(
                 0, self._spool_reserved_bytes - amount
             )
@@ -1666,12 +1780,26 @@ class ArchiveWriter:
         replacement_id: int | None = None
         digest: str | None = None
         owner_token: object | None = None
+        compaction_started = time.monotonic()
+        compaction_diagnostics: dict[str, Any] = {
+            "compaction_id": compaction_id,
+            "source_objects": len(candidates),
+            "source_compressed_bytes": sum(
+                int(value["compressed_bytes"]) for value in candidates
+            ),
+            "memory_before": process_memory_snapshot(),
+        }
+        LOGGER.info(
+            "Archive compaction started",
+            extra=compaction_diagnostics,
+        )
         try:
             stream = str(candidates[0]["stream"])
             schema_version = int(candidates[0]["schema_version"])
             if schema_version != SCHEMA_VERSION:
                 raise ValueError("compaction only merges the current schema version")
             tables: list[pa.Table] = []
+            read_started = time.monotonic()
             for candidate in candidates:
                 local = self.settings.archive_spool_directory / (
                     f"compact-source-{compaction_id}-{int(candidate['id'])}.parquet"
@@ -1679,8 +1807,21 @@ class ArchiveWriter:
                 await self.object_store.download(str(candidate["object_key"]), local)
                 local_inputs.append(local)
                 tables.append(await asyncio.to_thread(pq.read_table, local))
+            compaction_diagnostics["download_read_seconds"] = round(
+                time.monotonic() - read_started, 6
+            )
+            compaction_diagnostics["memory_after_reads"] = (
+                process_memory_snapshot()
+            )
             expected_rows = sum(int(value["row_count"]) for value in candidates)
+            concat_started = time.monotonic()
             table = pa.concat_tables(tables, promote_options="none")
+            compaction_diagnostics["concat_seconds"] = round(
+                time.monotonic() - concat_started, 6
+            )
+            compaction_diagnostics["memory_after_concat"] = (
+                process_memory_snapshot()
+            )
             if table.num_rows != expected_rows:
                 raise IOError(
                     f"compaction row mismatch: expected {expected_rows}, got {table.num_rows}"
@@ -1688,6 +1829,7 @@ class ArchiveWriter:
             provisional = self.settings.archive_spool_directory / (
                 f"compacting-{compaction_id}-{uuid.uuid4().hex}.parquet"
             )
+            write_started = time.monotonic()
             await asyncio.to_thread(
                 pq.write_table,
                 table,
@@ -1698,6 +1840,12 @@ class ArchiveWriter:
                 write_statistics=True,
                 row_group_size=self.settings.archive_row_group_rows,
                 data_page_size=1024 * 1024,
+            )
+            compaction_diagnostics["write_seconds"] = round(
+                time.monotonic() - write_started, 6
+            )
+            compaction_diagnostics["memory_after_write"] = (
+                process_memory_snapshot()
             )
             digest = await asyncio.to_thread(_sha256, provisional)
             owner_token = await self._claim_spool_object(digest, wait=True)
@@ -1787,9 +1935,40 @@ class ArchiveWriter:
                 int(value["compressed_bytes"]) for value in candidates
             )
             self.counters.compaction_bytes_after += int(head["ContentLength"])
+            compaction_diagnostics.update(
+                {
+                    "status": "completed",
+                    "rows": table.num_rows,
+                    "replacement_compressed_bytes": int(head["ContentLength"]),
+                    "total_seconds": round(
+                        time.monotonic() - compaction_started, 6
+                    ),
+                    "memory_after": process_memory_snapshot(),
+                }
+            )
+            self._last_compaction_diagnostics = compaction_diagnostics
+            LOGGER.info(
+                "Archive compaction completed",
+                extra=compaction_diagnostics,
+            )
             return True
         except Exception as exc:
             self.counters.compaction_failures += 1
+            compaction_diagnostics.update(
+                {
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "total_seconds": round(
+                        time.monotonic() - compaction_started, 6
+                    ),
+                    "memory_after": process_memory_snapshot(),
+                }
+            )
+            self._last_compaction_diagnostics = compaction_diagnostics
+            LOGGER.error(
+                "Archive compaction failed",
+                extra=compaction_diagnostics,
+            )
             if replacement_id is not None and hasattr(
                 self.database, "abandon_archive_object"
             ):
@@ -2250,7 +2429,7 @@ class ArchiveWriter:
                         values_by_id.setdefault(record_id, value)
             return list(values_by_id.values())
 
-        async with self._journal_lock:
+        async with self._journal_lock_scope("read_spilled"):
             values = await asyncio.to_thread(read_spilled)
         # Replay latency-sensitive live evidence first, then use the dedicated
         # REST lane for replayable pages. Numeric priority remains a useful
@@ -2518,6 +2697,56 @@ class ArchiveWriter:
             "journal_recovery_pending": (
                 not self._journal_recovery_complete.is_set()
             ),
+            "journal_lock": {
+                "locked": self._journal_lock.locked(),
+                "owner": (
+                    {
+                        **self._journal_lock_owner,
+                        "held_seconds": round(
+                            max(
+                                0.0,
+                                now_monotonic
+                                - float(
+                                    self._journal_lock_owner[
+                                        "acquired_monotonic"
+                                    ]
+                                ),
+                            ),
+                            6,
+                        ),
+                    }
+                    if self._journal_lock_owner is not None
+                    else None
+                ),
+                "stages": {
+                    stage: {
+                        key: (
+                            round(float(value), 6)
+                            if key != "count"
+                            else int(value)
+                        )
+                        for key, value in timing.items()
+                    }
+                    for stage, timing in sorted(
+                        self._journal_lock_timings.items()
+                    )
+                },
+                "slow_warning_seconds": SLOW_JOURNAL_OPERATION_SECONDS,
+            },
+            "journal_append": {
+                stream: {
+                    key: (
+                        round(float(value), 6)
+                        if key != "count"
+                        else int(value)
+                    )
+                    for key, value in timing.items()
+                }
+                for stream, timing in sorted(
+                    self._journal_append_timings.items()
+                )
+            },
+            "process_memory": process_memory_snapshot(),
             "objects_uploaded": self.counters.objects_uploaded,
             "rows_uploaded": self.counters.rows_uploaded,
             "uncompressed_bytes_uploaded": self.counters.uncompressed_bytes,
@@ -2555,6 +2784,7 @@ class ArchiveWriter:
                 "bytes_before": self.counters.compaction_bytes_before,
                 "bytes_after": self.counters.compaction_bytes_after,
                 "failures": self.counters.compaction_failures,
+                "last": dict(self._last_compaction_diagnostics),
             },
             "batch_processing": {
                 "batches_total": dict(self._batch_processing_count),
