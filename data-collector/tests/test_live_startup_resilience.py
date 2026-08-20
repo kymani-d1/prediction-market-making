@@ -225,3 +225,31 @@ def test_discovery_diagnostics_are_bounded_stage_aggregates() -> None:
         "seconds_last": 0.75,
     }
     assert "pid" in diagnostics["process_memory"]
+
+
+@pytest.mark.asyncio
+async def test_large_tier_evaluation_is_dispatched_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = LiveCollector.__new__(LiveCollector)
+    collector.tier_manager = tier_manager()
+    dispatched: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def to_thread(
+        function: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        dispatched.append((function, args, kwargs))
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", to_thread)
+
+    assignments = await collector._evaluate_tiers_off_loop([candidate("A")])
+
+    assert dispatched == [
+        (
+            collector.tier_manager.evaluate,
+            ([candidate("A")],),
+            {"retain_metadata_assignments": False},
+        )
+    ]
+    assert [assignment.market.external_id for assignment in assignments] == ["A"]

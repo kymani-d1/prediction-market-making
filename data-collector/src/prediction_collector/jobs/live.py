@@ -417,15 +417,27 @@ class LiveCollector:
     async def _persist_selected_candidates(
         self, candidates: list[MarketCandidate]
     ) -> None:
-        assignments = self.tier_manager.evaluate(
-            candidates, retain_metadata_assignments=False
-        )
+        async with self._selection_lock:
+            assignments = await self._evaluate_tiers_off_loop(candidates)
         selected = [
             assignment.market
             for assignment in assignments
             if assignment.tier is not CollectionTier.METADATA_ONLY
         ]
         await self.polymarket_service.persist_live_candidates(selected)
+
+    async def _evaluate_tiers_off_loop(
+        self, candidates: list[MarketCandidate]
+    ) -> list[TierAssignment]:
+        # A production universe currently contains roughly 177k markets. The
+        # deterministic score/sort pass is CPU-bound and previously blocked the
+        # event loop for several seconds, delaying durable journal producers
+        # even though their fsyncs had already completed.
+        return await asyncio.to_thread(
+            self.tier_manager.evaluate,
+            candidates,
+            retain_metadata_assignments=False,
+        )
 
     def _incremental_subscription_ceiling_reached(self) -> bool:
         full_limit = self.tier_manager.full_l2_max_markets
@@ -447,9 +459,7 @@ class LiveCollector:
         log_summary: bool,
     ) -> None:
         async with self._selection_lock:
-            assignments = self.tier_manager.evaluate(
-                candidates, retain_metadata_assignments=False
-            )
+            assignments = await self._evaluate_tiers_off_loop(candidates)
             subscribed = [
                 assignment.market
                 for assignment in assignments
