@@ -397,6 +397,9 @@ async def test_journal_ack_rewrite_does_not_block_new_durable_appends(
     workspace_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "prediction_collector.archive.JOURNAL_ACK_REWRITE_RECORDS", 1
+    )
     settings = archive_settings(workspace_tmp_path)
     settings.archive_spool_directory.mkdir(parents=True)
     writer = ArchiveWriter(
@@ -445,6 +448,59 @@ async def test_journal_ack_rewrite_does_not_block_new_durable_appends(
     assert acknowledged.record_id not in record_ids
     assert record_ids.count(retained.record_id) == 1
     assert record_ids.count(appended_during_rewrite.record_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_journal_acknowledgements_are_coalesced_before_rewrite(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "prediction_collector.archive.JOURNAL_ACK_REWRITE_RECORDS", 3
+    )
+    settings = archive_settings(workspace_tmp_path)
+    settings.archive_spool_directory.mkdir(parents=True)
+    writer = ArchiveWriter(
+        settings,
+        ArchiveDatabase(),
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    records = [
+        update_record(f"coalesced-{index}", f"0.4{index}")
+        for index in range(5)
+    ]
+    for record in records:
+        await writer._append_journal(record)
+
+    replacements = 0
+    original_replace = _atomic_replace
+
+    def count_rewrite(source: Path, target: Path) -> None:
+        nonlocal replacements
+        if source.name.endswith(".tmp"):
+            replacements += 1
+        original_replace(source, target)
+
+    monkeypatch.setattr(
+        "prediction_collector.archive._atomic_replace", count_rewrite
+    )
+    await writer._acknowledge_journal([records[0]])
+    await writer._acknowledge_journal([records[1]])
+    assert replacements == 0
+    assert writer.metrics()["journal_acknowledgement"]["pending_records"] == 2
+
+    await writer._acknowledge_journal([records[2]])
+    assert replacements == 1
+    assert writer.metrics()["journal_acknowledgement"]["pending_records"] == 0
+
+    await writer._acknowledge_journal([records[3]])
+    await writer._acknowledge_journal([records[4]])
+    assert replacements == 1
+    acknowledgement = writer.metrics()["journal_acknowledgement"]
+    assert acknowledgement["records_total"] == 5
+    assert acknowledgement["rewrites_total"] == 1
+    assert acknowledgement["segments_deleted_total"] == 1
+    assert not writer._recovery_journal_paths()
 
 
 def add_archive_manifest(

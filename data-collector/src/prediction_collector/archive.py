@@ -40,6 +40,7 @@ RAW_REST_FRESH_ADMISSION_BURST = 4
 LIVE_FRESH_ADMISSION_WAIT_SECONDS = 0.01
 SLOW_LIVE_BATCH_SECONDS = 2.0
 SLOW_JOURNAL_OPERATION_SECONDS = 0.5
+JOURNAL_ACK_REWRITE_RECORDS = 256
 
 SIDE_CODES = {"buy": 1, "bid": 1, "bids": 1, "yes": 1,
               "sell": 2, "ask": 2, "asks": 2, "no": 2}
@@ -588,6 +589,13 @@ class ArchiveWriter:
         self._journal_maintenance_lock = asyncio.Lock()
         self._journal_record_sources: dict[str, Path] = {}
         self._active_journal_record_ids: set[str] = set()
+        self._pending_journal_acknowledgements: dict[Path, set[str]] = (
+            defaultdict(set)
+        )
+        self._journal_segment_unacknowledged: dict[Path, int] = {}
+        self._journal_acknowledged_records = 0
+        self._journal_ack_rewrites = 0
+        self._journal_ack_segments_deleted = 0
         self._journal_lock_owner: dict[str, Any] | None = None
         self._journal_lock_timings: dict[str, dict[str, float | int]] = {}
         self._journal_append_timings: dict[str, dict[str, float | int]] = {}
@@ -1207,7 +1215,9 @@ class ArchiveWriter:
                 os.fsync(handle.fileno())
 
         await asyncio.to_thread(rotate)
-        for record_id in self._active_journal_record_ids:
+        segment_record_ids = set(self._active_journal_record_ids)
+        self._journal_segment_unacknowledged[segment] = len(segment_record_ids)
+        for record_id in segment_record_ids:
             if self._journal_record_sources.get(record_id) == self._journal_path:
                 self._journal_record_sources[record_id] = segment
         self._active_journal_record_ids.clear()
@@ -1297,10 +1307,9 @@ class ArchiveWriter:
     ) -> tuple[ArchiveRecord, Path] | None:
         """Read at most one unclaimed row, keeping recovery memory bounded."""
 
-        excluded_record_ids = set(self._recovery_record_sources)
-        excluded_record_ids.update(self._active_record_ids)
-
-        def read_one() -> tuple[dict[str, Any], Path] | None:
+        def read_one(
+            excluded_record_ids: set[str],
+        ) -> tuple[dict[str, Any], Path] | None:
             for path in self._recovery_journal_paths():
                 with path.open("r", encoding="utf-8") as handle:
                     for line in handle:
@@ -1314,8 +1323,14 @@ class ArchiveWriter:
             return None
 
         async with self._journal_maintenance_lock:
+            excluded_record_ids = set(self._recovery_record_sources)
+            excluded_record_ids.update(self._active_record_ids)
+            for acknowledged in self._pending_journal_acknowledgements.values():
+                excluded_record_ids.update(acknowledged)
             async with self._journal_lock_scope("read_recovery"):
-                recovered = await asyncio.to_thread(read_one)
+                recovered = await asyncio.to_thread(
+                    read_one, excluded_record_ids
+                )
         if recovered is None:
             return None
         value, source = recovered
@@ -1336,6 +1351,11 @@ class ArchiveWriter:
     async def _acknowledge_journal(self, records: list[ArchiveRecord]) -> None:
         if not records:
             return
+
+        def count_records(path: Path) -> int:
+            with path.open("r", encoding="utf-8") as handle:
+                return sum(bool(line.strip()) for line in handle)
+
         def rewrite(path: Path, acknowledged: set[str]) -> int:
             if not path.is_file():
                 raise FileNotFoundError(path)
@@ -1387,9 +1407,35 @@ class ArchiveWriter:
                 by_source[source].add(record.record_id)
 
             for source, acknowledged in by_source.items():
-                size_delta = await asyncio.to_thread(
-                    rewrite, source, acknowledged
+                if source not in self._journal_segment_unacknowledged:
+                    self._journal_segment_unacknowledged[source] = (
+                        await asyncio.to_thread(count_records, source)
+                    )
+                pending = self._pending_journal_acknowledgements[source]
+                newly_acknowledged = acknowledged - pending
+                pending.update(newly_acknowledged)
+                self._journal_acknowledged_records += len(newly_acknowledged)
+                unacknowledged = max(
+                    0,
+                    self._journal_segment_unacknowledged[source]
+                    - len(newly_acknowledged),
                 )
+                self._journal_segment_unacknowledged[source] = unacknowledged
+
+                size_delta = 0
+                if unacknowledged == 0:
+                    previous_size = source.stat().st_size if source.is_file() else 0
+                    source.unlink(missing_ok=True)
+                    size_delta = -previous_size
+                    self._pending_journal_acknowledgements.pop(source, None)
+                    self._journal_segment_unacknowledged.pop(source, None)
+                    self._journal_ack_segments_deleted += 1
+                elif len(pending) >= JOURNAL_ACK_REWRITE_RECORDS:
+                    size_delta = await asyncio.to_thread(
+                        rewrite, source, set(pending)
+                    )
+                    pending.clear()
+                    self._journal_ack_rewrites += 1
                 self._spool_bytes = max(0, self._spool_bytes + size_delta)
                 for record_id in acknowledged:
                     if self._recovery_record_sources.get(record_id) == source:
@@ -2801,6 +2847,19 @@ class ArchiveWriter:
                 for stream, timing in sorted(
                     self._journal_append_timings.items()
                 )
+            },
+            "journal_acknowledgement": {
+                "records_total": self._journal_acknowledged_records,
+                "rewrites_total": self._journal_ack_rewrites,
+                "segments_deleted_total": self._journal_ack_segments_deleted,
+                "pending_records": sum(
+                    len(record_ids)
+                    for record_ids in self._pending_journal_acknowledgements.values()
+                ),
+                "pending_segments": len(
+                    self._pending_journal_acknowledgements
+                ),
+                "rewrite_threshold_records": JOURNAL_ACK_REWRITE_RECORDS,
             },
             "process_memory": process_memory_snapshot(),
             "objects_uploaded": self.counters.objects_uploaded,
