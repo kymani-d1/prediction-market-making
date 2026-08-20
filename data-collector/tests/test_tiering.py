@@ -181,3 +181,45 @@ def test_restart_seed_preserves_dwell_then_allows_demotion() -> None:
     assert retained.tier is CollectionTier.SAMPLED
     demoted = value.evaluate([candidate], observed_at=NOW + timedelta(minutes=31))[0]
     assert demoted.tier is CollectionTier.METADATA_ONLY
+
+
+def test_bounded_live_evaluation_ranks_only_selected_assignments() -> None:
+    markets = [
+        market(
+            f"market-{index:04d}",
+            liquidity=str(10_000 + index),
+            volume_24h=str(index),
+        )
+        for index in range(1_000)
+    ]
+    first_manager = manager(
+        full_l2_min_score=Decimal("0"),
+        full_l2_min_liquidity=Decimal("0"),
+        sampled_promotion_score=Decimal("0"),
+    )
+    second_manager = manager(
+        full_l2_min_score=Decimal("0"),
+        full_l2_min_liquidity=Decimal("0"),
+        sampled_promotion_score=Decimal("0"),
+    )
+
+    first = first_manager.evaluate(
+        markets,
+        observed_at=NOW,
+        retain_metadata_assignments=False,
+    )
+    second = second_manager.evaluate(
+        reversed(markets),
+        observed_at=NOW,
+        retain_metadata_assignments=False,
+    )
+
+    assert [(item.market.external_id, item.tier) for item in first] == [
+        (item.market.external_id, item.tier) for item in second
+    ]
+    assert len(first) == 3
+    assert first_manager.counts() == {
+        CollectionTier.FULL_L2.value: 1,
+        CollectionTier.SAMPLED.value: 2,
+        CollectionTier.METADATA_ONLY.value: 997,
+    }

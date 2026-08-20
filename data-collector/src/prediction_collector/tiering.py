@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
+from heapq import nsmallest
 from typing import Iterable
 
 from prediction_collector.common.types import MarketCandidate
@@ -184,19 +185,35 @@ class TierManager:
                 (market, score, tuple(reasons), qualifies, interesting, sampled_eligible)
             )
 
-        scored.sort(key=lambda item: (-item[1], item[0].external_id))
+        score_order = lambda item: (-item[1], item[0].external_id)
         full_candidates = [item for item in scored if item[3]]
+        research: list[
+            tuple[MarketCandidate, Decimal, tuple[str, ...], bool, bool, bool]
+        ] = []
         if self.full_l2_max_markets:
             reserve = min(self.full_l2_research_reserve, self.full_l2_max_markets)
             # The reserve is deliberately exploratory: it may admit a
             # metadata-visible maker-reward, wide-spread, or near-resolution
             # market that has not yet cleared the ordinary FULL_L2 threshold.
-            # Selection remains deterministic because ``scored`` is ordered by
-            # score descending then external ID.
-            research = [item for item in scored if item[4]][:reserve]
+            # Selection remains deterministic without sorting the entire live
+            # universe: only the bounded winners need ordering.
+            research = nsmallest(
+                reserve,
+                (item for item in scored if item[4]),
+                key=score_order,
+            )
             research_ids = {item[0].external_id for item in research}
-            general = [item for item in full_candidates if item[0].external_id not in research_ids]
-            selected_full = research + general[: self.full_l2_max_markets - len(research)]
+            general_slots = self.full_l2_max_markets - len(research)
+            general = nsmallest(
+                general_slots,
+                (
+                    item
+                    for item in full_candidates
+                    if item[0].external_id not in research_ids
+                ),
+                key=score_order,
+            )
+            selected_full = research + general
         else:
             selected_full = full_candidates
         full_ids = {item[0].external_id for item in selected_full}
@@ -214,7 +231,11 @@ class TierManager:
             if item[0].external_id not in full_ids and item[5]
         ]
         sampled_items = (
-            remaining[: self.sampled_max_markets]
+            nsmallest(
+                self.sampled_max_markets,
+                remaining,
+                key=score_order,
+            )
             if self.sampled_max_markets
             else remaining
         )
