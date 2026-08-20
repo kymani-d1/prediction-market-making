@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from prediction_collector.archive import (
     ArchiveWriter,
     LocalObjectStore,
     RAW_REST_FRESH_ADMISSION_BURST,
+    _atomic_replace,
     _directory_size,
     stable_archive_key,
 )
@@ -388,6 +390,61 @@ async def test_journal_metrics_report_lock_append_and_fsync_by_stream(
     assert lock["locked"] is False
     assert lock["owner"] is None
     assert lock["stages"]["append"]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_journal_ack_rewrite_does_not_block_new_durable_appends(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = archive_settings(workspace_tmp_path)
+    settings.archive_spool_directory.mkdir(parents=True)
+    writer = ArchiveWriter(
+        settings,
+        ArchiveDatabase(),
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    acknowledged = update_record("acknowledged", "0.41")
+    retained = update_record("retained", "0.42")
+    appended_during_rewrite = update_record("concurrent", "0.43")
+    await writer._append_journal(acknowledged)
+    await writer._append_journal(retained)
+
+    rewrite_started = threading.Event()
+    release_rewrite = threading.Event()
+    original_replace = _atomic_replace
+
+    def gated_replace(source: Path, target: Path) -> None:
+        if source.name.endswith(".tmp"):
+            rewrite_started.set()
+            assert release_rewrite.wait(timeout=5)
+        original_replace(source, target)
+
+    monkeypatch.setattr(
+        "prediction_collector.archive._atomic_replace", gated_replace
+    )
+    acknowledgement = asyncio.create_task(
+        writer._acknowledge_journal([acknowledged])
+    )
+    assert await asyncio.to_thread(rewrite_started.wait, 1)
+
+    await asyncio.wait_for(
+        writer._append_journal(appended_during_rewrite), timeout=0.25
+    )
+    release_rewrite.set()
+    await asyncio.wait_for(acknowledgement, timeout=1)
+
+    journal_values = [
+        json.loads(line)
+        for path in [writer._journal_path, *writer._recovery_journal_paths()]
+        if path.is_file()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    record_ids = [str(value["record_id"]) for value in journal_values]
+    assert acknowledged.record_id not in record_ids
+    assert record_ids.count(retained.record_id) == 1
+    assert record_ids.count(appended_during_rewrite.record_id) == 1
 
 
 def add_archive_manifest(

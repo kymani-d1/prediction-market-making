@@ -581,6 +581,13 @@ class ArchiveWriter:
         # window currently queued, processing, or waiting for queue capacity.
         self._recovery_record_sources: dict[str, Path] = {}
         self._journal_lock = asyncio.Lock()
+        # Segment maintenance is serialized separately from the hot append
+        # lock. Acknowledgement may rewrite a large immutable journal segment,
+        # but current producers only need the append lock long enough to
+        # rotate that segment and publish their own fsynced row.
+        self._journal_maintenance_lock = asyncio.Lock()
+        self._journal_record_sources: dict[str, Path] = {}
+        self._active_journal_record_ids: set[str] = set()
         self._journal_lock_owner: dict[str, Any] | None = None
         self._journal_lock_timings: dict[str, dict[str, float | int]] = {}
         self._journal_append_timings: dict[str, dict[str, float | int]] = {}
@@ -1064,6 +1071,8 @@ class ArchiveWriter:
                 )
             write_flush_seconds, fsync_seconds = await asyncio.to_thread(append)
             self._spool_bytes += encoded_bytes
+            self._journal_record_sources[record.record_id] = self._journal_path
+            self._active_journal_record_ids.add(record.record_id)
         total_seconds = time.monotonic() - total_started
         timing = self._journal_append_timings.setdefault(
             record.stream,
@@ -1178,6 +1187,32 @@ class ArchiveWriter:
                 _atomic_replace, self._journal_path, recovery_path
             )
 
+    async def _rotate_active_journal_for_acknowledgement(self) -> Path:
+        """Detach the append journal while the caller owns the append lock."""
+        if (
+            not self._journal_path.is_file()
+            or self._journal_path.stat().st_size == 0
+        ):
+            raise FileNotFoundError(self._journal_path)
+        segment = self._journal_path.with_name(
+            f"ingress-journal.recovery-{uuid.uuid4().hex}.jsonl"
+        )
+
+        def rotate() -> None:
+            _atomic_replace(self._journal_path, segment)
+            # Preserve the long-standing empty-active-journal contract while
+            # subsequent appends are directed to a new inode.
+            with self._journal_path.open("a", encoding="utf-8") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+
+        await asyncio.to_thread(rotate)
+        for record_id in self._active_journal_record_ids:
+            if self._journal_record_sources.get(record_id) == self._journal_path:
+                self._journal_record_sources[record_id] = segment
+        self._active_journal_record_ids.clear()
+        return segment
+
     async def _recover_journal(self) -> None:
         """Replay inherited rows incrementally without delaying live startup."""
         if self._recovery_journal_paths():
@@ -1237,8 +1272,9 @@ class ArchiveWriter:
                 path.unlink(missing_ok=True)
             return has_records
 
-        async with self._journal_lock_scope("prune_recovery"):
-            has_recovery_records = await asyncio.to_thread(prune_empty)
+        async with self._journal_maintenance_lock:
+            async with self._journal_lock_scope("prune_recovery"):
+                has_recovery_records = await asyncio.to_thread(prune_empty)
         # Recheck event-loop state after yielding for the filesystem pass.
         if (
             has_recovery_records
@@ -1261,6 +1297,9 @@ class ArchiveWriter:
     ) -> tuple[ArchiveRecord, Path] | None:
         """Read at most one unclaimed row, keeping recovery memory bounded."""
 
+        excluded_record_ids = set(self._recovery_record_sources)
+        excluded_record_ids.update(self._active_record_ids)
+
         def read_one() -> tuple[dict[str, Any], Path] | None:
             for path in self._recovery_journal_paths():
                 with path.open("r", encoding="utf-8") as handle:
@@ -1269,16 +1308,14 @@ class ArchiveWriter:
                             continue
                         value = json.loads(line)
                         record_id = str(value["record_id"])
-                        if (
-                            record_id in self._recovery_record_sources
-                            or record_id in self._active_record_ids
-                        ):
+                        if record_id in excluded_record_ids:
                             continue
                         return value, path
             return None
 
-        async with self._journal_lock_scope("read_recovery"):
-            recovered = await asyncio.to_thread(read_one)
+        async with self._journal_maintenance_lock:
+            async with self._journal_lock_scope("read_recovery"):
+                recovered = await asyncio.to_thread(read_one)
         if recovered is None:
             return None
         value, source = recovered
@@ -1299,14 +1336,6 @@ class ArchiveWriter:
     async def _acknowledge_journal(self, records: list[ArchiveRecord]) -> None:
         if not records:
             return
-        by_source: dict[Path, set[str]] = defaultdict(set)
-        for record in records:
-            by_source[
-                self._recovery_record_sources.get(
-                    record.record_id, self._journal_path
-                )
-            ].add(record.record_id)
-
         def rewrite(path: Path, acknowledged: set[str]) -> int:
             if not path.is_file():
                 raise FileNotFoundError(path)
@@ -1337,7 +1366,26 @@ class ArchiveWriter:
                 current_size = path.stat().st_size
             return current_size - previous_size
 
-        async with self._journal_lock_scope("acknowledge"):
+        async with self._journal_maintenance_lock:
+            async with self._journal_lock_scope("rotate_for_acknowledge"):
+                if any(
+                    self._journal_record_sources.get(record.record_id)
+                    == self._journal_path
+                    for record in records
+                ):
+                    await self._rotate_active_journal_for_acknowledgement()
+
+            by_source: dict[Path, set[str]] = defaultdict(set)
+            for record in records:
+                source = self._recovery_record_sources.get(record.record_id)
+                if source is None:
+                    source = self._journal_record_sources.get(record.record_id)
+                if source is None:
+                    raise KeyError(
+                        f"journal source missing for record {record.record_id}"
+                    )
+                by_source[source].add(record.record_id)
+
             for source, acknowledged in by_source.items():
                 size_delta = await asyncio.to_thread(
                     rewrite, source, acknowledged
@@ -1346,6 +1394,8 @@ class ArchiveWriter:
                 for record_id in acknowledged:
                     if self._recovery_record_sources.get(record_id) == source:
                         self._recovery_record_sources.pop(record_id, None)
+                    if self._journal_record_sources.get(record_id) == source:
+                        self._journal_record_sources.pop(record_id, None)
 
     async def _refresh_spool_bytes(self) -> int:
         async with self._journal_lock_scope("refresh_spool_bytes"):
@@ -2404,6 +2454,11 @@ class ArchiveWriter:
             for record_id, source in self._recovery_record_sources.items()
             if record_id in self._spilled_record_ids
         }
+        source_paths.update(
+            source
+            for record_id, source in self._journal_record_sources.items()
+            if record_id in self._spilled_record_ids
+        )
         if self._journal_path.is_file():
             source_paths.add(self._journal_path)
         if not source_paths:
@@ -2429,8 +2484,9 @@ class ArchiveWriter:
                         values_by_id.setdefault(record_id, value)
             return list(values_by_id.values())
 
-        async with self._journal_lock_scope("read_spilled"):
-            values = await asyncio.to_thread(read_spilled)
+        async with self._journal_maintenance_lock:
+            async with self._journal_lock_scope("read_spilled"):
+                values = await asyncio.to_thread(read_spilled)
         # Replay latency-sensitive live evidence first, then use the dedicated
         # REST lane for replayable pages. Numeric priority remains a useful
         # ordering within the live lane, but must not put raw REST ahead of L2.
