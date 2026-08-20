@@ -346,19 +346,11 @@ class LiveCollector:
                     "crawl", time.monotonic() - crawl_started
                 )
                 self._last_discovery = discovered
-                persist_started = time.monotonic()
-                await self._persist_selected_candidates(discovered)
-                self._record_discovery_stage(
-                    "persist_selected", time.monotonic() - persist_started
-                )
-                tiers_started = time.monotonic()
-                await self._apply_tiers(
+                await self._persist_and_apply_tiers(
                     discovered,
                     persist=True,
                     log_summary=True,
-                )
-                self._record_discovery_stage(
-                    "apply_tiers", time.monotonic() - tiers_started
+                    record_stages=True,
                 )
                 # "ready" means the complete crawl, selected-market hydration,
                 # tier persistence, and desired socket reconciliation all
@@ -409,22 +401,56 @@ class LiveCollector:
         # repeatedly tears down healthy shards while discovery is still in
         # progress and can make a large crawl slower than its refresh period.
         if not self._incremental_subscription_ceiling_reached():
-            await self._persist_selected_candidates(self._last_discovery)
-            await self._apply_tiers(
-                self._last_discovery, persist=False, log_summary=False
+            await self._persist_and_apply_tiers(
+                self._last_discovery,
+                persist=False,
+                log_summary=False,
             )
 
-    async def _persist_selected_candidates(
-        self, candidates: list[MarketCandidate]
+    async def _persist_selected_assignments(
+        self, assignments: list[TierAssignment]
     ) -> None:
-        async with self._selection_lock:
-            assignments = await self._evaluate_tiers_off_loop(candidates)
         selected = [
             assignment.market
             for assignment in assignments
             if assignment.tier is not CollectionTier.METADATA_ONLY
         ]
         await self.polymarket_service.persist_live_candidates(selected)
+
+    async def _persist_and_apply_tiers(
+        self,
+        candidates: list[MarketCandidate],
+        *,
+        persist: bool,
+        log_summary: bool,
+        record_stages: bool = False,
+    ) -> None:
+        async with self._selection_lock:
+            evaluate_started = time.monotonic()
+            assignments = await self._evaluate_tiers_off_loop(candidates)
+            if record_stages:
+                self._record_discovery_stage(
+                    "evaluate_tiers", time.monotonic() - evaluate_started
+                )
+
+            persist_started = time.monotonic()
+            await self._persist_selected_assignments(assignments)
+            if record_stages:
+                self._record_discovery_stage(
+                    "persist_selected", time.monotonic() - persist_started
+                )
+
+            apply_started = time.monotonic()
+            await self._apply_tier_assignments(
+                candidates,
+                assignments,
+                persist=persist,
+                log_summary=log_summary,
+            )
+            if record_stages:
+                self._record_discovery_stage(
+                    "apply_tiers", time.monotonic() - apply_started
+                )
 
     async def _evaluate_tiers_off_loop(
         self, candidates: list[MarketCandidate]
@@ -460,71 +486,85 @@ class LiveCollector:
     ) -> None:
         async with self._selection_lock:
             assignments = await self._evaluate_tiers_off_loop(candidates)
-            subscribed = [
-                assignment.market
+            await self._apply_tier_assignments(
+                candidates,
+                assignments,
+                persist=persist,
+                log_summary=log_summary,
+            )
+
+    async def _apply_tier_assignments(
+        self,
+        candidates: list[MarketCandidate],
+        assignments: list[TierAssignment],
+        *,
+        persist: bool,
+        log_summary: bool,
+    ) -> None:
+        subscribed = [
+            assignment.market
+            for assignment in assignments
+            if assignment.tier is not CollectionTier.METADATA_ONLY
+        ]
+        selection = LiveSelection(
+            discovered=len(candidates),
+            active=sum(market.active for market in candidates),
+            tradable=sum(market.tradable for market in candidates),
+            subscribed=subscribed,
+            excluded=[],
+            excluded_total=len(candidates) - len(subscribed),
+        )
+        self.coverage = LiveCoverageState(
+            candidates=list(candidates),
+            selection=selection,
+            assignments=[
+                item
+                for item in assignments
+                if item.tier is not CollectionTier.METADATA_ONLY
+            ],
+            confirmed_subscribed=self.coverage.confirmed_subscribed,
+        )
+        if persist:
+            await self.database.record_tier_assignments(assignments)
+            confirmed = _confirmed_current_subscriptions(
+                subscribed,
+                await self.database.active_subscribed_market_ids(self.run_id),
+            )
+            self.coverage.confirmed_subscribed = len(confirmed)
+            reasons = {
+                ("polymarket", assignment.market.external_id): ",".join(
+                    assignment.reasons
+                )
                 for assignment in assignments
-                if assignment.tier is not CollectionTier.METADATA_ONLY
-            ]
-            selection = LiveSelection(
-                discovered=len(candidates),
-                active=sum(market.active for market in candidates),
-                tradable=sum(market.tradable for market in candidates),
-                subscribed=subscribed,
-                excluded=[],
-                excluded_total=len(candidates) - len(subscribed),
+                if assignment.tier is CollectionTier.METADATA_ONLY
+            }
+            await self.database.record_live_selection(
+                self.run_id,
+                [item.market for item in assignments],
+                confirmed,
+                reasons,
             )
-            self.coverage = LiveCoverageState(
-                candidates=list(candidates),
-                selection=selection,
-                assignments=[
-                    item
-                    for item in assignments
-                    if item.tier is not CollectionTier.METADATA_ONLY
-                ],
-                confirmed_subscribed=self.coverage.confirmed_subscribed,
+        # Reconcile desired state against the actual running shards on every
+        # pass. This is intentionally idempotent: if persistence or shard
+        # creation failed once, an unchanged next discovery still converges.
+        await self._reconcile_market_shards(subscribed)
+        if log_summary:
+            counts = self.tier_manager.counts()
+            bindings = self.tier_manager.ceiling_exclusions
+            LOGGER.info(
+                "Tier assignment summary",
+                extra={
+                    "discovered_markets": len(candidates),
+                    "active_markets": selection.active,
+                    "tradable_markets": selection.tradable,
+                    "full_l2_markets": counts[CollectionTier.FULL_L2.value],
+                    "sampled_markets": counts[CollectionTier.SAMPLED.value],
+                    "metadata_only_markets": counts[CollectionTier.METADATA_ONLY.value],
+                    "resource_ceiling_exclusions": bindings,
+                    "exclusion_reasons": self.tier_manager.exclusion_counts,
+                    "discovery_state": self.discovery_state,
+                },
             )
-            if persist:
-                await self.database.record_tier_assignments(assignments)
-                confirmed = _confirmed_current_subscriptions(
-                    subscribed,
-                    await self.database.active_subscribed_market_ids(self.run_id),
-                )
-                self.coverage.confirmed_subscribed = len(confirmed)
-                reasons = {
-                    ("polymarket", assignment.market.external_id): ",".join(
-                        assignment.reasons
-                    )
-                    for assignment in assignments
-                    if assignment.tier is CollectionTier.METADATA_ONLY
-                }
-                await self.database.record_live_selection(
-                    self.run_id,
-                    [item.market for item in assignments],
-                    confirmed,
-                    reasons,
-                )
-            # Reconcile desired state against the actual running shards on
-            # every pass. This is intentionally idempotent: if persistence or
-            # shard creation failed once, an unchanged next discovery still
-            # converges instead of assuming the previous desired set is live.
-            await self._reconcile_market_shards(subscribed)
-            if log_summary:
-                counts = self.tier_manager.counts()
-                bindings = self.tier_manager.ceiling_exclusions
-                LOGGER.info(
-                    "Tier assignment summary",
-                    extra={
-                        "discovered_markets": len(candidates),
-                        "active_markets": selection.active,
-                        "tradable_markets": selection.tradable,
-                        "full_l2_markets": counts[CollectionTier.FULL_L2.value],
-                        "sampled_markets": counts[CollectionTier.SAMPLED.value],
-                        "metadata_only_markets": counts[CollectionTier.METADATA_ONLY.value],
-                        "resource_ceiling_exclusions": bindings,
-                        "exclusion_reasons": self.tier_manager.exclusion_counts,
-                        "discovery_state": self.discovery_state,
-                    },
-                )
 
     async def _reconcile_market_shards(
         self, selected: list[MarketCandidate]

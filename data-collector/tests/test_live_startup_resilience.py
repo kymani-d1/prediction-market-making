@@ -64,15 +64,12 @@ async def test_incremental_discovery_retains_every_page_and_subscribes_before_co
         (),
         {"selection": None, "confirmed_subscribed": 0},
     )()
-    collector._persist_selected_candidates = (  # type: ignore[method-assign]
-        lambda _: asyncio.sleep(0)
-    )
     observed: list[list[str]] = []
 
     async def apply(candidates: list[MarketCandidate], **_: Any) -> None:
         observed.append(sorted(item.external_id for item in candidates))
 
-    collector._apply_tiers = apply  # type: ignore[method-assign]
+    collector._persist_and_apply_tiers = apply  # type: ignore[method-assign]
     await collector._merge_discovery_page([candidate("A"), candidate("B")])
     await collector._merge_discovery_page([candidate("C")])
     assert observed == [["A", "B"], ["A", "B", "C"]]
@@ -90,16 +87,13 @@ async def test_incremental_discovery_stops_rotating_shards_after_caps_are_full()
         (),
         {"selection": None, "confirmed_subscribed": 0},
     )()
-    collector._persist_selected_candidates = (  # type: ignore[method-assign]
-        lambda _: asyncio.sleep(0)
-    )
     observed: list[list[str]] = []
 
     async def apply(candidates: list[MarketCandidate], **_: Any) -> None:
         observed.append(sorted(item.external_id for item in candidates))
         collector.tier_manager.evaluate(candidates)
 
-    collector._apply_tiers = apply  # type: ignore[method-assign]
+    collector._persist_and_apply_tiers = apply  # type: ignore[method-assign]
     await collector._merge_discovery_page([candidate("A"), candidate("B")])
     await collector._merge_discovery_page([candidate("C")])
     assert sorted(item.external_id for item in collector._last_discovery) == [
@@ -253,3 +247,52 @@ async def test_large_tier_evaluation_is_dispatched_off_the_event_loop(
         )
     ]
     assert [assignment.market.external_id for assignment in assignments] == ["A"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_persists_and_applies_one_shared_tier_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = LiveCollector.__new__(LiveCollector)
+    collector._selection_lock = asyncio.Lock()
+    collector._discovery_stage_timings = {}
+    collector.discovery_state = "discovering"
+    collector.run_id = 1
+    collector.coverage = type("Coverage", (), {"confirmed_subscribed": 0})()
+    collector.tier_manager = capped_tier_manager()
+    original_evaluate = collector.tier_manager.evaluate
+    evaluations = 0
+
+    def evaluate(*args: Any, **kwargs: Any) -> Any:
+        nonlocal evaluations
+        evaluations += 1
+        return original_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(collector.tier_manager, "evaluate", evaluate)
+    persisted: list[str] = []
+
+    class Service:
+        async def persist_live_candidates(
+            self, values: list[MarketCandidate]
+        ) -> None:
+            persisted.extend(item.external_id for item in values)
+
+    collector.polymarket_service = Service()  # type: ignore[assignment]
+    collector._reconcile_market_shards = (  # type: ignore[method-assign]
+        lambda _: asyncio.sleep(0)
+    )
+
+    await collector._persist_and_apply_tiers(
+        [candidate("A"), candidate("B"), candidate("C")],
+        persist=False,
+        log_summary=False,
+        record_stages=True,
+    )
+
+    assert evaluations == 1
+    assert sorted(persisted) == ["A", "B"]
+    assert set(collector._discovery_stage_timings) == {
+        "evaluate_tiers",
+        "persist_selected",
+        "apply_tiers",
+    }

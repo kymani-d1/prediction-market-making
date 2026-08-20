@@ -2106,16 +2106,13 @@ async def test_live_discovery_raw_page_preempts_inherited_raw_rest_recovery(
             },
         },
     )()
-    collector._persist_selected_candidates = (  # type: ignore[method-assign]
-        lambda _: asyncio.sleep(0)
-    )
     shard_reconciliation_reached = asyncio.Event()
 
     async def apply_tiers(markets: list[Any], **_: Any) -> None:
         assert markets[0].external_id == raw_market["conditionId"]
         shard_reconciliation_reached.set()
 
-    collector._apply_tiers = apply_tiers  # type: ignore[method-assign]
+    collector._persist_and_apply_tiers = apply_tiers  # type: ignore[method-assign]
 
     discovering = asyncio.create_task(
         service.discover_live(
