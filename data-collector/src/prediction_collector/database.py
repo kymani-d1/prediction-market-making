@@ -29,6 +29,12 @@ from prediction_collector.migrations import migrate_database, verify_database_mi
 
 LOGGER = logging.getLogger(__name__)
 
+_POSTGRESQL_JSONB_MAX_CONTAINER_BYTES = 268_435_455
+# Keep each parameter far below PostgreSQL's hard JSONB container limit.  A
+# production backfill currently evaluates millions of markets, so bounding by
+# row count would still make payload size depend on reason and identifier size.
+_TIER_ASSIGNMENT_CHUNK_MAX_BYTES = 16 * 1024 * 1024
+
 
 _CURRENT_TIER_STATUS_SQL = """
     WITH latest_cohort AS (
@@ -161,6 +167,43 @@ class MetadataSyncDiagnostics:
 
 def _json(value: Any) -> Jsonb:
     return Jsonb(value if value is not None else {})
+
+
+def _tier_assignment_payload_chunks(
+    assignments: Iterable[Any],
+    *,
+    max_bytes: int = _TIER_ASSIGNMENT_CHUNK_MAX_BYTES,
+) -> Iterable[list[dict[str, Any]]]:
+    """Yield canonical-JSON-size-bounded tier-assignment payloads."""
+    if max_bytes < 2:
+        raise ValueError("tier assignment payload limit must fit a JSON array")
+
+    chunk: list[dict[str, Any]] = []
+    chunk_bytes = 2  # Opening and closing JSON array delimiters.
+    for item in assignments:
+        value = {
+            "external_id": item.market.external_id,
+            "tier": item.tier.value,
+            "score": str(item.score),
+            "reason_codes": list(item.reasons),
+            "ceiling_binding": item.ceiling_binding,
+        }
+        value_bytes = len(canonical_json(value).encode("utf-8"))
+        if value_bytes + 2 > max_bytes:
+            raise ValueError(
+                "one tier assignment exceeds the bounded JSON payload limit"
+            )
+        separator_bytes = 1 if chunk else 0
+        if chunk and chunk_bytes + separator_bytes + value_bytes > max_bytes:
+            yield chunk
+            chunk = []
+            chunk_bytes = 2
+            separator_bytes = 0
+        chunk.append(value)
+        chunk_bytes += separator_bytes + value_bytes
+
+    if chunk:
+        yield chunk
 
 
 def _compact_raw(value: Any, keys: Iterable[str]) -> dict[str, Any]:
@@ -2770,25 +2813,50 @@ class Database:
         cursor = await connection.execute(query, params)
         return max(cursor.rowcount, 0)
 
-    async def record_tier_assignments(self, assignments: Iterable[Any]) -> int:
-        values = list(assignments)
-        if not values:
-            return 0
+    async def record_tier_assignments(
+        self,
+        assignments: Iterable[Any],
+        *,
+        _max_payload_bytes: int = _TIER_ASSIGNMENT_CHUNK_MAX_BYTES,
+    ) -> int:
         now = utc_now()
-        payload = [
-            {
-                "external_id": item.market.external_id,
-                "tier": item.tier.value,
-                "score": str(item.score),
-                "reason_codes": list(item.reasons),
-                "ceiling_binding": item.ceiling_binding,
-            }
-            for item in values
-        ]
-        encoded = _json(json.loads(canonical_json(payload)))
+        changed = 0
+        processed = 0
         async with self.pool.connection() as connection:
             async with connection.transaction():
-                changed_row = await (
+                for payload in _tier_assignment_payload_chunks(
+                    assignments, max_bytes=_max_payload_bytes
+                ):
+                    # Use the same serializer used for the byte bound so the
+                    # transmitted JSON parameter cannot grow past it.
+                    encoded = Jsonb(payload, dumps=canonical_json)
+                    changed_rows = await (
+                        await connection.execute(
+                            """
+                            WITH input AS (
+                                SELECT * FROM jsonb_to_recordset(%s::JSONB) AS x(
+                                    external_id TEXT, tier TEXT, score NUMERIC,
+                                    reason_codes TEXT[], ceiling_binding BOOLEAN
+                                )
+                            )
+                            INSERT INTO market_collection_tier_history
+                                (market_id, previous_tier, tier, score, reason_codes,
+                                 ceiling_binding, evaluated_at)
+                            SELECT m.id, t.tier, i.tier, i.score, i.reason_codes,
+                                   i.ceiling_binding, %s
+                            FROM input i
+                            JOIN markets m
+                              ON m.exchange = 'polymarket'
+                             AND m.external_id = i.external_id
+                            LEFT JOIN market_collection_tiers t ON t.market_id = m.id
+                            WHERE t.tier IS DISTINCT FROM i.tier
+                            ON CONFLICT DO NOTHING
+                            RETURNING id
+                            """,
+                            (encoded, now),
+                        )
+                    ).fetchall()
+                    changed += len(changed_rows)
                     await connection.execute(
                         """
                         WITH input AS (
@@ -2797,67 +2865,45 @@ class Database:
                                 reason_codes TEXT[], ceiling_binding BOOLEAN
                             )
                         )
-                        INSERT INTO market_collection_tier_history
-                            (market_id, previous_tier, tier, score, reason_codes,
-                             ceiling_binding, evaluated_at)
-                        SELECT m.id, t.tier, i.tier, i.score, i.reason_codes,
-                               i.ceiling_binding, %s
+                        INSERT INTO market_collection_tiers
+                            (market_id, tier, score, reason_codes, signals,
+                             ceiling_binding, first_assigned_at, evaluated_at,
+                             promoted_at, demoted_at)
+                        SELECT m.id, i.tier, i.score, i.reason_codes,
+                               jsonb_build_object('policy_reasons', i.reason_codes),
+                               i.ceiling_binding, %s, %s,
+                               CASE WHEN i.tier = 'full_l2' THEN %s END,
+                               NULL
                         FROM input i
                         JOIN markets m
-                          ON m.exchange = 'polymarket' AND m.external_id = i.external_id
-                        LEFT JOIN market_collection_tiers t ON t.market_id = m.id
-                        WHERE t.tier IS DISTINCT FROM i.tier
-                        ON CONFLICT DO NOTHING
-                        RETURNING id
+                          ON m.exchange = 'polymarket'
+                         AND m.external_id = i.external_id
+                        ON CONFLICT (market_id) DO UPDATE SET
+                            tier = EXCLUDED.tier,
+                            score = EXCLUDED.score,
+                            reason_codes = EXCLUDED.reason_codes,
+                            signals = EXCLUDED.signals,
+                            ceiling_binding = EXCLUDED.ceiling_binding,
+                            evaluated_at = EXCLUDED.evaluated_at,
+                            promoted_at = CASE
+                                WHEN EXCLUDED.tier = 'full_l2'
+                                 AND market_collection_tiers.tier <> 'full_l2'
+                                THEN EXCLUDED.evaluated_at
+                                ELSE market_collection_tiers.promoted_at END,
+                            demoted_at = CASE
+                                WHEN EXCLUDED.tier <> 'full_l2'
+                                 AND market_collection_tiers.tier = 'full_l2'
+                                THEN EXCLUDED.evaluated_at
+                                ELSE market_collection_tiers.demoted_at END,
+                            updated_at = clock_timestamp()
                         """,
-                        (encoded, now),
+                        (encoded, now, now, now),
                     )
-                ).fetchall()
-                await connection.execute(
-                    """
-                    WITH input AS (
-                        SELECT * FROM jsonb_to_recordset(%s::JSONB) AS x(
-                            external_id TEXT, tier TEXT, score NUMERIC,
-                            reason_codes TEXT[], ceiling_binding BOOLEAN
-                        )
-                    )
-                    INSERT INTO market_collection_tiers
-                        (market_id, tier, score, reason_codes, signals,
-                         ceiling_binding, first_assigned_at, evaluated_at,
-                         promoted_at, demoted_at)
-                    SELECT m.id, i.tier, i.score, i.reason_codes,
-                           jsonb_build_object('policy_reasons', i.reason_codes),
-                           i.ceiling_binding, %s, %s,
-                           CASE WHEN i.tier = 'full_l2' THEN %s END,
-                           NULL
-                    FROM input i
-                    JOIN markets m
-                      ON m.exchange = 'polymarket' AND m.external_id = i.external_id
-                    ON CONFLICT (market_id) DO UPDATE SET
-                        tier = EXCLUDED.tier,
-                        score = EXCLUDED.score,
-                        reason_codes = EXCLUDED.reason_codes,
-                        signals = EXCLUDED.signals,
-                        ceiling_binding = EXCLUDED.ceiling_binding,
-                        evaluated_at = EXCLUDED.evaluated_at,
-                        promoted_at = CASE
-                            WHEN EXCLUDED.tier = 'full_l2'
-                             AND market_collection_tiers.tier <> 'full_l2'
-                            THEN EXCLUDED.evaluated_at
-                            ELSE market_collection_tiers.promoted_at END,
-                        demoted_at = CASE
-                            WHEN EXCLUDED.tier <> 'full_l2'
-                             AND market_collection_tiers.tier = 'full_l2'
-                            THEN EXCLUDED.evaluated_at
-                            ELSE market_collection_tiers.demoted_at END,
-                        updated_at = clock_timestamp()
-                    """,
-                    (encoded, now, now, now),
-                )
-        changed = len(changed_row)
+                    processed += len(payload)
         if changed:
             await self.metrics.rows("market_collection_tier_history", changed)
-        await self.metrics.rows("market_collection_tiers", len(values))
+        if processed:
+            await self.metrics.rows("market_collection_tiers", processed)
         return changed
 
     async def register_archive_object(self, **value: Any) -> int:
