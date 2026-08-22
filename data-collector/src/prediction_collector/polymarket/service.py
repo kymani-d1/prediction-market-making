@@ -808,6 +808,7 @@ class PolymarketService:
         counts = {
             "markets_checked": 0,
             "fee_versions_inserted": 0,
+            "fee_rates_unavailable": 0,
             "reward_records_seen": 0,
             "reward_versions_inserted": 0,
             "errors": 0,
@@ -868,6 +869,30 @@ class PolymarketService:
                         }
                     if rate is not None:
                         fee_values.append(rate)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 404:
+                        counts["fee_rates_unavailable"] += 1
+                        outcome_fees[token_id] = {
+                            "available": False,
+                            "http_status": 404,
+                            "reason": "clob_token_not_found",
+                        }
+                        continue
+                    counts["errors"] += 1
+                    LOGGER.exception(
+                        "Polymarket fee-rate collection failed",
+                        extra={"market": market.external_id, "token_id": token_id},
+                    )
+                    await self.database.record_gap(
+                        run_id=self.writer.run_id,
+                        connection_id=None,
+                        exchange="polymarket",
+                        channel="rest:fee-rate",
+                        market_external_id=market.external_id,
+                        outcome_external_id=token_id,
+                        gap_type="rest_collection_failed",
+                        reconnect_reason=f"{type(exc).__name__}: {exc}",
+                    )
                 except Exception as exc:
                     counts["errors"] += 1
                     LOGGER.exception(

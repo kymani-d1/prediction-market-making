@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
 
 from prediction_collector.common.types import MarketCandidate
@@ -162,6 +163,89 @@ async def test_fee_rate_is_normalized_from_basis_points_and_live_only() -> None:
     assert counts["markets_checked"] == 1
     assert database.fees[0]["fee_rate"] == Decimal("0.01")
     assert len([item for item in writer.items if item.kind == "raw_rest_payloads"]) == 2
+
+
+class StreamingEconomicsDatabase(EconomicsDatabase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gaps: list[dict[str, Any]] = []
+
+    async def live_candidates(self, exchange: str) -> list[MarketCandidate]:
+        raise AssertionError("the production fee path must not materialize all markets")
+
+    async def iter_live_candidates(self, exchange: str):  # type: ignore[no-untyped-def]
+        assert exchange == "polymarket"
+        yield MarketCandidate(
+            exchange="polymarket",
+            external_id="HISTORIC",
+            ticker=None,
+            status="closed",
+            active=False,
+            tradable=False,
+            outcome_token_ids=("MISSING-YES", "MISSING-NO"),
+        )
+
+    async def record_gap(self, **kwargs: Any) -> None:
+        self.gaps.append(kwargs)
+
+
+class MissingFeeRest:
+    def __init__(self) -> None:
+        self.tokens: list[str] = []
+
+    async def fee_rate(self, token_id: str) -> FakeResult:
+        self.tokens.append(token_id)
+        request = httpx.Request(
+            "GET", f"https://clob.polymarket.com/fee-rate?token_id={token_id}"
+        )
+        response = httpx.Response(404, request=request)
+        raise httpx.HTTPStatusError(
+            "fee configuration not found", request=request, response=response
+        )
+
+
+@pytest.mark.asyncio
+async def test_fee_rate_404_is_persisted_as_expected_token_absence() -> None:
+    rest = MissingFeeRest()
+    database = StreamingEconomicsDatabase()
+    writer = CapturingWriter()
+    service = PolymarketService(
+        rest=rest,  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        writer=writer,  # type: ignore[arg-type]
+    )
+
+    counts = await service.sync_fees_and_incentives(
+        include_fee_rates=True,
+        include_rewards=False,
+        fee_rate_live_only=False,
+    )
+
+    assert rest.tokens == ["MISSING-YES", "MISSING-NO"]
+    assert counts == {
+        "markets_checked": 1,
+        "fee_versions_inserted": 1,
+        "fee_rates_unavailable": 2,
+        "reward_records_seen": 0,
+        "reward_versions_inserted": 0,
+        "errors": 0,
+    }
+    assert database.gaps == []
+    assert database.fees[0]["configuration"] == {
+        "outcomes": {
+            "MISSING-YES": {
+                "available": False,
+                "http_status": 404,
+                "reason": "clob_token_not_found",
+            },
+            "MISSING-NO": {
+                "available": False,
+                "http_status": 404,
+                "reason": "clob_token_not_found",
+            },
+        }
+    }
+    assert writer.items == []
 
 
 def test_transport_wrappers_do_not_change_semantic_fee_digest() -> None:
