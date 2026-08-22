@@ -31,6 +31,7 @@ class MarketCandidate:
     aliases: tuple[str, ...] = ()
     source_id: str | None = None
     event_external_id: str | None = None
+    open_time: datetime | None = None
     raw_data: JsonObject = field(default_factory=dict)
 
     @property

@@ -83,6 +83,20 @@ class PolymarketService:
         self._live_persisted_ids: set[str] = set()
         self.stale_checkpoint_cursor_replays = 0
 
+    async def _iter_database_candidates(
+        self, exchange: str
+    ) -> AsyncIterator[MarketCandidate]:
+        iterator = getattr(self.database, "iter_live_candidates", None)
+        if iterator is not None:
+            async for market in iterator(exchange):
+                yield market
+            return
+        # Narrow test doubles and alternate Database implementations may only
+        # expose the original materialized method. Production uses keyset
+        # batches through Database.iter_live_candidates().
+        for market in await self.database.live_candidates(exchange):
+            yield market
+
     async def sync_metadata(self, *, include_closed: bool = True) -> dict[str, Any]:
         counts: dict[str, Any] = {
             "series": 0,
@@ -644,7 +658,6 @@ class PolymarketService:
         # windows are recursively bisected.  A one-second window that still
         # contains 20,000 records is retained as explicitly partial rather than
         # silently certified as complete.
-        markets = await self.database.live_candidates("polymarket")
         parsed_count = 0
         saturated_markets = 0
         saturated_windows = 0
@@ -653,20 +666,13 @@ class PolymarketService:
         pages_fetched = 0
         windows_completed = 0
         page_size = 10_000
-        for market in markets:  # Live tier ceilings never enter this path.
+        async for market in self._iter_database_candidates("polymarket"):
+            # Live tier ceilings never enter this path.
             markets_queried += 1
             market_saturated = False
             end = int(utc_now().timestamp())
             documented_floor = end - (3 * 365 * 24 * 60 * 60)
-            opened_at = parse_timestamp(
-                first_present(
-                    market.raw_data,
-                    "startDate",
-                    "startTime",
-                    "start_date",
-                    "open_time",
-                )
-            )
+            opened_at = market.open_time
             opened_epoch = int(opened_at.timestamp()) if opened_at else None
             start = max(documented_floor, opened_epoch or documented_floor)
             if opened_epoch is not None and opened_epoch < documented_floor:
@@ -809,11 +815,7 @@ class PolymarketService:
         # Fee rates require one request per outcome token. Explicit backfills
         # retain that comprehensive behavior; periodic live refreshes can skip
         # it while still collecting both current reward variants below.
-        markets = (
-            await self.database.live_candidates("polymarket")
-            if include_fee_rates
-            else []
-        )
+        selected: set[str] | None = None
         if fee_rate_live_only:
             # Continuous authoritative per-token requests are resource-heavy.
             # Limit them to the currently subscribed research universe; the
@@ -821,13 +823,18 @@ class PolymarketService:
             selected = await self.database.collection_tier_market_ids(
                 ("full_l2", "sampled")
             )
-            markets = [
-                market
-                for market in markets
-                if market.active and market.tradable
+        markets = (
+            self._iter_database_candidates("polymarket")
+            if include_fee_rates
+            else _empty_market_candidates()
+        )
+        async for market in markets:
+            if selected is not None and not (
+                market.active
+                and market.tradable
                 and market.external_id in selected
-            ]
-        for market in markets:
+            ):
+                continue
             counts["markets_checked"] += 1
             observed_at = utc_now()
             outcome_fees: dict[str, Any] = {}
@@ -1063,8 +1070,8 @@ class PolymarketService:
 
     async def backfill_market_data(self) -> dict[str, int]:
         counts = {"books": 0, "price_points": 0, "holders": 0}
-        markets = await self.database.live_candidates("polymarket")
-        for market in markets:  # deliberately all markets; live caps never enter this path
+        async for market in self._iter_database_candidates("polymarket"):
+            # Deliberately all markets; live caps never enter this path.
             for token_id in market.outcome_token_ids:
                 if market.active and market.tradable:
                     try:
@@ -1224,6 +1231,11 @@ class PolymarketService:
         await self._raw_page(
             source, endpoint, entity_type, result.data, result, external_key=external_key
         )
+
+
+async def _empty_market_candidates() -> AsyncIterator[MarketCandidate]:
+    if False:
+        yield MarketCandidate("", "", None, None, False, False)
 
 
 def _as_dict_list(value: Any) -> list[dict[str, Any]]:

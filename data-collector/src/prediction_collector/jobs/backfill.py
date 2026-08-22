@@ -25,7 +25,13 @@ async def run_polymarket_backfill(
             assignments = writer.tier_manager.evaluate(
                 await service.database.live_candidates("polymarket")
             )
-            await service.database.record_tier_assignments(assignments)
+            try:
+                await service.database.record_tier_assignments(assignments)
+            finally:
+                # Every assignment owns its MarketCandidate. Retaining this
+                # multi-million-row graph while the next phase reads the same
+                # universe is the difference between one cohort and two.
+                del assignments
             details["tiers"] = writer.tier_manager.counts()
         details["fees_incentives"] = await service.sync_fees_and_incentives(
             include_fee_rates=True,

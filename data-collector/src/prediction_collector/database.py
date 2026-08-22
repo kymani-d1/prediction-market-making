@@ -5,7 +5,7 @@ import json
 import logging
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -204,6 +204,29 @@ def _tier_assignment_payload_chunks(
 
     if chunk:
         yield chunk
+
+
+def _market_candidate_from_row(row: Mapping[str, Any]) -> MarketCandidate:
+    return MarketCandidate(
+        exchange=str(row["exchange"]),
+        external_id=str(row["external_id"]),
+        ticker=row["ticker"],
+        status=row["status"],
+        active=bool(row["is_active"]),
+        tradable=bool(row["is_tradable"]),
+        closed=str(row["status"] or "").lower()
+        in {"closed", "resolved", "settled", "finalized"},
+        archived=bool(row["archived"]),
+        accepting_orders=bool(row["accepting_orders"]),
+        enable_order_book=bool(row["enable_order_book"]),
+        volume=row["volume"],
+        volume_24h=row["volume_24h"],
+        liquidity=row["liquidity"],
+        has_maker_rewards=bool(row["has_maker_rewards"]),
+        open_time=row["open_time"],
+        close_time=row["close_time"],
+        outcome_token_ids=tuple(row["token_ids"]),
+    )
 
 
 def _compact_raw(value: Any, keys: Iterable[str]) -> dict[str, Any]:
@@ -2151,53 +2174,85 @@ class Database:
             return None
         return str(row["cursor"])
 
+    async def iter_live_candidates(
+        self,
+        exchange: str,
+        *,
+        batch_size: int = 1_000,
+    ) -> AsyncIterator[MarketCandidate]:
+        """Stream a complete exchange universe without a long-lived DB cursor."""
+        if batch_size <= 0:
+            raise ValueError("candidate batch size must be positive")
+
+        after_external_id = ""
+        while True:
+            async with self.pool.connection() as connection:
+                rows = await (
+                    await connection.execute(
+                        """
+                        SELECT candidate.exchange, candidate.external_id,
+                               candidate.ticker, candidate.status,
+                               candidate.is_active, candidate.is_tradable,
+                               candidate.archived, candidate.accepting_orders,
+                               candidate.enable_order_book, candidate.open_time,
+                               candidate.close_time, candidate.volume,
+                               candidate.volume_24h, candidate.liquidity,
+                               candidate.has_maker_rewards,
+                               COALESCE(tokens.token_ids, ARRAY[]::TEXT[])
+                                   AS token_ids
+                        FROM (
+                            SELECT m.id, m.exchange, m.external_id, m.ticker,
+                                   m.status, m.is_active, m.is_tradable,
+                                   m.archived, m.accepting_orders,
+                                   m.enable_order_book, m.open_time,
+                                   m.close_time, m.volume, m.volume_24h,
+                                   m.liquidity,
+                                   (m.raw_data ->> 'rewardsMinSize' IS NOT NULL
+                                    OR m.raw_data ->> 'rewardsMaxSpread' IS NOT NULL)
+                                       AS has_maker_rewards
+                            FROM markets m
+                            WHERE m.exchange = %s AND m.external_id > %s
+                            ORDER BY m.external_id
+                            LIMIT %s
+                        ) candidate
+                        LEFT JOIN LATERAL (
+                            SELECT array_agg(
+                                o.token_id
+                                ORDER BY o.outcome_index NULLS LAST, o.id
+                            ) AS token_ids
+                            FROM outcomes o
+                            WHERE o.market_id = candidate.id
+                              AND o.token_id IS NOT NULL
+                        ) tokens ON TRUE
+                        ORDER BY candidate.external_id
+                        """,
+                        (exchange, after_external_id, batch_size),
+                    )
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield _market_candidate_from_row(row)
+            after_external_id = str(rows[-1]["external_id"])
+
     async def live_candidates(
         self, exchange: str | None = None
     ) -> list[MarketCandidate]:
-        params: tuple[Any, ...] = () if exchange is None else (exchange,)
-        where = "" if exchange is None else "WHERE m.exchange = %s"
-        query = f"""
-            SELECT m.exchange, m.external_id, m.ticker, m.status, m.is_active,
-                   m.is_tradable, m.archived, m.accepting_orders,
-                   m.enable_order_book, m.close_time,
-                   m.volume, m.volume_24h, m.liquidity, m.raw_data,
-                   COALESCE(array_agg(o.token_id) FILTER (WHERE o.token_id IS NOT NULL), ARRAY[]::TEXT[]) AS token_ids
-            FROM markets m
-            LEFT JOIN outcomes o ON o.market_id = m.id
-            {where}
-            GROUP BY m.id
-            ORDER BY m.exchange, m.external_id
-        """
-        async with self.pool.connection() as connection:
-            rows = await (await connection.execute(query, params)).fetchall()
-        return [
-            MarketCandidate(
-                exchange=row["exchange"],
-                external_id=row["external_id"],
-                ticker=row["ticker"],
-                status=row["status"],
-                active=row["is_active"],
-                tradable=row["is_tradable"],
-                closed=str(row["status"] or "").lower()
-                in {"closed", "resolved", "settled", "finalized"},
-                archived=bool(row["archived"]),
-                accepting_orders=bool(row["accepting_orders"]),
-                enable_order_book=bool(row["enable_order_book"]),
-                volume=row["volume"],
-                volume_24h=row["volume_24h"],
-                liquidity=row["liquidity"],
-                has_maker_rewards=bool(
-                    isinstance(row["raw_data"], Mapping)
-                    and (
-                        row["raw_data"].get("rewardsMinSize") is not None
-                        or row["raw_data"].get("rewardsMaxSpread") is not None
+        if exchange is None:
+            async with self.pool.connection() as connection:
+                rows = await (
+                    await connection.execute(
+                        "SELECT DISTINCT exchange FROM markets ORDER BY exchange"
                     )
-                ),
-                close_time=row["close_time"],
-                outcome_token_ids=tuple(row["token_ids"]),
-                raw_data=row["raw_data"],
-            )
-            for row in rows
+                ).fetchall()
+            return [
+                candidate
+                for row in rows
+                async for candidate in self.iter_live_candidates(str(row["exchange"]))
+            ]
+        return [
+            candidate
+            async for candidate in self.iter_live_candidates(exchange)
         ]
 
     async def collection_tier_market_ids(self, tiers: Iterable[str]) -> set[str]:
