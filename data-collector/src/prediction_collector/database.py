@@ -2086,21 +2086,37 @@ class Database:
         name = str(
             raw.get("label") or raw.get("name") or raw.get("slug") or external_id or ""
         )
+        normalized_external_id = (
+            str(external_id) if external_id is not None else None
+        )
+        if normalized_external_id is not None:
+            conflict_clause = """
+                ON CONFLICT (exchange, external_id) WHERE external_id IS NOT NULL
+                DO UPDATE SET
+                    name = EXCLUDED.name,
+                    slug = EXCLUDED.slug,
+                    raw_data = EXCLUDED.raw_data,
+                    updated_at = clock_timestamp()
+            """
+        else:
+            conflict_clause = """
+                ON CONFLICT (exchange, name) DO UPDATE SET
+                    slug = EXCLUDED.slug,
+                    raw_data = EXCLUDED.raw_data,
+                    updated_at = clock_timestamp()
+            """
         async with self.pool.connection() as connection:
             row = await (
                 await connection.execute(
-                    """
+                    f"""
                     INSERT INTO tags (exchange, external_id, name, slug, raw_data)
                     VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (exchange, name) DO UPDATE SET
-                        external_id = COALESCE(EXCLUDED.external_id, tags.external_id),
-                        slug = EXCLUDED.slug, raw_data = EXCLUDED.raw_data,
-                        updated_at = clock_timestamp()
+                    {conflict_clause}
                     RETURNING id
                     """,
                     (
                         exchange,
-                        str(external_id) if external_id is not None else None,
+                        normalized_external_id,
                         name,
                         raw.get("slug"),
                         _json(_compact_raw(raw, ("id", "label", "name", "slug"))),
