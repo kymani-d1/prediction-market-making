@@ -495,12 +495,55 @@ async def test_journal_acknowledgements_are_coalesced_before_rewrite(
 
     await writer._acknowledge_journal([records[3]])
     await writer._acknowledge_journal([records[4]])
-    assert replacements == 1
+    assert replacements == 2
     acknowledgement = writer.metrics()["journal_acknowledgement"]
     assert acknowledgement["records_total"] == 5
-    assert acknowledgement["rewrites_total"] == 1
+    assert acknowledgement["rewrites_total"] == 2
     assert acknowledgement["segments_deleted_total"] == 1
     assert not writer._recovery_journal_paths()
+
+
+@pytest.mark.asyncio
+async def test_journal_ack_reconciles_an_underestimated_segment_before_deletion(
+    workspace_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "prediction_collector.archive.JOURNAL_ACK_REWRITE_RECORDS", 256
+    )
+    settings = archive_settings(workspace_tmp_path)
+    settings.archive_spool_directory.mkdir(parents=True)
+    writer = ArchiveWriter(
+        settings,
+        ArchiveDatabase(),
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    records = [
+        update_record(f"ack-count-drift-{index}", f"0.5{index}")
+        for index in range(2)
+    ]
+    for record in records:
+        await writer._append_journal(record)
+    async with writer._journal_lock_scope("test_rotate"):
+        segment = await writer._rotate_active_journal_for_acknowledgement()
+
+    # A stale in-memory estimate must not be allowed to remove a segment that
+    # still contains a durable, unacknowledged row.
+    writer._journal_segment_unacknowledged[segment] = 1
+    await writer._acknowledge_journal([records[0]])
+
+    assert segment.is_file()
+    remaining = [
+        json.loads(line)["record_id"]
+        for line in segment.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert remaining == [records[1].record_id]
+    assert writer._journal_segment_unacknowledged[segment] == 1
+
+    await writer._acknowledge_journal([records[1]])
+    assert not segment.exists()
+    assert not writer._journal_segment_unacknowledged
 
 
 def add_archive_manifest(

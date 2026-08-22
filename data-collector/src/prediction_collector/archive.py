@@ -1356,7 +1356,7 @@ class ArchiveWriter:
             with path.open("r", encoding="utf-8") as handle:
                 return sum(bool(line.strip()) for line in handle)
 
-        def rewrite(path: Path, acknowledged: set[str]) -> int:
+        def rewrite(path: Path, acknowledged: set[str]) -> tuple[int, int]:
             if not path.is_file():
                 raise FileNotFoundError(path)
             previous_size = path.stat().st_size
@@ -1384,7 +1384,7 @@ class ArchiveWriter:
                 current_size = 0
             else:
                 current_size = path.stat().st_size
-            return current_size - previous_size
+            return current_size - previous_size, retained
 
         async with self._journal_maintenance_lock:
             async with self._journal_lock_scope("rotate_for_acknowledge"):
@@ -1423,19 +1423,20 @@ class ArchiveWriter:
                 self._journal_segment_unacknowledged[source] = unacknowledged
 
                 size_delta = 0
-                if unacknowledged == 0:
-                    previous_size = source.stat().st_size if source.is_file() else 0
-                    source.unlink(missing_ok=True)
-                    size_delta = -previous_size
-                    self._pending_journal_acknowledgements.pop(source, None)
-                    self._journal_segment_unacknowledged.pop(source, None)
-                    self._journal_ack_segments_deleted += 1
-                elif len(pending) >= JOURNAL_ACK_REWRITE_RECORDS:
-                    size_delta = await asyncio.to_thread(
+                if (
+                    unacknowledged == 0
+                    or len(pending) >= JOURNAL_ACK_REWRITE_RECORDS
+                ):
+                    size_delta, retained = await asyncio.to_thread(
                         rewrite, source, set(pending)
                     )
                     pending.clear()
+                    self._journal_segment_unacknowledged[source] = retained
                     self._journal_ack_rewrites += 1
+                    if retained == 0:
+                        self._pending_journal_acknowledgements.pop(source, None)
+                        self._journal_segment_unacknowledged.pop(source, None)
+                        self._journal_ack_segments_deleted += 1
                 self._spool_bytes = max(0, self._spool_bytes + size_delta)
                 for record_id in acknowledged:
                     if self._recovery_record_sources.get(record_id) == source:
