@@ -118,15 +118,17 @@ async def test_one_shot_absent_reconciliation_may_complete_normally() -> None:
     collector = LiveCollector.__new__(LiveCollector)
     collector.reconciliation_task = None
     collector._task_failure = asyncio.get_running_loop().create_future()
+    observed: list[tuple[str, ...]] = []
 
     class Service:
-        async def reconcile_absent_live(self, _: list[MarketCandidate]) -> None:
-            return None
+        async def reconcile_absent_live(self, values: tuple[str, ...]) -> None:
+            observed.append(values)
 
     collector.polymarket_service = Service()  # type: ignore[assignment]
     collector._schedule_absent_reconciliation([candidate("A")])
     assert collector.reconciliation_task is not None
     await collector.reconciliation_task
+    assert observed == [("A",)]
     assert not collector._task_failure.done()
 
 
@@ -296,3 +298,4 @@ async def test_discovery_persists_and_applies_one_shared_tier_evaluation(
         "persist_selected",
         "apply_tiers",
     }
+    assert not hasattr(collector.coverage, "candidates")

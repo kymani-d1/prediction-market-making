@@ -34,7 +34,6 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class LiveCoverageState:
-    candidates: list[MarketCandidate] = field(default_factory=list)
     selection: LiveSelection | None = None
     assignments: list[TierAssignment] = field(default_factory=list)
     confirmed_subscribed: int = 0
@@ -515,7 +514,6 @@ class LiveCollector:
             excluded_total=len(candidates) - len(subscribed),
         )
         self.coverage = LiveCoverageState(
-            candidates=list(candidates),
             selection=selection,
             assignments=[
                 item
@@ -686,16 +684,21 @@ class LiveCollector:
             return
         # This is a one-shot maintenance task. Normal completion is expected
         # and must not be treated like a dead perpetual collector loop.
+        discovered_external_ids = tuple(
+            candidate.external_id for candidate in candidates
+        )
         self.reconciliation_task = asyncio.create_task(
-            self._reconcile_absent_markets(list(candidates)),
+            self._reconcile_absent_markets(discovered_external_ids),
             name="polymarket-absent-market-reconciliation",
         )
 
     async def _reconcile_absent_markets(
-        self, candidates: list[MarketCandidate]
+        self, discovered_external_ids: tuple[str, ...]
     ) -> None:
         try:
-            await self.polymarket_service.reconcile_absent_live(candidates)
+            await self.polymarket_service.reconcile_absent_live(
+                discovered_external_ids
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -709,7 +712,7 @@ class LiveCollector:
                 outcome_external_id=None,
                 gap_type="state_reconciliation_batch_failed",
                 reconnect_reason=f"{type(exc).__name__}: {exc}",
-                details={"current_markets": len(candidates)},
+                details={"current_markets": len(discovered_external_ids)},
             )
 
     async def _record_discovery_gap(

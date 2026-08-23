@@ -546,6 +546,58 @@ async def test_journal_ack_reconciles_an_underestimated_segment_before_deletion(
     assert not writer._journal_segment_unacknowledged
 
 
+@pytest.mark.asyncio
+async def test_journal_ack_recovers_a_missing_source_mapping(
+    workspace_tmp_path: Path,
+) -> None:
+    settings = archive_settings(workspace_tmp_path)
+    settings.archive_spool_directory.mkdir(parents=True)
+    writer = ArchiveWriter(
+        settings,
+        ArchiveDatabase(),
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    record = update_record("source-map-recovery", "0.56")
+    await writer._append_journal(record)
+    async with writer._journal_lock_scope("test_rotate"):
+        segment = await writer._rotate_active_journal_for_acknowledgement()
+    writer._journal_record_sources.pop(record.record_id)
+
+    await writer._acknowledge_journal([record])
+
+    assert not segment.exists()
+    acknowledgement = writer.metrics()["journal_acknowledgement"]
+    assert acknowledgement["records_total"] == 1
+    assert acknowledgement["source_recoveries_total"] == 1
+    assert acknowledgement["source_misses_total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_journal_ack_does_not_crash_after_an_uploaded_row_was_pruned(
+    workspace_tmp_path: Path,
+) -> None:
+    settings = archive_settings(workspace_tmp_path)
+    settings.archive_spool_directory.mkdir(parents=True)
+    writer = ArchiveWriter(
+        settings,
+        ArchiveDatabase(),
+        object_store=LocalObjectStore(workspace_tmp_path / "objects"),
+    )
+    record = update_record("already-pruned-source", "0.57")
+    await writer._append_journal(record)
+    async with writer._journal_lock_scope("test_rotate"):
+        segment = await writer._rotate_active_journal_for_acknowledgement()
+    segment.unlink()
+    writer._journal_record_sources.pop(record.record_id)
+
+    await writer._acknowledge_journal([record])
+
+    acknowledgement = writer.metrics()["journal_acknowledgement"]
+    assert acknowledgement["records_total"] == 1
+    assert acknowledgement["source_recoveries_total"] == 0
+    assert acknowledgement["source_misses_total"] == 1
+
+
 def add_archive_manifest(
     database: ArchiveDatabase,
     workspace_tmp_path: Path,

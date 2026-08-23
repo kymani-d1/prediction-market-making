@@ -596,6 +596,8 @@ class ArchiveWriter:
         self._journal_acknowledged_records = 0
         self._journal_ack_rewrites = 0
         self._journal_ack_segments_deleted = 0
+        self._journal_ack_source_recoveries = 0
+        self._journal_ack_source_misses = 0
         self._journal_lock_owner: dict[str, Any] | None = None
         self._journal_lock_timings: dict[str, dict[str, float | int]] = {}
         self._journal_append_timings: dict[str, dict[str, float | int]] = {}
@@ -1386,6 +1388,30 @@ class ArchiveWriter:
                 current_size = path.stat().st_size
             return current_size - previous_size, retained
 
+        def locate_sources(
+            paths: list[Path], record_ids: set[str]
+        ) -> dict[str, Path]:
+            remaining = set(record_ids)
+            located: dict[str, Path] = {}
+            for path in paths:
+                if not remaining or not path.is_file():
+                    continue
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        try:
+                            record_id = str(json.loads(line).get("record_id"))
+                        except json.JSONDecodeError:
+                            continue
+                        if record_id not in remaining:
+                            continue
+                        located[record_id] = path
+                        remaining.remove(record_id)
+                        if not remaining:
+                            break
+            return located
+
         async with self._journal_maintenance_lock:
             async with self._journal_lock_scope("rotate_for_acknowledge"):
                 if any(
@@ -1395,15 +1421,78 @@ class ArchiveWriter:
                 ):
                     await self._rotate_active_journal_for_acknowledgement()
 
+            record_ids = {record.record_id for record in records}
+            initially_missing_sources = {
+                record_id
+                for record_id in record_ids
+                if record_id not in self._recovery_record_sources
+                and record_id not in self._journal_record_sources
+            }
+            if initially_missing_sources:
+                located = await asyncio.to_thread(
+                    locate_sources,
+                    self._recovery_journal_paths(),
+                    initially_missing_sources,
+                )
+                self._journal_record_sources.update(located)
+
+            missing_sources = {
+                record_id
+                for record_id in record_ids
+                if record_id not in self._recovery_record_sources
+                and record_id not in self._journal_record_sources
+            }
+            if missing_sources:
+                # The append journal can change concurrently, so scan and, if
+                # necessary, rotate it while holding its hot lock. This slow
+                # path runs only after an in-memory source invariant is lost.
+                async with self._journal_lock_scope("locate_ack_source"):
+                    located = await asyncio.to_thread(
+                        locate_sources,
+                        [self._journal_path],
+                        missing_sources,
+                    )
+                    for record_id in located:
+                        self._journal_record_sources[record_id] = self._journal_path
+                        self._active_journal_record_ids.add(record_id)
+                    if located:
+                        await self._rotate_active_journal_for_acknowledgement()
+
+            source_misses = {
+                record_id
+                for record_id in record_ids
+                if record_id not in self._recovery_record_sources
+                and record_id not in self._journal_record_sources
+            }
+            recovered_count = len(initially_missing_sources - source_misses)
+            if recovered_count:
+                self._journal_ack_source_recoveries += recovered_count
+                LOGGER.warning(
+                    "Recovered missing archive journal source bookkeeping",
+                    extra={"records": recovered_count},
+                )
+            if source_misses:
+                # Upload and manifest commit already succeeded before this
+                # acknowledgement. If the journal row has also disappeared,
+                # the durable work is complete; crashing the collector cannot
+                # recover more evidence and only interrupts fresh ingestion.
+                self._journal_ack_source_misses += len(source_misses)
+                self._journal_acknowledged_records += len(source_misses)
+                LOGGER.error(
+                    "Uploaded archive records were absent from ingress journals",
+                    extra={
+                        "records": len(source_misses),
+                        "record_id_samples": sorted(source_misses)[:5],
+                    },
+                )
+
             by_source: dict[Path, set[str]] = defaultdict(set)
             for record in records:
                 source = self._recovery_record_sources.get(record.record_id)
                 if source is None:
                     source = self._journal_record_sources.get(record.record_id)
                 if source is None:
-                    raise KeyError(
-                        f"journal source missing for record {record.record_id}"
-                    )
+                    continue
                 by_source[source].add(record.record_id)
 
             for source, acknowledged in by_source.items():
@@ -2853,6 +2942,8 @@ class ArchiveWriter:
                 "records_total": self._journal_acknowledged_records,
                 "rewrites_total": self._journal_ack_rewrites,
                 "segments_deleted_total": self._journal_ack_segments_deleted,
+                "source_recoveries_total": self._journal_ack_source_recoveries,
+                "source_misses_total": self._journal_ack_source_misses,
                 "pending_records": sum(
                     len(record_ids)
                     for record_ids in self._pending_journal_acknowledgements.values()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -487,7 +487,7 @@ class PolymarketService:
             )
         if reconcile_absent:
             await self.reconcile_absent_live(
-                candidates,
+                (candidate.external_id for candidate in candidates),
                 emit_summary=False,
             )
         LOGGER.info(
@@ -580,7 +580,7 @@ class PolymarketService:
 
     async def reconcile_absent_live(
         self,
-        candidates: list[MarketCandidate],
+        discovered_external_ids: Iterable[str],
         *,
         diagnostics: MetadataSyncDiagnostics | None = None,
         emit_summary: bool = True,
@@ -589,7 +589,7 @@ class PolymarketService:
         diagnostics = diagnostics or MetadataSyncDiagnostics()
         absent = await self.database.absent_active_markets(
             exchange="polymarket",
-            discovered_external_ids=(candidate.external_id for candidate in candidates),
+            discovered_external_ids=discovered_external_ids,
         )
         received_at = utc_now()
         monotonic_ns = time.monotonic_ns()
