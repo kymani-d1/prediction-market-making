@@ -58,6 +58,7 @@ class MetadataDatabase:
         self.gaps: list[dict[str, Any]] = []
         self.checkpoints: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.checkpoint_values: dict[tuple[str, str, str], str | None] = {}
+        self.completed_checkpoint_keys: set[tuple[str, str, str]] = set()
 
     async def upsert_market(self, market: dict[str, Any], **_: Any) -> int:
         self.markets.append(market)
@@ -82,11 +83,22 @@ class MetadataDatabase:
         self.checkpoint_values[(args[0], args[1], kwargs["checkpoint_key"])] = (
             kwargs.get("cursor")
         )
+        key = (args[0], args[1], kwargs["checkpoint_key"])
+        if kwargs.get("cursor") is None:
+            self.completed_checkpoint_keys.add(key)
+        else:
+            self.completed_checkpoint_keys.discard(key)
 
     async def checkpoint_cursor(
         self, exchange: str, job: str, *, checkpoint_key: str = "default"
     ) -> str | None:
         return self.checkpoint_values.get((exchange, job, checkpoint_key))
+
+    async def checkpoint_cursor_state(
+        self, exchange: str, job: str, *, checkpoint_key: str = "default"
+    ) -> tuple[bool, str | None]:
+        key = (exchange, job, checkpoint_key)
+        return key in self.completed_checkpoint_keys, self.checkpoint_values.get(key)
 
     async def record_gap(self, **value: Any) -> int:
         self.gaps.append(value)
@@ -324,6 +336,43 @@ def _service_with_persisted_cursor(
         writer=writer,  # type: ignore[arg-type]
     )
     return service, database, writer
+
+
+class CompletedCohortRest(MetadataRest):
+    async def iter_events(self, *, closed: bool, after_cursor: str | None = None):
+        raise AssertionError((closed, after_cursor, "completed events must be skipped"))
+        if False:
+            yield
+
+    async def iter_markets(self, *, closed: bool, after_cursor: str | None = None):
+        raise AssertionError((closed, after_cursor, "completed markets must be skipped"))
+        if False:
+            yield
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoints_skip_completed_metadata_cohorts() -> None:
+    database = MetadataDatabase()
+    completed = {
+        ("polymarket", "metadata_events", "closed=false"),
+        ("polymarket", "metadata_markets", "closed=false"),
+    }
+    database.completed_checkpoint_keys.update(completed)
+    database.checkpoint_values.update(dict.fromkeys(completed))
+    writer = MetadataWriter()
+    service = PolymarketService(
+        rest=CompletedCohortRest([]),  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        writer=writer,  # type: ignore[arg-type]
+    )
+
+    result = await service.sync_metadata(include_closed=False)
+
+    assert result["completed_metadata_cohorts_skipped"] == 2
+    assert result["events"] == 0
+    assert result["markets"] == 0
+    assert database.checkpoints == []
+    assert database.completed_checkpoint_keys == completed
 
 
 @pytest.mark.asyncio

@@ -2175,6 +2175,19 @@ class Database:
         checkpoint_key: str = "default",
     ) -> str | None:
         """Return the cursor after the last durably completed page, if any."""
+        _, cursor = await self.checkpoint_cursor_state(
+            exchange, job, checkpoint_key=checkpoint_key
+        )
+        return cursor
+
+    async def checkpoint_cursor_state(
+        self,
+        exchange: str,
+        job: str,
+        *,
+        checkpoint_key: str = "default",
+    ) -> tuple[bool, str | None]:
+        """Return checkpoint existence and cursor, preserving terminal NULL."""
         async with self.pool.connection() as connection:
             row = await (
                 await connection.execute(
@@ -2186,9 +2199,9 @@ class Database:
                     (exchange, job, checkpoint_key),
                 )
             ).fetchone()
-        if row is None or row["cursor"] is None:
-            return None
-        return str(row["cursor"])
+        if row is None:
+            return False, None
+        return True, str(row["cursor"]) if row["cursor"] is not None else None
 
     async def iter_live_candidates(
         self,

@@ -97,6 +97,19 @@ class PolymarketService:
         for market in await self.database.live_candidates(exchange):
             yield market
 
+    async def _metadata_checkpoint_state(
+        self, job: str, checkpoint_key: str
+    ) -> tuple[bool, str | None]:
+        state_reader = getattr(self.database, "checkpoint_cursor_state", None)
+        if state_reader is not None:
+            exists, cursor = await state_reader(
+                "polymarket", job, checkpoint_key=checkpoint_key
+            )
+            return bool(exists and cursor is None), cursor
+        return False, await self.database.checkpoint_cursor(
+            "polymarket", job, checkpoint_key=checkpoint_key
+        )
+
     async def sync_metadata(self, *, include_closed: bool = True) -> dict[str, Any]:
         counts: dict[str, Any] = {
             "series": 0,
@@ -105,6 +118,7 @@ class PolymarketService:
             "outcomes": 0,
             "tags": 0,
             "stale_checkpoint_cursor_replays": 0,
+            "completed_metadata_cohorts_skipped": 0,
         }
         malformed_markets_skipped = 0
         malformed_market_samples: list[dict[str, Any]] = []
@@ -131,94 +145,122 @@ class PolymarketService:
         states = [False, True] if include_closed else [False]
         for closed in states:
             checkpoint_key = f"closed={str(closed).lower()}"
-            event_cursor = await self.database.checkpoint_cursor(
-                "polymarket", "metadata_events", checkpoint_key=checkpoint_key
+            event_complete, event_cursor = await self._metadata_checkpoint_state(
+                "metadata_events", checkpoint_key
             )
-            if event_cursor:
+            if event_complete:
+                counts["completed_metadata_cohorts_skipped"] += 1
+                LOGGER.info(
+                    "Skipping completed Polymarket event metadata cohort",
+                    extra={"closed": closed, "checkpoint_key": checkpoint_key},
+                )
+            elif event_cursor:
                 LOGGER.info(
                     "Resuming Polymarket event metadata backfill",
                     extra={"closed": closed, "has_persisted_cursor": True},
                 )
-            async for items, result, cursor in self.rest.iter_events(
-                closed=closed, after_cursor=event_cursor
-            ):
-                await self._raw_page(
-                    "gamma", "/events/keyset", "events", items, result, external_key=cursor
-                )
-                for raw in items:
-                    for series_raw in _as_dict_list(raw.get("series")):
-                        await self.database.upsert_series(normalise_series(series_raw))
-                    await self.database.upsert_event(normalise_event(raw))
-                    counts["events"] += 1
-                await self.database.checkpoint(
-                    "polymarket",
-                    "metadata_events",
-                    checkpoint_key=checkpoint_key,
-                    cursor=cursor,
-                    timestamp=utc_now(),
-                    metadata={"records": counts["events"]},
-                )
+            if not event_complete:
+                async for items, result, cursor in self.rest.iter_events(
+                    closed=closed, after_cursor=event_cursor
+                ):
+                    await self._raw_page(
+                        "gamma",
+                        "/events/keyset",
+                        "events",
+                        items,
+                        result,
+                        external_key=cursor,
+                    )
+                    for raw in items:
+                        for series_raw in _as_dict_list(raw.get("series")):
+                            await self.database.upsert_series(normalise_series(series_raw))
+                        await self.database.upsert_event(normalise_event(raw))
+                        counts["events"] += 1
+                    await self.database.checkpoint(
+                        "polymarket",
+                        "metadata_events",
+                        checkpoint_key=checkpoint_key,
+                        cursor=cursor,
+                        timestamp=utc_now(),
+                        metadata={"records": counts["events"]},
+                    )
 
-            market_cursor = await self.database.checkpoint_cursor(
-                "polymarket", "metadata_markets", checkpoint_key=checkpoint_key
+            market_complete, market_cursor = await self._metadata_checkpoint_state(
+                "metadata_markets", checkpoint_key
             )
-            if market_cursor:
+            if market_complete:
+                counts["completed_metadata_cohorts_skipped"] += 1
+                LOGGER.info(
+                    "Skipping completed Polymarket market metadata cohort",
+                    extra={"closed": closed, "checkpoint_key": checkpoint_key},
+                )
+            elif market_cursor:
                 LOGGER.info(
                     "Resuming Polymarket market metadata backfill",
                     extra={"closed": closed, "has_persisted_cursor": True},
                 )
             replay_count_before = self.stale_checkpoint_cursor_replays
-            async for items, result, cursor in self._iter_markets_with_stale_checkpoint_replay(
-                closed=closed,
-                checkpoint_key=checkpoint_key,
-                persisted_cursor=market_cursor,
-            ):
-                await self._raw_page(
-                    "gamma", "/markets/keyset", "markets", items, result, external_key=cursor
-                )
-                for raw in items:
-                    event_external_id: str | None = None
-                    nested_events = _as_dict_list(raw.get("events"))
-                    if nested_events:
-                        event = normalise_event(nested_events[0])
-                        event_external_id = event["external_id"]
-                        await self.database.upsert_event(event)
-                    market, outcomes = normalise_market(
-                        raw,
-                        event_external_id=event_external_id,
-                        invalid_metric_recorder=invalid_metrics.recorder_for(raw),
-                    )
-                    external_id = market.get("external_id")
-                    if not isinstance(external_id, str) or not external_id.strip():
-                        malformed_markets_skipped += 1
-                        if len(malformed_market_samples) < 10:
-                            malformed_market_samples.append(
-                                _market_identity_failure_sample(raw)
-                            )
-                        continue
-                    market["exchange_timestamp"] = result.response_timestamp
-                    market["exchange_timestamp_is_transport"] = True
-                    market["observed_at"] = (
-                        getattr(result, "requested_at", None) or utc_now()
-                    )
-                    market_id = await self.database.upsert_market(
-                        market, diagnostics=diagnostics
-                    )
-                    counts["markets"] += 1
-                    for outcome in outcomes:
-                        await self.database.upsert_outcome(market_id, outcome)
-                        counts["outcomes"] += 1
-                await self.database.checkpoint(
-                    "polymarket",
-                    "metadata_markets",
+            if not market_complete:
+                async for (
+                    items,
+                    result,
+                    cursor,
+                ) in self._iter_markets_with_stale_checkpoint_replay(
+                    closed=closed,
                     checkpoint_key=checkpoint_key,
-                    cursor=cursor,
-                    timestamp=utc_now(),
-                    metadata={
-                        "records": counts["markets"],
-                        "malformed_markets_skipped": malformed_markets_skipped,
-                    },
-                )
+                    persisted_cursor=market_cursor,
+                ):
+                    await self._raw_page(
+                        "gamma",
+                        "/markets/keyset",
+                        "markets",
+                        items,
+                        result,
+                        external_key=cursor,
+                    )
+                    for raw in items:
+                        event_external_id: str | None = None
+                        nested_events = _as_dict_list(raw.get("events"))
+                        if nested_events:
+                            event = normalise_event(nested_events[0])
+                            event_external_id = event["external_id"]
+                            await self.database.upsert_event(event)
+                        market, outcomes = normalise_market(
+                            raw,
+                            event_external_id=event_external_id,
+                            invalid_metric_recorder=invalid_metrics.recorder_for(raw),
+                        )
+                        external_id = market.get("external_id")
+                        if not isinstance(external_id, str) or not external_id.strip():
+                            malformed_markets_skipped += 1
+                            if len(malformed_market_samples) < 10:
+                                malformed_market_samples.append(
+                                    _market_identity_failure_sample(raw)
+                                )
+                            continue
+                        market["exchange_timestamp"] = result.response_timestamp
+                        market["exchange_timestamp_is_transport"] = True
+                        market["observed_at"] = (
+                            getattr(result, "requested_at", None) or utc_now()
+                        )
+                        market_id = await self.database.upsert_market(
+                            market, diagnostics=diagnostics
+                        )
+                        counts["markets"] += 1
+                        for outcome in outcomes:
+                            await self.database.upsert_outcome(market_id, outcome)
+                            counts["outcomes"] += 1
+                    await self.database.checkpoint(
+                        "polymarket",
+                        "metadata_markets",
+                        checkpoint_key=checkpoint_key,
+                        cursor=cursor,
+                        timestamp=utc_now(),
+                        metadata={
+                            "records": counts["markets"],
+                            "malformed_markets_skipped": malformed_markets_skipped,
+                        },
+                    )
             counts["stale_checkpoint_cursor_replays"] += (
                 self.stale_checkpoint_cursor_replays - replay_count_before
             )
