@@ -2895,6 +2895,20 @@ class Database:
         processed = 0
         async with self.pool.connection() as connection:
             async with connection.transaction():
+                # Backfill and live discovery both replace rows in these two
+                # tables. A millions-row backfill transaction otherwise
+                # overlaps many short live transactions, allowing each writer
+                # to hold an index/row lock the other needs. Acquire both table
+                # locks in the same order as the writes before either table is
+                # changed. Reads remain available; concurrent tier writers wait
+                # for this atomic cohort to commit or roll back.
+                await connection.execute(
+                    """
+                    LOCK TABLE market_collection_tier_history,
+                               market_collection_tiers
+                    IN SHARE ROW EXCLUSIVE MODE
+                    """
+                )
                 for payload in _tier_assignment_payload_chunks(
                     assignments, max_bytes=_max_payload_bytes
                 ):

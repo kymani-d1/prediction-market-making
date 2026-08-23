@@ -81,6 +81,8 @@ class _TierConnection:
         self.evaluated_at_values: list[datetime] = []
         self.history_calls = 0
         self.tier_calls = 0
+        self.lock_calls = 0
+        self.statements: list[str] = []
         self.fail_on_history_call: int | None = None
         self.commits = 0
         self.rollbacks = 0
@@ -88,12 +90,21 @@ class _TierConnection:
     def transaction(self) -> _Transaction:
         return _Transaction(self)
 
-    async def execute(self, query: str, params: tuple[Any, ...]) -> _Cursor:
+    async def execute(
+        self, query: str, params: tuple[Any, ...] = ()
+    ) -> _Cursor:
+        normalized = " ".join(query.split())
+        self.statements.append(normalized)
+        if normalized.startswith("LOCK TABLE market_collection_tier_history"):
+            assert "market_collection_tiers" in normalized
+            assert "IN SHARE ROW EXCLUSIVE MODE" in normalized
+            self.lock_calls += 1
+            return _Cursor()
+
         payload = params[0].obj
         evaluated_at = params[1]
         self.payload_sizes.append(len(canonical_json(payload).encode("utf-8")))
         self.evaluated_at_values.append(evaluated_at)
-        normalized = " ".join(query.split())
 
         if "INSERT INTO market_collection_tier_history" in normalized:
             self.history_calls += 1
@@ -169,6 +180,11 @@ async def test_small_assignment_cohort_retains_one_payload_behavior(
     assert changed == 2
     assert connection.history_calls == 1
     assert connection.tier_calls == 1
+    assert connection.lock_calls == 1
+    assert connection.statements[0].startswith(
+        "LOCK TABLE market_collection_tier_history"
+    )
+    assert "market_collection_tiers" in connection.statements[0]
     assert connection.commits == 1
     assert connection.rollbacks == 0
     assert set(connection.tiers) == {item.market.external_id for item in assignments}
