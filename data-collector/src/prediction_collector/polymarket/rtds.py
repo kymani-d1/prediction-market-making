@@ -27,6 +27,31 @@ LOGGER = logging.getLogger(__name__)
 CONNECTION_STATS_FLUSH_SECONDS = 30.0
 
 
+class RtdsApplicationSilenceError(RuntimeError):
+    pass
+
+
+async def _receive_rtds_application_frame(
+    websocket: Any, *, timeout_seconds: float
+) -> str | bytes:
+    """Receive non-heartbeat data without letting PONGs mask a stale feed."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RtdsApplicationSilenceError(
+                f"no RTDS application message for {timeout_seconds:g} seconds"
+            )
+        try:
+            frame = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+        except TimeoutError as exc:
+            raise RtdsApplicationSilenceError(
+                f"no RTDS application message for {timeout_seconds:g} seconds"
+            ) from exc
+        if frame != "PONG":
+            return frame
+
+
 class PolymarketRtdsWebSocket:
     def __init__(
         self,
@@ -38,6 +63,7 @@ class PolymarketRtdsWebSocket:
         store_raw: bool,
         equity_symbols: frozenset[str],
         comments_enabled: bool,
+        application_silence_timeout_seconds: float,
     ) -> None:
         self.url = url
         self.writer = writer
@@ -46,6 +72,9 @@ class PolymarketRtdsWebSocket:
         self.store_raw = store_raw
         self.equity_symbols = equity_symbols
         self.comments_enabled = comments_enabled
+        self.application_silence_timeout_seconds = (
+            application_silence_timeout_seconds
+        )
 
     def subscriptions(self) -> list[dict[str, str]]:
         subscriptions: list[dict[str, str]] = [
@@ -114,7 +143,13 @@ class PolymarketRtdsWebSocket:
                         self._heartbeat(websocket, stop), name="polymarket-rtds-heartbeat"
                     )
                     try:
-                        async for frame in websocket:
+                        while not stop.is_set():
+                            frame = await _receive_rtds_application_frame(
+                                websocket,
+                                timeout_seconds=(
+                                    self.application_silence_timeout_seconds
+                                ),
+                            )
                             received_at = utc_now()
                             if first_message_at is None:
                                 first_message_at = received_at
@@ -122,8 +157,6 @@ class PolymarketRtdsWebSocket:
                             monotonic_ns = time.monotonic_ns()
                             if isinstance(frame, bytes):
                                 frame = frame.decode("utf-8", errors="replace")
-                            if frame == "PONG":
-                                continue
                             messages += 1
                             await self.metrics.message("polymarket_rtds")
                             now_monotonic = time.monotonic()

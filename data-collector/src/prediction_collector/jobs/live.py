@@ -30,6 +30,7 @@ from prediction_collector.writer import BatchWriter
 
 
 LOGGER = logging.getLogger(__name__)
+MARKET_SHARD_STOP_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(slots=True)
@@ -267,6 +268,9 @@ class LiveCollector:
                 store_raw=True,
                 equity_symbols=self.settings.polymarket_equity_symbols,
                 comments_enabled=self.settings.polymarket_comments_enabled,
+                application_silence_timeout_seconds=(
+                    self.settings.polymarket_rtds_reference_stale_after_seconds
+                ),
             )
             self.background_tasks.append(
                 self._create_watched_task(
@@ -656,6 +660,20 @@ class LiveCollector:
         if old is not None:
             old.planned_stop.set()
             old.task.cancel()
+            done, _ = await asyncio.wait(
+                {old.task}, timeout=MARKET_SHARD_STOP_TIMEOUT_SECONDS
+            )
+            if not done:
+                # Discovery must never wait forever for a socket task that
+                # consumed cancellation while it was already unwinding a
+                # remote disconnect. Keep the old shard registered, leave its
+                # planned-stop signal set, and fail this discovery cycle so it
+                # cannot be reported ready before reconciliation converges.
+                old.task.cancel()
+                raise TimeoutError(
+                    f"Polymarket market shard {shard_id} did not stop within "
+                    f"{MARKET_SHARD_STOP_TIMEOUT_SECONDS:g} seconds"
+                )
             await asyncio.gather(old.task, return_exceptions=True)
             self.market_shards.pop(shard_id, None)
         if not new_subscriptions:

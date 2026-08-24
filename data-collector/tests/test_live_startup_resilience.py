@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from decimal import Decimal
 from typing import Any
 
@@ -9,6 +10,7 @@ import pytest
 from prediction_collector.common.types import MarketCandidate
 from prediction_collector.jobs.live import (
     LiveCollector,
+    MarketSocketShard,
     _confirmed_current_subscriptions,
 )
 from prediction_collector.tiering import TierManager
@@ -299,3 +301,46 @@ async def test_discovery_persists_and_applies_one_shared_tier_evaluation(
         "apply_tiers",
     }
     assert not hasattr(collector.coverage, "candidates")
+
+
+@pytest.mark.asyncio
+async def test_shard_replacement_fails_instead_of_waiting_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    async def cancellation_resistant_task() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    task = asyncio.create_task(
+        cancellation_resistant_task(), name="cancellation-resistant-shard"
+    )
+    await asyncio.sleep(0)
+    planned_stop = asyncio.Event()
+    collector = LiveCollector.__new__(LiveCollector)
+    collector.market_shards = {
+        1: MarketSocketShard(1, {"old": "market"}, task, planned_stop)
+    }
+    monkeypatch.setattr(
+        "prediction_collector.jobs.live.MARKET_SHARD_STOP_TIMEOUT_SECONDS", 0.01
+    )
+
+    try:
+        with pytest.raises(TimeoutError, match="market shard 1 did not stop"):
+            await asyncio.wait_for(
+                collector._replace_market_shard(
+                    1,
+                    old=collector.market_shards[1],
+                    new_subscriptions={},
+                ),
+                timeout=0.5,
+            )
+        assert planned_stop.is_set()
+        assert collector.market_shards[1].task is task
+    finally:
+        release.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

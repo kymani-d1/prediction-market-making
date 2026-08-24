@@ -76,7 +76,9 @@ class PolymarketMarketWebSocket:
             return
         reconnect_attempt = 0
         unresolved_connection_gaps: list[int] = list(recovery_gap_ids)
-        while not stop.is_set():
+        while not stop.is_set() and not (
+            planned_stop is not None and planned_stop.is_set()
+        ):
             connection_id: int | None = None
             messages = 0
             dropped = 0
@@ -140,7 +142,9 @@ class PolymarketMarketWebSocket:
                         name=f"polymarket-heartbeat-{connection_label}",
                     )
                     try:
-                        while not stop.is_set():
+                        while not stop.is_set() and not (
+                            planned_stop is not None and planned_stop.is_set()
+                        ):
                             if subscription_confirmed:
                                 frame = await websocket.recv()
                             else:
@@ -267,6 +271,8 @@ class PolymarketMarketWebSocket:
                         heartbeat.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await heartbeat
+                if planned_stop is not None and planned_stop.is_set():
+                    disconnect_reason = "planned_subscription_refresh"
                 reconnect_attempt = 0
             except asyncio.CancelledError:
                 disconnect_reason = (
@@ -326,7 +332,9 @@ class PolymarketMarketWebSocket:
                             details={"token_count": len(assets)},
                         )
                         unresolved_connection_gaps.append(gap_id)
-            if not stop.is_set():
+            if not stop.is_set() and not (
+                planned_stop is not None and planned_stop.is_set()
+            ):
                 delay = min(30.0, 0.5 * (2 ** min(reconnect_attempt, 6)))
                 await _stop_aware_sleep(stop, delay)
 

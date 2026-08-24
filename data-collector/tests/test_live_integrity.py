@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
-from prediction_collector.polymarket.rtds import PolymarketRtdsWebSocket
+from prediction_collector.polymarket.rtds import (
+    PolymarketRtdsWebSocket,
+    RtdsApplicationSilenceError,
+    _receive_rtds_application_frame,
+)
 from prediction_collector.polymarket.websocket import (
+    PolymarketMarketWebSocket,
     _fully_initialized_markets,
     _polymarket_lifecycle_updates,
 )
@@ -21,6 +28,28 @@ class CapturingWriter:
         self.items.append(item)
 
 
+class SocketDatabase:
+    def __init__(self) -> None:
+        self.close_reasons: list[str] = []
+
+    async def create_connection(self, **_: Any) -> int:
+        return 1
+
+    async def update_connection_stats(self, *_: Any, **__: Any) -> None:
+        return None
+
+    async def close_connection(self, *_: Any, **values: Any) -> None:
+        self.close_reasons.append(values["reason"])
+
+    async def record_gap(self, **_: Any) -> int:
+        raise AssertionError("planned shard stop must not record an unknown gap")
+
+
+class SocketMetrics:
+    async def message(self, *_: Any, **__: Any) -> None:
+        return None
+
+
 def socket(writer: CapturingWriter) -> PolymarketRtdsWebSocket:
     return PolymarketRtdsWebSocket(
         url="wss://example.invalid",
@@ -30,6 +59,7 @@ def socket(writer: CapturingWriter) -> PolymarketRtdsWebSocket:
         store_raw=False,
         equity_symbols=frozenset(),
         comments_enabled=False,
+        application_silence_timeout_seconds=600,
     )
 
 
@@ -51,6 +81,105 @@ def test_partial_initial_dump_confirms_only_complete_markets() -> None:
     assert _fully_initialized_markets(
         mapping, {"a-yes", "a-no", "b-yes"}
     ) == {"market-a"}
+
+
+@pytest.mark.asyncio
+async def test_rtds_heartbeat_pongs_cannot_mask_application_silence() -> None:
+    class HeartbeatOnlySocket:
+        async def recv(self) -> str:
+            await asyncio.sleep(0)
+            return "PONG"
+
+    with pytest.raises(
+        RtdsApplicationSilenceError,
+        match="no RTDS application message",
+    ):
+        await asyncio.wait_for(
+            _receive_rtds_application_frame(
+                HeartbeatOnlySocket(), timeout_seconds=0.01
+            ),
+            timeout=0.5,
+        )
+
+
+@pytest.mark.asyncio
+async def test_rtds_application_frame_satisfies_liveness() -> None:
+    class DataSocket:
+        def __init__(self) -> None:
+            self.frames = iter(("PONG", '{"topic":"crypto_prices"}'))
+
+        async def recv(self) -> str:
+            return next(self.frames)
+
+    assert await _receive_rtds_application_frame(
+        DataSocket(), timeout_seconds=1
+    ) == '{"topic":"crypto_prices"}'
+
+
+@pytest.mark.asyncio
+async def test_market_socket_planned_stop_survives_swallowed_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receive_started = asyncio.Event()
+    context_entries = 0
+
+    class WebSocket:
+        async def send(self, _: str) -> None:
+            return None
+
+        async def recv(self) -> str:
+            receive_started.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+    class CancellationSwallowingConnection:
+        async def __aenter__(self) -> WebSocket:
+            nonlocal context_entries
+            context_entries += 1
+            return WebSocket()
+
+        async def __aexit__(
+            self,
+            error_type: type[BaseException] | None,
+            _: BaseException | None,
+            __: object,
+        ) -> bool:
+            # Reproduce the production race: the planned refresh cancelled the
+            # shard while the transport was unwinding a remote disconnect, and
+            # the transport context consumed that cancellation.
+            return error_type is asyncio.CancelledError
+
+    monkeypatch.setattr(
+        "prediction_collector.polymarket.websocket.connect",
+        lambda *_args, **_kwargs: CancellationSwallowingConnection(),
+    )
+    database = SocketDatabase()
+    market_socket = PolymarketMarketWebSocket(
+        url="wss://example.invalid",
+        writer=CapturingWriter(),  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        metrics=SocketMetrics(),  # type: ignore[arg-type]
+        tier_manager=object(),  # type: ignore[arg-type]
+    )
+    stop = asyncio.Event()
+    planned_stop = asyncio.Event()
+    task = asyncio.create_task(
+        market_socket.run(
+            {"token": "market"},
+            run_id=1,
+            stop=stop,
+            connection_label="shard-1",
+            planned_stop=planned_stop,
+        )
+    )
+    await asyncio.wait_for(receive_started.wait(), timeout=1)
+
+    planned_stop.set()
+    task.cancel()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert context_entries == 1
+    assert database.close_reasons == ["planned_subscription_refresh"]
 
 
 @pytest.mark.asyncio
