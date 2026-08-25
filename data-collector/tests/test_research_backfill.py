@@ -124,7 +124,9 @@ class ResearchDatabase:
     def __init__(self, markets: list[ResearchMarket]) -> None:
         self.markets = markets
         self.cohort_calls: list[dict[str, Any]] = []
+        self.incremental_cohort_calls: list[dict[str, Any]] = []
         self.phase_updates: list[dict[str, Any]] = []
+        self.profiles: list[dict[str, Any]] = []
         self.gaps: list[dict[str, Any]] = []
         self.iteration_started = 0
 
@@ -132,6 +134,18 @@ class ResearchDatabase:
         self.cohort_calls.append(kwargs)
         return {
             "id": 7,
+            "version": kwargs["version"],
+            "selected_count": min(len(self.markets), kwargs["max_markets"]),
+            "max_markets": kwargs["max_markets"],
+            "status": "ready",
+        }
+
+    async def create_or_get_incremental_research_cohort(
+        self, **kwargs: Any
+    ) -> dict[str, Any]:
+        self.incremental_cohort_calls.append(kwargs)
+        return {
+            "id": 8,
             "version": kwargs["version"],
             "selected_count": min(len(self.markets), kwargs["max_markets"]),
             "max_markets": kwargs["max_markets"],
@@ -146,6 +160,9 @@ class ResearchDatabase:
 
     async def set_research_phase_status(self, **kwargs: Any) -> None:
         self.phase_updates.append(kwargs)
+
+    async def record_research_market_profile(self, **kwargs: Any) -> None:
+        self.profiles.append(kwargs)
 
     async def research_cohort_status(self, **kwargs: Any) -> dict[str, Any]:
         return {
@@ -178,11 +195,17 @@ class ResearchRest:
         self.active_price_calls = 0
         self.max_active_price_calls = 0
         self.fail_prices = False
+        self.empty_primary_prices = False
+        self.empty_all_prices = False
+        self.price_call_details: list[dict[str, Any]] = []
 
     async def batch_price_history(
         self, token_ids: list[str], **kwargs: Any
     ) -> FakeResult:
         self.price_calls.append(list(token_ids))
+        self.price_call_details.append(
+            {"token_ids": list(token_ids), **kwargs}
+        )
         self.active_price_calls += 1
         self.max_active_price_calls = max(
             self.max_active_price_calls, self.active_price_calls
@@ -191,6 +214,13 @@ class ResearchRest:
         self.active_price_calls -= 1
         if self.fail_prices:
             raise RuntimeError("transient price failure")
+        if self.empty_all_prices or (
+            self.empty_primary_prices and kwargs.get("fidelity_minutes") == 60
+        ):
+            return FakeResult(
+                {"history": {}},
+                url="https://clob.test/batch-prices-history",
+            )
         return FakeResult(
             {
                 "history": {
@@ -251,15 +281,30 @@ def service_for(
 
 def test_research_defaults_and_absolute_bounds() -> None:
     value = Settings.from_env({}, load_dotenv_file=False)
-    assert value.research_backfill_max_markets == 2_500
+    assert value.research_backfill_max_markets == 100
     assert value.research_backfill_hard_max_markets == 5_000
+    assert value.research_backfill_incremental_max_markets == 100
     assert value.research_backfill_catalogue_horizon_days == 730
     assert value.research_backfill_price_fidelity_minutes == 60
+    assert value.research_backfill_price_fallback_fidelity_minutes == 720
     assert value.research_backfill_archive_raw_rest is False
 
     with pytest.raises(ConfigurationError, match="cannot exceed 5000"):
         Settings.from_env(
             {"RESEARCH_BACKFILL_HARD_MAX_MARKETS": "5001"},
+            load_dotenv_file=False,
+        )
+    with pytest.raises(ConfigurationError, match="cannot exceed 250"):
+        Settings.from_env(
+            {"RESEARCH_BACKFILL_INCREMENTAL_MAX_MARKETS": "251"},
+            load_dotenv_file=False,
+        )
+    with pytest.raises(ConfigurationError, match="must be greater"):
+        Settings.from_env(
+            {
+                "RESEARCH_BACKFILL_PRICE_FIDELITY_MINUTES": "60",
+                "RESEARCH_BACKFILL_PRICE_FALLBACK_FIDELITY_MINUTES": "60",
+            },
             load_dotenv_file=False,
         )
 
@@ -322,6 +367,14 @@ async def test_research_path_only_fetches_cohort_prices_and_trades() -> None:
     assert rest.trade_calls == [market.external_id]
     assert rest.forbidden_calls == []
     assert database.iteration_started == 1
+    assert len(database.profiles) == 1
+    profile = database.profiles[0]["profile"]
+    assert profile["trade_records"] == 1
+    assert profile["rows_enqueued"] == 3
+    assert profile["completed"] is True
+    assert profile["phases"]["price"]["writer_drain_seconds"] >= 0
+    assert profile["phases"]["trade"]["pages_fetched"] == 1
+    assert profile["phases"]["trade"]["windows_completed"] == 1
     assert database.cohort_calls[0]["max_markets"] == 1
     assert database.cohort_calls[0]["criteria"]["dimensions"] == [
         "category",
@@ -373,6 +426,147 @@ async def test_completed_market_is_not_refetched_after_restart() -> None:
     assert rest.price_calls == []
     assert rest.trade_calls == []
     assert database.phase_updates == []
+
+
+@pytest.mark.asyncio
+async def test_incremental_resume_only_retries_unfinished_market() -> None:
+    complete = research_market(
+        1,
+        statuses=("completed", "completed", "completed", "completed"),
+    )
+    unfinished = research_market(
+        2,
+        statuses=("retryable_failed", "not_started", "completed", "completed"),
+    )
+    service, database, rest, _writer_instance = service_for(
+        [complete, unfinished]
+    )
+    settings = replace(
+        Settings(),
+        research_backfill_incremental_max_markets=2,
+        research_backfill_request_concurrency=1,
+        research_backfill_candidate_batch_size=1,
+    )
+
+    result = await run_polymarket_research_backfill(
+        service,
+        _writer_instance,
+        settings,
+        mode="incremental",
+        phase="data",
+        cohort_version="incremental-v1",
+        max_markets=2,
+    )
+
+    assert result.details["historical_data"]["markets_skipped_complete"] == 1  # type: ignore[index]
+    assert rest.price_calls == [["token-2-yes", "token-2-no"]]
+    assert rest.trade_calls == [unfinished.external_id]
+    assert {
+        update["market_id"] for update in database.phase_updates
+    } == {unfinished.market_id}
+
+
+@pytest.mark.asyncio
+async def test_price_fallback_is_one_bounded_batch_and_records_provenance() -> None:
+    market = research_market()
+    service, database, rest, writer = service_for([market])
+    rest.empty_primary_prices = True
+    settings = replace(
+        Settings(),
+        research_backfill_request_concurrency=1,
+        research_backfill_candidate_batch_size=1,
+    )
+
+    await run_polymarket_research_backfill(
+        service, writer, settings, phase="data"
+    )
+
+    assert [call["fidelity_minutes"] for call in rest.price_call_details] == [
+        60,
+        720,
+    ]
+    price = [
+        update
+        for update in database.phase_updates
+        if update["phase"] == "price" and update["status"] != "in_progress"
+    ][0]
+    assert price["status"] == "completed"
+    assert price["requests"] == 2
+    assert price["provenance"]["fallback_attempted_tokens"] == [
+        "token-1-yes",
+        "token-1-no",
+    ]
+    assert {
+        item.data["interval_seconds"]
+        for item in writer.items
+        if item.kind == "candlesticks"
+    } == {720 * 60}
+
+
+@pytest.mark.asyncio
+async def test_price_fallback_stops_after_two_explicit_empty_responses() -> None:
+    market = research_market()
+    service, database, rest, writer = service_for([market])
+    rest.empty_all_prices = True
+
+    await run_polymarket_research_backfill(
+        service, writer, Settings(), phase="data"
+    )
+
+    assert len(rest.price_call_details) == 2
+    price = [
+        update
+        for update in database.phase_updates
+        if update["phase"] == "price" and update["status"] != "in_progress"
+    ][0]
+    assert price["status"] == "unavailable"
+    assert price["records"] == 0
+
+
+@pytest.mark.asyncio
+async def test_incremental_mode_uses_new_immutable_batch_selector() -> None:
+    service, database, rest, writer = service_for([research_market()])
+    settings = replace(Settings(), research_backfill_incremental_max_markets=5)
+
+    result = await run_polymarket_research_backfill(
+        service,
+        writer,
+        settings,
+        mode="incremental",
+        phase="cohort",
+        cohort_version="incremental-v1",
+        max_markets=5,
+    )
+
+    assert result.details["mode"] == "bounded_research_dataset_incremental"
+    assert database.cohort_calls == []
+    assert len(database.incremental_cohort_calls) == 1
+    call = database.incremental_cohort_calls[0]
+    assert call["version"] == "incremental-v1"
+    assert call["criteria"]["active_markets_included"] is False
+    assert call["criteria"]["prior_cohort_policy"] == (
+        "exclude_all_prior_memberships"
+    )
+    assert rest.price_calls == []
+
+
+@pytest.mark.asyncio
+async def test_incremental_override_cannot_exceed_configured_run_bound() -> None:
+    service, _database, _rest, writer = service_for([])
+    settings = replace(Settings(), research_backfill_incremental_max_markets=5)
+
+    with pytest.raises(ValueError, match="configured safety bound"):
+        await run_polymarket_research_backfill(
+            service,
+            writer,
+            settings,
+            mode="incremental",
+            phase="cohort",
+            cohort_version="incremental-v1",
+            max_markets=6,
+        )
+
+    assert writer.started == 0
 
 
 @pytest.mark.asyncio

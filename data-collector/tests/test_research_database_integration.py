@@ -40,6 +40,28 @@ def _criteria() -> dict[str, object]:
     }
 
 
+def _incremental_criteria() -> dict[str, object]:
+    return {
+        "mode": "incremental",
+        "method": "newly_resolved_since_latest_bootstrap",
+        "method_version": 1,
+        "horizon_days": 730,
+        "dimensions": [
+            "category",
+            "volume_bucket",
+            "liquidity_bucket",
+            "duration_bucket",
+            "lifecycle_bucket",
+            "calendar_quarter",
+        ],
+        "ordering": "eligibility_time_then_stable_seed",
+        "eligibility": "resolved_or_closed_with_outcome_token",
+        "prior_cohort_policy": "exclude_all_prior_memberships",
+        "active_markets_included": False,
+        "requires_outcome_token": True,
+    }
+
+
 @pytest.mark.asyncio
 async def test_research_schema_selection_resume_and_view_contract() -> None:
     assert DATABASE_URL is not None
@@ -282,5 +304,161 @@ async def test_research_schema_selection_resume_and_view_contract() -> None:
         assert int(view["distinct_categories"]) >= 8
         assert int(view["unknown"]) == 0
         assert int(view["winners"]) == 8
+
+        async with database.pool.connection() as connection:
+            original_fingerprint = await (
+                await connection.execute(
+                    """
+                    SELECT md5(string_agg(
+                        market_external_id, ',' ORDER BY selection_rank
+                    )) AS value
+                    FROM research_cohort_markets
+                    WHERE cohort_id = %s
+                    """,
+                    (int(cohort["id"]),),
+                )
+            ).fetchone()
+            assert original_fingerprint is not None
+            bootstrap_cutoff = cohort["selection_timestamp"]
+            new_market_ids: list[int] = []
+            for index in range(4):
+                eligible_at = bootstrap_cutoff + timedelta(
+                    microseconds=index + 1
+                )
+                market = await (
+                    await connection.execute(
+                        """
+                        INSERT INTO markets
+                            (exchange, external_id, event_id, question, status,
+                             is_active, is_tradable, open_time, close_time,
+                             settlement_time, volume, liquidity, raw_data)
+                        VALUES
+                            ('polymarket', %s, %s, %s, 'resolved', false,
+                             false, %s, %s, %s, %s, %s,
+                             '{"feesEnabled": false}'::jsonb)
+                        RETURNING id
+                        """,
+                        (
+                            f"research-integration-new-{index}",
+                            event_id,
+                            f"Will newly resolved market {index} occur?",
+                            eligible_at - timedelta(days=2),
+                            eligible_at,
+                            eligible_at,
+                            10_000 + index,
+                            100 + index,
+                        ),
+                    )
+                ).fetchone()
+                assert market is not None
+                market_id = int(market["id"])
+                new_market_ids.append(market_id)
+                for outcome_index, name in enumerate(("Yes", "No")):
+                    await connection.execute(
+                        """
+                        INSERT INTO outcomes
+                            (market_id, exchange, external_id, token_id, name,
+                             outcome_index, last_price)
+                        VALUES (%s, 'polymarket', %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            market_id,
+                            f"research-integration-new-{index}:{outcome_index}",
+                            f"research-token-new-{index}-{outcome_index}",
+                            name,
+                            outcome_index,
+                            1 if outcome_index == 0 else 0,
+                        ),
+                    )
+
+        incremental = await database.create_or_get_incremental_research_cohort(
+            exchange="polymarket",
+            version="integration-v2-incremental",
+            seed="integration-seed",
+            max_markets=2,
+            horizon_start=now - timedelta(days=730),
+            criteria=_incremental_criteria(),
+        )
+        assert int(incremental["selected_count"]) == 2
+        assert incremental["criteria"]["baseline_source"] == (
+            "latest_bootstrap_selection"
+        )
+        assert incremental["criteria"]["baseline_cutoff"] == (
+            bootstrap_cutoff.isoformat()
+        )
+        repeated_incremental = (
+            await database.create_or_get_incremental_research_cohort(
+                exchange="polymarket",
+                version="integration-v2-incremental",
+                seed="integration-seed",
+                max_markets=2,
+                horizon_start=now - timedelta(days=730),
+                criteria=_incremental_criteria(),
+            )
+        )
+        assert int(repeated_incremental["id"]) == int(incremental["id"])
+        with pytest.raises(ValueError, match="different selection inputs"):
+            await database.create_or_get_incremental_research_cohort(
+                exchange="polymarket",
+                version="integration-v2-incremental",
+                seed="different-seed",
+                max_markets=2,
+                horizon_start=now - timedelta(days=730),
+                criteria=_incremental_criteria(),
+            )
+
+        first_incremental_members = [
+            market.market_id
+            async for market in database.iter_research_markets(
+                exchange="polymarket",
+                cohort_version="integration-v2-incremental",
+                batch_size=1,
+            )
+        ]
+        assert len(first_incremental_members) == 2
+        assert set(first_incremental_members) <= set(new_market_ids)
+        assert set(first_incremental_members).isdisjoint(inserted_market_ids)
+
+        second_incremental = (
+            await database.create_or_get_incremental_research_cohort(
+                exchange="polymarket",
+                version="integration-v3-incremental",
+                seed="integration-seed",
+                max_markets=2,
+                horizon_start=now - timedelta(days=730),
+                criteria=_incremental_criteria(),
+            )
+        )
+        assert int(second_incremental["selected_count"]) == 2
+        second_incremental_members = [
+            market.market_id
+            async for market in database.iter_research_markets(
+                exchange="polymarket",
+                cohort_version="integration-v3-incremental",
+                batch_size=1,
+            )
+        ]
+        assert set(first_incremental_members).isdisjoint(
+            second_incremental_members
+        )
+        assert set(first_incremental_members + second_incremental_members) == set(
+            new_market_ids
+        )
+
+        async with database.pool.connection() as connection:
+            final_fingerprint = await (
+                await connection.execute(
+                    """
+                    SELECT md5(string_agg(
+                        market_external_id, ',' ORDER BY selection_rank
+                    )) AS value
+                    FROM research_cohort_markets
+                    WHERE cohort_id = %s
+                    """,
+                    (int(cohort["id"]),),
+                )
+            ).fetchone()
+        assert final_fingerprint is not None
+        assert final_fingerprint["value"] == original_fingerprint["value"]
     finally:
         await database.close()
