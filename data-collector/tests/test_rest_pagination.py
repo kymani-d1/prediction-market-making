@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ class FakeHttp:
         self.responses = list(responses)
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.retryable_statuses: list[frozenset[int]] = []
+        self.request_calls: list[tuple[str, str, dict[str, Any]]] = []
 
     async def get_json(
         self,
@@ -28,6 +30,16 @@ class FakeHttp:
     ) -> FakeResult:
         self.calls.append((url, dict(params or {})))
         self.retryable_statuses.append(retryable_status_codes)
+        return FakeResult(self.responses.pop(0))
+
+    async def request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+    ) -> FakeResult:
+        self.request_calls.append((method, url, dict(json_body or {})))
         return FakeResult(self.responses.pop(0))
 
 
@@ -75,6 +87,49 @@ async def test_keyset_pagination_can_resume_from_durable_cursor() -> None:
             {"closed": "true", "limit": 100, "after_cursor": "cursor-A"},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_keyset_catalogue_horizon_is_forwarded_without_offset() -> None:
+    http = FakeHttp([{"markets": []}])
+    horizon = datetime(2024, 8, 25, tzinfo=UTC)
+
+    _ = [
+        page
+        async for page in client(http).iter_markets(
+            closed=True, end_date_min=horizon
+        )
+    ]
+
+    assert http.calls == [
+        (
+            "https://gamma.test/markets/keyset",
+            {
+                "closed": "true",
+                "end_date_min": "2024-08-25T00:00:00+00:00",
+                "limit": 100,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_price_history_is_one_bounded_request() -> None:
+    http = FakeHttp([{"history": {"yes": [], "no": []}}])
+
+    await client(http).batch_price_history(
+        ["yes", "no"], interval="max", fidelity_minutes=60
+    )
+
+    assert http.request_calls == [
+        (
+            "POST",
+            "https://clob.test/batch-prices-history",
+            {"markets": ["yes", "no"], "interval": "max", "fidelity": 60},
+        )
+    ]
+    with pytest.raises(ValueError, match="1-20"):
+        await client(http).batch_price_history([str(index) for index in range(21)])
 
 
 @pytest.mark.asyncio

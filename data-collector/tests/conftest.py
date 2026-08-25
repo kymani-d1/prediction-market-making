@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import selectors
 import shutil
 import sys
 import uuid
@@ -15,6 +17,19 @@ TESTS_ROOT = Path(__file__).resolve().parent
 SOURCE_ROOT = TESTS_ROOT.parent / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
+
+
+def pytest_asyncio_loop_factories(
+    config: pytest.Config, item: pytest.Item
+) -> dict[str, Callable[[], asyncio.AbstractEventLoop]]:
+    del config, item
+    if sys.platform == "win32":
+        return {
+            "selector": lambda: asyncio.SelectorEventLoop(
+                selectors.SelectSelector()
+            )
+        }
+    return {"default": asyncio.new_event_loop}
 
 
 @pytest.fixture
