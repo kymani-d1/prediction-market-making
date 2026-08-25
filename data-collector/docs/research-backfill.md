@@ -3,10 +3,10 @@
 ## Product boundary
 
 `collector-live` is permanent. It collects the L2/order-book evidence that
-cannot be reconstructed later. `research-backfill` is a cheap, reproducible
-historical context dataset for quantitative research. The legacy `backfill`
-command remains available only as an exhaustive production-engineering path; it
-is not the normal research workflow.
+cannot be reconstructed later. `research-backfill` creates bounded,
+reproducible historical context datasets for quantitative research. The legacy
+`backfill` command remains available only as an exhaustive
+production-engineering path; it is not the normal research workflow.
 
 Research backfill deliberately excludes comments, holder snapshots, current
 order books, live tier evaluation, universal historical fee lookups, the global
@@ -27,11 +27,13 @@ progress remain durable either way. With the default `false` value, research
 mode does not start the S3/archive writer, inspect or replay an old spool, or
 require archive credentials.
 
-## Deterministic cohort
+## Bootstrap cohort
 
-The default cohort size is 2,500 markets. The configurable hard ceiling defaults
-to 5,000 and a code-level absolute ceiling prevents any higher value. For a
-production pilot, use 10-50 markets first.
+Bootstrap is the explicit `--mode bootstrap` path and remains the default for
+backward compatibility. The default cohort size is 100 markets. The configurable
+hard ceiling defaults to 5,000 and a code-level absolute ceiling prevents any
+higher value. Increasing the default requires measured production evidence; it
+must not be inferred from the ceiling.
 
 Selection is executed in PostgreSQL and persisted atomically. Eligible markets
 must be active or inside the configured historical horizon and must have at
@@ -56,14 +58,49 @@ bound; `research_cohort_markets` stores exact membership, rank, strata,
 selection-time metrics, category source, and reason. Change the cohort version
 when any selection input or method changes.
 
+## Incremental batches
+
+`--mode incremental` creates a new persisted batch; it never changes an existing
+cohort. Eligible markets are inactive and have a normalized status of resolved,
+closed, settled, or finalized, a settlement/close timestamp inside the horizon,
+and at least one CLOB outcome token. Selection excludes every market already in
+any persisted research cohort. Active markets are deliberately excluded because
+`collector-live` owns ongoing data and a periodic historical job must not fetch
+the same active market repeatedly.
+
+The batch stores its selection timestamp/cutoff, the latest bootstrap selection
+used as the lower baseline (or the horizon when no bootstrap exists), selection
+method version, seed, requested/selected counts, exact membership, chronological
+rank, reason, strata, and selection-time metrics. Keeping the bootstrap baseline
+while excluding prior members prevents an over-cap backlog from being skipped;
+successive incremental batches drain it in eligibility-time order. A version
+rerun verifies the static inputs and reuses the same membership. Any seed,
+method, policy, or bound drift under that version fails closed.
+
+The configured incremental per-run limit defaults to 100. Code enforces an
+independent absolute ceiling of 250 even if configuration is wrong. Every new
+scheduled period therefore requires a new cohort version; this repository does
+not create a schedule.
+
 ## Historical outputs
 
 Prices use the official batch price-history endpoint (maximum 20 tokens per
-request), `interval=max`, and a configurable fidelity that defaults to 60
-minutes. Each observation is normalized into `candlesticks` with
+request), `interval=max`, and a configurable primary fidelity that defaults to
+60 minutes. Production diagnostics found closed-token histories omitted at
+`max/60` that appeared at `max/720`; the single-token and batch endpoints agreed,
+so batching was not the failure. For tokens with an omitted or empty primary
+history, the collector performs exactly one additional batch request at the
+configured fallback fidelity (default 720 minutes). It does not split windows or
+fan out per token. Empty results after both explicit responses remain
+`unavailable`; mixed token coverage is `partial`. The upstream documentation
+does not define a retention guarantee or the exact span represented by `max`, so
+the fallback is evidence-based rather than treated as a contractual guarantee.
+
+Each observation is normalized into `candlesticks` with
 `open=high=low=close`; this is a sampled probability series, not exchange OHLCV.
-Hourly fidelity is intended for volatility, regime, and time-to-resolution
-context. It is not a substitute for proprietary live tick/L2 history.
+The primary hourly series and coarser fallback are intended for volatility,
+regime, and time-to-resolution context. Neither substitutes for proprietary live
+tick/L2 history.
 
 Trades retain the existing market-scoped Data API pagination logic. Pages are
 bounded to 10,000 rows and saturated windows are recursively bisected. A
@@ -84,16 +121,26 @@ distinguishes `not_started`, `in_progress`, `completed`, `partial`,
 terminal only after normalized writer/database work has drained safely. A crash
 leaves unfinished work retryable; completed markets are skipped on restart.
 
+Every attempted market also persists a compact profile under coverage
+provenance: identity/rank, phase state, records, request/page/window counts, API
+time, normalization time, writer enqueue time, writer drain time, total time,
+and error type. Writer drain includes the durable database batch/commit path but
+can include concurrent markets sharing the writer; it is not falsely labelled as
+exclusive SQL time.
+
 ## Commands
 
 ```text
-# Use existing catalogue, select a 25-market pilot, and fetch its data.
-python -m prediction_collector research-backfill --max-markets 25
+# Use existing catalogue, select a 100-market bootstrap, and fetch its data.
+python -m prediction_collector research-backfill --mode bootstrap --max-markets 100
+
+# Select a new bounded incremental batch. Always use a new version for a new run.
+python -m prediction_collector research-backfill --mode incremental --cohort-version research-incremental-20260825-v1 --max-markets 5
 
 # Independently resumable phases.
-python -m prediction_collector research-backfill --phase catalogue
-python -m prediction_collector research-backfill --phase cohort --max-markets 25
-python -m prediction_collector research-backfill --phase data
+python -m prediction_collector research-backfill --mode bootstrap --phase catalogue
+python -m prediction_collector research-backfill --mode bootstrap --phase cohort --max-markets 100
+python -m prediction_collector research-backfill --mode bootstrap --phase data
 ```
 
 The Railway research service must use `python -m prediction_collector

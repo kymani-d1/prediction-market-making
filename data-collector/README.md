@@ -51,9 +51,10 @@ The operating model is also split deliberately:
 - `collector-live` / `run` is permanent and owns scarce, non-recoverable L2
   snapshots, deltas, reconstructed books, trades, spreads, depth, imbalance,
   reference prices, lifecycle evidence, and live economics.
-- `research-backfill` is a bounded historical bootstrap. It may refresh a
-  configurable catalogue horizon, persists a deterministic research cohort,
-  and fetches historical prices/trades only for that cohort.
+- `research-backfill --mode bootstrap` builds one bounded historical cohort.
+  `--mode incremental` creates a new immutable batch of newly eligible resolved
+  markets while excluding every prior research-cohort member. Both may refresh
+  the configured catalogue horizon and fetch history only for persisted members.
 - `backfill` is the retained legacy exhaustive workflow. It is expensive, is
   not the recommended Railway command, and must not be used for research pilots.
 
@@ -218,7 +219,8 @@ Removed variables are not aliases and are deliberately ignored: all
 ```text
 python -m prediction_collector migrate   apply pending migrations
 python -m prediction_collector run       permanent live worker; migrates on startup
-python -m prediction_collector research-backfill  bounded research dataset bootstrap
+python -m prediction_collector research-backfill --mode bootstrap    bounded bootstrap
+python -m prediction_collector research-backfill --mode incremental  immutable incremental batch
 python -m prediction_collector backfill  legacy exhaustive workflow; expensive
 python -m prediction_collector status    strictly read-only health report
 python -m prediction_collector smoke     read-only public API shape check
@@ -266,7 +268,7 @@ Then, in a second terminal while live collection remains running:
 ```powershell
 cd data-collector
 .\.venv\Scripts\Activate.ps1
-python -m prediction_collector research-backfill --max-markets 25
+python -m prediction_collector research-backfill --mode bootstrap --max-markets 25
 ```
 
 ### Docker Compose
@@ -285,7 +287,7 @@ docker compose logs -f collector
 Keep that collector running. Start a bounded research pilot separately:
 
 ```powershell
-docker compose run --rm collector research-backfill --max-markets 25
+docker compose run --rm collector research-backfill --mode bootstrap --max-markets 25
 ```
 
 `docker compose down -v` destroys both local PostgreSQL and MinIO volumes. It is
