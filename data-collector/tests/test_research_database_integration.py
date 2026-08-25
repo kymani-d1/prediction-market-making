@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(
 def _criteria() -> dict[str, object]:
     return {
         "method": "stratified_deterministic_sample",
-        "method_version": 1,
+        "method_version": 2,
         "horizon_days": 730,
         "dimensions": [
             "category",
@@ -33,6 +33,8 @@ def _criteria() -> dict[str, object]:
         "volume_buckets_usdc": [0, 1_000, 100_000],
         "liquidity_buckets_usdc": [0, 1_000, 10_000],
         "duration_buckets_days": [1, 7, 30],
+        "category_source": "event_metadata_then_question_taxonomy_v1",
+        "category_balance": "round_robin_before_full_strata_depth",
         "requires_outcome_token": True,
         "active_markets_included": True,
     }
@@ -47,6 +49,7 @@ async def test_research_schema_selection_resume_and_view_contract() -> None:
     database = Database(settings)
     migrations = await database.migrate()
     assert "004_research_backfill.sql" in migrations or not migrations
+    assert "005_research_category_view.sql" in migrations or not migrations
     await database.open()
     now = datetime.now(UTC)
     try:
@@ -83,13 +86,24 @@ async def test_research_schema_selection_resume_and_view_contract() -> None:
                             (exchange, external_id, title, category, status)
                         VALUES
                             ('polymarket', 'research-integration-event',
-                             'Research integration event', 'politics', 'closed')
+                             'Research integration event', NULL, 'closed')
                         RETURNING id
                         """
                     )
                 ).fetchone()
                 assert event is not None
                 event_id = int(event["id"])
+                questions = [
+                    "Will an NBA team win the final?",
+                    "Will Bitcoin trade above its target?",
+                    "Will the presidential election be called?",
+                    "Will the Federal Reserve cut its interest rate?",
+                    "Will a Ukraine ceasefire be announced?",
+                    "Will OpenAI announce new artificial intelligence research?",
+                    "Will the highest temperature exceed 30 C?",
+                    "Will a movie win an Oscar?",
+                    "Will an uncategorized outcome occur?",
+                ]
                 inserted_market_ids: list[int] = []
                 for index in range(9):
                     active = index == 8
@@ -111,7 +125,7 @@ async def test_research_schema_selection_resume_and_view_contract() -> None:
                             (
                                 f"research-integration-{index}",
                                 event_id,
-                                f"Research market {index}?",
+                                questions[index],
                                 "active" if active else "resolved",
                                 active,
                                 active,
@@ -255,7 +269,8 @@ async def test_research_schema_selection_resume_and_view_contract() -> None:
                 await connection.execute(
                     """
                     SELECT count(*) AS rows,
-                           count(*) FILTER (WHERE category = 'politics') AS categorized,
+                           count(DISTINCT category) AS distinct_categories,
+                           count(*) FILTER (WHERE category = 'unknown') AS unknown,
                            count(*) FILTER (WHERE is_winner IS TRUE) AS winners
                     FROM research_cohort_dataset
                     WHERE cohort_version = 'integration-v1'
@@ -264,7 +279,8 @@ async def test_research_schema_selection_resume_and_view_contract() -> None:
             ).fetchone()
         assert view is not None
         assert int(view["rows"]) == 18
-        assert int(view["categorized"]) == 18
+        assert int(view["distinct_categories"]) >= 8
+        assert int(view["unknown"]) == 0
         assert int(view["winners"]) == 8
     finally:
         await database.close()

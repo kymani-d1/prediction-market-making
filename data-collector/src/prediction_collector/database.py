@@ -2338,9 +2338,12 @@ class Database:
                 selected = await (
                     await connection.execute(
                         """
-                        WITH eligible AS (
+                        WITH candidates AS (
                             SELECT m.id AS market_id, m.external_id,
-                                   COALESCE(e.category, 'unknown') AS category,
+                                   e.category AS event_category,
+                                   lower(concat_ws(
+                                       ' ', m.question, m.slug, e.title
+                                   )) AS search_text,
                                    COALESCE(m.volume, 0) AS volume,
                                    COALESCE(m.liquidity, 0) AS liquidity,
                                    m.status, m.is_active, m.open_time, m.close_time,
@@ -2391,6 +2394,43 @@ class Database:
                                   WHERE o.market_id = m.id
                                     AND o.token_id IS NOT NULL
                               )
+                        ), eligible AS (
+                            SELECT candidates.*,
+                                   CASE
+                                     WHEN NULLIF(trim(event_category), '') IS NOT NULL
+                                       THEN lower(trim(event_category))
+                                     WHEN search_text ~
+                                       '(^|[^a-z0-9])(bitcoin|ethereum|solana|dogecoin|crypto|xrp|btc|eth)([^a-z0-9]|$)'
+                                       THEN 'crypto'
+                                     WHEN search_text ~
+                                       '(election|president|senate|congress|governor|parliament|democrat|republican|trump|biden|politic|prime minister|referendum)'
+                                       THEN 'politics'
+                                     WHEN search_text ~
+                                       '(temperature|weather|hurricane|climate|earthquake|wildfire|rainfall|snowfall)'
+                                       THEN 'weather_climate'
+                                     WHEN search_text ~
+                                       '(^|[^a-z0-9])(fc|nba|nfl|mlb|nhl|wnba|ncaa|ufc|fifa|dota|esports|soccer|football|basketball|baseball|hockey|tennis|golf|cricket|rugby)([^a-z0-9]|$)|[[:space:]]vs[.]?[[:space:]]|counter-strike|home runs|exact score|both teams|total kills|over/under|[[:space:]]o/u[[:space:]]|^spread:|set [0-9]+ winner|map [0-9]+'
+                                       THEN 'sports_esports'
+                                     WHEN search_text ~
+                                       '(federal reserve|interest rate|inflation|gdp|recession|unemployment|nasdaq|s&p|dow jones|stock|ipo|treasury|market cap)'
+                                       THEN 'macro_finance'
+                                     WHEN search_text ~
+                                       '(ceasefire|invasion|sanction|ukraine|russia|israel|iran|taiwan|nato|geopolit)'
+                                       THEN 'geopolitics'
+                                     WHEN search_text ~
+                                       '(artificial intelligence|openai|spacex|rocket launch|quantum|technology)'
+                                       THEN 'science_technology'
+                                     WHEN search_text ~
+                                       '(oscar|grammy|movie|film|album|box office|celebrity|television|music award)'
+                                       THEN 'entertainment'
+                                     ELSE 'other'
+                                   END AS category,
+                                   CASE
+                                     WHEN NULLIF(trim(event_category), '') IS NOT NULL
+                                       THEN 'event_metadata'
+                                     ELSE 'question_taxonomy_v1'
+                                   END AS category_source
+                            FROM candidates
                         ), ranked AS (
                             SELECT eligible.*,
                                    to_char(
@@ -2407,15 +2447,24 @@ class Database:
                                                 external_id
                                    ) AS stratum_depth
                             FROM eligible
+                        ), category_ranked AS (
+                            SELECT ranked.*,
+                                   row_number() OVER (
+                                       PARTITION BY category
+                                       ORDER BY stratum_depth, stable_key, external_id
+                                   ) AS category_depth
+                            FROM ranked
                         ), chosen AS (
                             SELECT *
-                            FROM ranked
-                            ORDER BY stratum_depth, stable_key, external_id
+                            FROM category_ranked
+                            ORDER BY category_depth, stratum_depth,
+                                     stable_key, external_id
                             LIMIT %s
                         ), numbered AS (
                             SELECT chosen.*,
                                    row_number() OVER (
-                                       ORDER BY stratum_depth, stable_key, external_id
+                                       ORDER BY category_depth, stratum_depth,
+                                                stable_key, external_id
                                    ) AS selection_rank
                             FROM chosen
                         )
@@ -2438,6 +2487,7 @@ class Database:
                                    'liquidity', liquidity,
                                    'status', status,
                                    'active', is_active,
+                                   'category_source', category_source,
                                    'open_time', open_time,
                                    'close_time', close_time
                                )

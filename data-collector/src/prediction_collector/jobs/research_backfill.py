@@ -93,7 +93,7 @@ async def run_polymarket_research_backfill(
         if phase in {"all", "cohort"}:
             criteria = {
                 "method": "stratified_deterministic_sample",
-                "method_version": 1,
+                "method_version": 2,
                 "horizon_days": settings.research_backfill_catalogue_horizon_days,
                 "dimensions": [
                     "category",
@@ -106,6 +106,8 @@ async def run_polymarket_research_backfill(
                 "volume_buckets_usdc": [0, 1_000, 100_000],
                 "liquidity_buckets_usdc": [0, 1_000, 10_000],
                 "duration_buckets_days": [1, 7, 30],
+                "category_source": "event_metadata_then_question_taxonomy_v1",
+                "category_balance": "round_robin_before_full_strata_depth",
                 "requires_outcome_token": True,
                 "active_markets_included": True,
             }

@@ -37,7 +37,9 @@ Selection is executed in PostgreSQL and persisted atomically. Eligible markets
 must be active or inside the configured historical horizon and must have at
 least one CLOB outcome token. Fixed, interpretable strata cover:
 
-- event category;
+- event category when present, otherwise a fixed versioned question/event-title
+  taxonomy (crypto, politics, weather/climate, sports/esports, macro/finance,
+  geopolitics, science/technology, entertainment, or other);
 - zero, quiet, medium, and high volume;
 - zero, thin, medium, and deep liquidity;
 - intraday, short, medium, long, and unknown duration;
@@ -45,12 +47,14 @@ least one CLOB outcome token. Fixed, interpretable strata cover:
 - calendar quarter.
 
 Within each stratum, `md5(seed + ':' + condition_id)` provides a stable order.
-The selector takes one market from each stratum before taking a second, and so
-on, until the bound is reached. This prevents a top-volume-only sample while
-remaining deterministic. `research_cohorts` stores the version, seed, criteria,
-horizon, timestamp, and bound; `research_cohort_markets` stores exact membership,
-rank, strata, selection-time metrics, and reason. Change the cohort version when
-any selection input or method changes.
+The selector first round-robins category buckets, then depth within the complete
+strata, until the bound is reached. This prevents both a top-volume-only sample
+and a large category with many occupied sub-strata from taking every pilot slot.
+The taxonomy is an explicit research heuristic, not exchange ground truth.
+`research_cohorts` stores the version, seed, criteria, horizon, timestamp, and
+bound; `research_cohort_markets` stores exact membership, rank, strata,
+selection-time metrics, category source, and reason. Change the cohort version
+when any selection input or method changes.
 
 ## Historical outputs
 

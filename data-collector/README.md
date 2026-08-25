@@ -294,7 +294,8 @@ not a normal reset command and must never be run against data you intend to keep
 ## PostgreSQL schema
 
 Migrations `002_polymarket_hot_archive.sql`,
-`003_archive_minimisation.sql`, and `004_research_backfill.sql` are forward-only.
+`003_archive_minimisation.sql`, `004_research_backfill.sql`, and
+`005_research_category_view.sql` are forward-only.
 Migration 002 renames the
 former unbounded tables to `legacy_*` instead of dropping them, then creates:
 
