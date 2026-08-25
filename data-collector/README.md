@@ -46,6 +46,17 @@ The new split is deliberate:
   message plus a deterministic 0.1% sample of known-valid frames. Normal known
   FULL_L2 messages already have a normalized permanent stream.
 
+The operating model is also split deliberately:
+
+- `collector-live` / `run` is permanent and owns scarce, non-recoverable L2
+  snapshots, deltas, reconstructed books, trades, spreads, depth, imbalance,
+  reference prices, lifecycle evidence, and live economics.
+- `research-backfill` is a bounded historical bootstrap. It may refresh a
+  configurable catalogue horizon, persists a deterministic research cohort,
+  and fetches historical prices/trades only for that cohort.
+- `backfill` is the retained legacy exhaustive workflow. It is expensive, is
+  not the recommended Railway command, and must not be used for research pilots.
+
 ## Collection tiers
 
 Every discovered market gets one auditable tier. Discovery, lifecycle metadata,
@@ -185,11 +196,13 @@ Important groups:
 - Guardrails: `POSTGRES_STORAGE_WARN_GB`,
   `POSTGRES_STORAGE_CRITICAL_GB`, archive warning/critical thresholds.
 
-Complete metadata refresh defaults to 15 minutes. Live lifecycle messages remain
+Complete live metadata refresh defaults to 15 minutes. Live lifecycle messages remain
 continuous; the longer REST cadence cuts repeated transport/archive work while
-content hashing still preserves every distinct response body. The six-hour live `/fee-rate` refresh is limited to current FULL_L2/SAMPLED
-markets because it requires one REST request per token. The explicit backfill
-remains comprehensive and is not affected by tier ceilings.
+content hashing still preserves every distinct response body. The six-hour live
+`/fee-rate` refresh is limited to current FULL_L2/SAMPLED markets because it
+requires one REST request per token. Research backfill never performs that
+universal lookup: it records fee/reward evidence from cohort market metadata and
+marks irrecoverable historical economics unknown.
 
 Removed variables are not aliases and are deliberately ignored: all
 `KALSHI_*` variables (`KALSHI_ENABLED`, `KALSHI_API_KEY_ID`,
@@ -205,12 +218,13 @@ Removed variables are not aliases and are deliberately ignored: all
 ```text
 python -m prediction_collector migrate   apply pending migrations
 python -m prediction_collector run       permanent live worker; migrates on startup
-python -m prediction_collector backfill  one-shot uncapped Polymarket REST backfill
+python -m prediction_collector research-backfill  bounded research dataset bootstrap
+python -m prediction_collector backfill  legacy exhaustive workflow; expensive
 python -m prediction_collector status    strictly read-only health report
 python -m prediction_collector smoke     read-only public API shape check
 ```
 
-`run` and `backfill` require valid S3 configuration. `status` never applies a
+Write commands require valid S3 configuration. `status` never applies a
 migration. It verifies migration names/checksums and returns non-zero with a
 pending/inconsistent report. Migration responsibility belongs to `migrate` and
 the write-worker startup path.
@@ -220,7 +234,7 @@ The correct order after creating storage is:
 1. run `migrate`;
 2. start the permanent `run` worker immediately;
 3. verify live subscription and archive uploads;
-4. run `backfill` in a second terminal or one-shot container.
+4. run a small `research-backfill` pilot in the backfill service.
 
 Do not reverse steps 2 and 4. Historical REST data is recoverable later;
 missed WebSocket microstructure generally is not.
@@ -252,7 +266,7 @@ Then, in a second terminal while live collection remains running:
 ```powershell
 cd data-collector
 .\.venv\Scripts\Activate.ps1
-python -m prediction_collector backfill
+python -m prediction_collector research-backfill --max-markets 25
 ```
 
 ### Docker Compose
@@ -268,10 +282,10 @@ docker compose up -d database object-store object-store-init migrate collector
 docker compose logs -f collector
 ```
 
-Keep that collector running. Start backfill separately:
+Keep that collector running. Start a bounded research pilot separately:
 
 ```powershell
-docker compose run --rm collector backfill
+docker compose run --rm collector research-backfill --max-markets 25
 ```
 
 `docker compose down -v` destroys both local PostgreSQL and MinIO volumes. It is
@@ -279,8 +293,9 @@ not a normal reset command and must never be run against data you intend to keep
 
 ## PostgreSQL schema
 
-Migrations `002_polymarket_hot_archive.sql` and
-`003_archive_minimisation.sql` are forward-only. Migration 002 renames the
+Migrations `002_polymarket_hot_archive.sql`,
+`003_archive_minimisation.sql`, and `004_research_backfill.sql` are forward-only.
+Migration 002 renames the
 former unbounded tables to `legacy_*` instead of dropping them, then creates:
 
 - `market_collection_tiers` and append-only tier changes;
@@ -302,6 +317,12 @@ transport timing changes update current fields without opening false metadata
 versions. Full exchange payloads live in the raw REST archive. Outcome IDs remain
 stable before token assignment; linked negative-risk memberships are deduplicated
 and retired when authoritative metadata changes.
+
+Migration 004 adds `research_cohorts`, `research_cohort_markets`, and
+`research_market_coverage`. `research_cohort_dataset` is a flat outcome-level
+view joining cohort membership, market metadata, category/tags, resolution
+labels, and component coverage. Historical prices remain in `candlesticks` and
+trades in `trades`, keyed by the market/outcome IDs exposed by that view.
 
 ## Status and observability
 

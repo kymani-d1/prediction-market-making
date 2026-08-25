@@ -18,15 +18,17 @@ Polymarket REST + WebSockets
                  selected raw WebSocket evidence and reference prices
 ```
 
-All active/tradable markets are discovered and retained as metadata. Expensive
-continuous collection is dynamically assigned to `FULL_L2`, `SAMPLED`, or
-`METADATA_ONLY` tiers. The default ceilings are explicit safety controls, not
-discovery limits.
+The production system has two deliberately different jobs. `collector-live` is
+the permanent, high-value microstructure collector: it discovers all currently
+tradeable markets and assigns bounded `FULL_L2`, `SAMPLED`, or `METADATA_ONLY`
+tiers. `research-backfill` is a bounded historical dataset bootstrap: it
+persists a deterministic stratified cohort, then collects historical prices and
+trades only for that cohort. It is not an archival replica of Polymarket.
 
 Start with [the collector runbook](data-collector/README.md). The critical
-operational rule is: after migrations, start the permanent live worker first;
-run historical backfill separately afterward. REST history is recoverable;
-missed WebSocket microstructure usually is not.
+operational rule is: protect the permanent live worker first; run bounded
+historical research separately afterward. REST history is partly recoverable;
+missed WebSocket L2 microstructure is not.
 
 Before the refactor, the repository state was preserved locally as the annotated
 Git tag `pre-polymarket-only`. Push it when you are ready:
