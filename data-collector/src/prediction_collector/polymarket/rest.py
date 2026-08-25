@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any
 
 from prediction_collector.common.http import AsyncHttpClient, HttpResult
@@ -132,6 +133,7 @@ class PolymarketRestClient:
         *,
         active: bool | None = None,
         closed: bool | None = None,
+        end_date_min: datetime | None = None,
         after_cursor: str | None = None,
     ) -> AsyncIterator[tuple[list[dict[str, Any]], HttpResult, str | None]]:
         params: dict[str, Any] = {}
@@ -139,6 +141,8 @@ class PolymarketRestClient:
             params["active"] = str(active).lower()
         if closed is not None:
             params["closed"] = str(closed).lower()
+        if end_date_min is not None:
+            params["end_date_min"] = end_date_min.isoformat()
         async for page in self._keyset(
             "events", parameters=params, after_cursor=after_cursor
         ):
@@ -165,6 +169,7 @@ class PolymarketRestClient:
         *,
         active: bool | None = None,
         closed: bool | None = None,
+        end_date_min: datetime | None = None,
         after_cursor: str | None = None,
     ) -> AsyncIterator[tuple[list[dict[str, Any]], HttpResult, str | None]]:
         params: dict[str, Any] = {}
@@ -172,6 +177,8 @@ class PolymarketRestClient:
             params["active"] = str(active).lower()
         if closed is not None:
             params["closed"] = str(closed).lower()
+        if end_date_min is not None:
+            params["end_date_min"] = end_date_min.isoformat()
         async for page in self._keyset(
             "markets", parameters=params, after_cursor=after_cursor
         ):
@@ -273,6 +280,25 @@ class PolymarketRestClient:
         return await self.http.get_json(
             f"{self.clob_url}/prices-history",
             params={"market": token_id, "interval": interval, "fidelity": fidelity_minutes},
+        )
+
+    async def batch_price_history(
+        self,
+        token_ids: list[str],
+        *,
+        interval: str = "max",
+        fidelity_minutes: int = 60,
+    ) -> HttpResult:
+        if not token_ids or len(token_ids) > 20:
+            raise ValueError("Polymarket batch price history requires 1-20 tokens")
+        return await self.http.request_json(
+            "POST",
+            f"{self.clob_url}/batch-prices-history",
+            json_body={
+                "markets": token_ids,
+                "interval": interval,
+                "fidelity": fidelity_minutes,
+            },
         )
 
     async def open_interest(self, condition_ids: list[str]) -> HttpResult:

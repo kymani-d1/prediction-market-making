@@ -24,6 +24,7 @@ DEFAULT_POLYMARKET_EQUITY_SYMBOLS = frozenset(
         "XAUUSD", "XAGUSD", "WTI", "CC", "NGD",
     }
 )
+RESEARCH_BACKFILL_ABSOLUTE_MAX_MARKETS = 5_000
 
 
 class ConfigurationError(ValueError):
@@ -120,6 +121,20 @@ class Settings:
     database_flush_interval_seconds: float = 2
     database_queue_size: int = 50_000
     polymarket_ws_subscription_chunk_size: int = 500
+
+    # Research backfill is deliberately a bounded sample, not an exchange
+    # replica.  The absolute ceiling is code-enforced so a mistyped Railway
+    # variable cannot fan expensive work out across the full catalogue.
+    research_backfill_cohort_version: str = "v1"
+    research_backfill_seed: str = "prediction-market-making-research-v1"
+    research_backfill_max_markets: int = 2_500
+    research_backfill_hard_max_markets: int = 5_000
+    research_backfill_catalogue_horizon_days: int = 730
+    research_backfill_refresh_catalogue: bool = False
+    research_backfill_request_concurrency: int = 4
+    research_backfill_candidate_batch_size: int = 100
+    research_backfill_price_fidelity_minutes: int = 60
+    research_backfill_archive_raw_rest: bool = False
 
     # These are intentionally pilot limits. Raising them requires a measured
     # queue/CPU/archive-growth review, not an assumption that discovery scale
@@ -231,6 +246,26 @@ class Settings:
             "postgres_storage_warn_gb": str(self.postgres_storage_warn_gb),
             "postgres_storage_critical_gb": str(self.postgres_storage_critical_gb),
             "http_concurrency": self.http_concurrency,
+            "research_backfill_cohort_version": self.research_backfill_cohort_version,
+            "research_backfill_max_markets": self.research_backfill_max_markets,
+            "research_backfill_hard_max_markets": (
+                self.research_backfill_hard_max_markets
+            ),
+            "research_backfill_catalogue_horizon_days": (
+                self.research_backfill_catalogue_horizon_days
+            ),
+            "research_backfill_refresh_catalogue": (
+                self.research_backfill_refresh_catalogue
+            ),
+            "research_backfill_request_concurrency": (
+                self.research_backfill_request_concurrency
+            ),
+            "research_backfill_price_fidelity_minutes": (
+                self.research_backfill_price_fidelity_minutes
+            ),
+            "research_backfill_archive_raw_rest": (
+                self.research_backfill_archive_raw_rest
+            ),
             "log_level": self.log_level,
             "json_logs": self.json_logs,
         }
@@ -277,6 +312,58 @@ class Settings:
             database_flush_interval_seconds=_float(get("DATABASE_FLUSH_INTERVAL_SECONDS"), 2, name="DATABASE_FLUSH_INTERVAL_SECONDS", minimum=0.1),
             database_queue_size=_int(get("DATABASE_QUEUE_SIZE"), 50_000, name="DATABASE_QUEUE_SIZE", minimum=100),
             polymarket_ws_subscription_chunk_size=_int(get("POLYMARKET_WS_SUBSCRIPTION_CHUNK_SIZE"), 500, name="POLYMARKET_WS_SUBSCRIPTION_CHUNK_SIZE", minimum=1),
+            research_backfill_cohort_version=(
+                get("RESEARCH_BACKFILL_COHORT_VERSION", "v1") or "v1"
+            ).strip(),
+            research_backfill_seed=(
+                get(
+                    "RESEARCH_BACKFILL_SEED",
+                    "prediction-market-making-research-v1",
+                )
+                or "prediction-market-making-research-v1"
+            ).strip(),
+            research_backfill_max_markets=_int(
+                get("RESEARCH_BACKFILL_MAX_MARKETS"),
+                2_500,
+                name="RESEARCH_BACKFILL_MAX_MARKETS",
+                minimum=1,
+            ),
+            research_backfill_hard_max_markets=_int(
+                get("RESEARCH_BACKFILL_HARD_MAX_MARKETS"),
+                5_000,
+                name="RESEARCH_BACKFILL_HARD_MAX_MARKETS",
+                minimum=1,
+            ),
+            research_backfill_catalogue_horizon_days=_int(
+                get("RESEARCH_BACKFILL_CATALOGUE_HORIZON_DAYS"),
+                730,
+                name="RESEARCH_BACKFILL_CATALOGUE_HORIZON_DAYS",
+                minimum=30,
+            ),
+            research_backfill_refresh_catalogue=_bool(
+                get("RESEARCH_BACKFILL_REFRESH_CATALOGUE"), False
+            ),
+            research_backfill_request_concurrency=_int(
+                get("RESEARCH_BACKFILL_REQUEST_CONCURRENCY"),
+                4,
+                name="RESEARCH_BACKFILL_REQUEST_CONCURRENCY",
+                minimum=1,
+            ),
+            research_backfill_candidate_batch_size=_int(
+                get("RESEARCH_BACKFILL_CANDIDATE_BATCH_SIZE"),
+                100,
+                name="RESEARCH_BACKFILL_CANDIDATE_BATCH_SIZE",
+                minimum=1,
+            ),
+            research_backfill_price_fidelity_minutes=_int(
+                get("RESEARCH_BACKFILL_PRICE_FIDELITY_MINUTES"),
+                60,
+                name="RESEARCH_BACKFILL_PRICE_FIDELITY_MINUTES",
+                minimum=1,
+            ),
+            research_backfill_archive_raw_rest=_bool(
+                get("RESEARCH_BACKFILL_ARCHIVE_RAW_REST"), False
+            ),
             full_l2_max_markets=_int(get("FULL_L2_MAX_MARKETS"), 10, name="FULL_L2_MAX_MARKETS"),
             sampled_max_markets=_int(get("SAMPLED_MAX_MARKETS"), 50, name="SAMPLED_MAX_MARKETS"),
             full_l2_min_score=_decimal(get("FULL_L2_MIN_SCORE"), Decimal("55"), name="FULL_L2_MIN_SCORE"),
@@ -357,6 +444,40 @@ class Settings:
             raise ConfigurationError("S3_URL_STYLE must be virtual, path, or auto")
         if settings.full_l2_market_allowlist & settings.live_market_blocklist:
             raise ConfigurationError("FULL_L2_MARKET_ALLOWLIST and LIVE_MARKET_BLOCKLIST overlap")
+        if not settings.research_backfill_cohort_version:
+            raise ConfigurationError("RESEARCH_BACKFILL_COHORT_VERSION cannot be empty")
+        if not settings.research_backfill_seed:
+            raise ConfigurationError("RESEARCH_BACKFILL_SEED cannot be empty")
+        if (
+            settings.research_backfill_hard_max_markets
+            > RESEARCH_BACKFILL_ABSOLUTE_MAX_MARKETS
+        ):
+            raise ConfigurationError(
+                "RESEARCH_BACKFILL_HARD_MAX_MARKETS cannot exceed 5000"
+            )
+        if (
+            settings.research_backfill_max_markets
+            > settings.research_backfill_hard_max_markets
+        ):
+            raise ConfigurationError(
+                "RESEARCH_BACKFILL_MAX_MARKETS cannot exceed "
+                "RESEARCH_BACKFILL_HARD_MAX_MARKETS"
+            )
+        if (
+            settings.research_backfill_request_concurrency
+            > settings.http_concurrency
+        ):
+            raise ConfigurationError(
+                "RESEARCH_BACKFILL_REQUEST_CONCURRENCY cannot exceed HTTP_CONCURRENCY"
+            )
+        if (
+            settings.research_backfill_candidate_batch_size
+            < settings.research_backfill_request_concurrency
+        ):
+            raise ConfigurationError(
+                "RESEARCH_BACKFILL_CANDIDATE_BATCH_SIZE cannot be below "
+                "RESEARCH_BACKFILL_REQUEST_CONCURRENCY"
+            )
         if settings.archive_queue_warn_rows >= settings.archive_queue_max_rows:
             raise ConfigurationError("ARCHIVE_QUEUE_WARN_ROWS must be below ARCHIVE_QUEUE_MAX_ROWS")
         if settings.archive_queue_critical_rows > settings.archive_queue_max_rows:

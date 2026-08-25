@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -15,7 +16,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from prediction_collector.common.types import MarketCandidate
+from prediction_collector.common.types import (
+    MarketCandidate,
+    ResearchMarket,
+    ResearchOutcome,
+)
 from prediction_collector.common.utils import (
     canonical_json,
     content_hash,
@@ -56,6 +61,13 @@ _EXPECTED_POLYMARKET_CRYPTO_REFERENCE_PROVIDERS = (
     "chainlink_twap_30s",
     "chainlink_twap_60s",
 )
+
+
+def research_selection_key(seed: str, external_id: str) -> str:
+    """Match PostgreSQL md5(seed || ':' || external_id) exactly."""
+    return hashlib.md5(
+        f"{seed}:{external_id}".encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
 
 
 def _discovery_state(
@@ -226,6 +238,57 @@ def _market_candidate_from_row(row: Mapping[str, Any]) -> MarketCandidate:
         open_time=row["open_time"],
         close_time=row["close_time"],
         outcome_token_ids=tuple(row["token_ids"]),
+    )
+
+
+def _research_market_from_row(row: Mapping[str, Any]) -> ResearchMarket:
+    raw_outcomes = row.get("outcomes")
+    outcomes: list[ResearchOutcome] = []
+    if isinstance(raw_outcomes, list):
+        for value in raw_outcomes:
+            if not isinstance(value, Mapping) or not value.get("token_id"):
+                continue
+            outcomes.append(
+                ResearchOutcome(
+                    external_id=(
+                        str(value["external_id"])
+                        if value.get("external_id") is not None
+                        else None
+                    ),
+                    token_id=str(value["token_id"]),
+                    name=str(value.get("name") or ""),
+                    outcome_index=(
+                        int(value["outcome_index"])
+                        if value.get("outcome_index") is not None
+                        else None
+                    ),
+                    last_price=value.get("last_price"),
+                )
+            )
+    raw_data = row.get("raw_data")
+    return ResearchMarket(
+        cohort_id=int(row["cohort_id"]),
+        cohort_version=str(row["cohort_version"]),
+        selection_rank=int(row["selection_rank"]),
+        market_id=int(row["market_id"]),
+        external_id=str(row["external_id"]),
+        question=str(row["question"]),
+        category=str(row.get("category") or "unknown"),
+        status=str(row.get("status") or "unknown"),
+        active=bool(row.get("is_active")),
+        open_time=row.get("open_time"),
+        close_time=row.get("close_time"),
+        settlement_time=row.get("settlement_time"),
+        result=str(row["result"]) if row.get("result") is not None else None,
+        volume=row.get("volume"),
+        liquidity=row.get("liquidity"),
+        fee_rate=row.get("fee_rate"),
+        raw_data=dict(raw_data) if isinstance(raw_data, Mapping) else {},
+        outcomes=tuple(outcomes),
+        price_status=str(row.get("price_status") or "not_started"),
+        trade_status=str(row.get("trade_status") or "not_started"),
+        resolution_status=str(row.get("resolution_status") or "not_started"),
+        economics_status=str(row.get("economics_status") or "not_started"),
     )
 
 
@@ -2202,6 +2265,409 @@ class Database:
         if row is None:
             return False, None
         return True, str(row["cursor"]) if row["cursor"] is not None else None
+
+    async def create_or_get_research_cohort(
+        self,
+        *,
+        exchange: str,
+        version: str,
+        seed: str,
+        max_markets: int,
+        horizon_start: datetime,
+        criteria: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Atomically persist a deterministic, bounded stratified cohort."""
+        if not 1 <= max_markets <= 5_000:
+            raise ValueError("research cohort size must be between 1 and 5000")
+        criteria_value = dict(criteria)
+        async with self.pool.connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"research_cohort:{exchange}:{version}",),
+                )
+                existing = await (
+                    await connection.execute(
+                        """
+                        SELECT id, exchange, version, seed, selection_timestamp,
+                               horizon_start, max_markets, selected_count,
+                               criteria, status
+                        FROM research_cohorts
+                        WHERE exchange = %s AND version = %s
+                        """,
+                        (exchange, version),
+                    )
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        str(existing["seed"]) != seed
+                        or int(existing["max_markets"]) != max_markets
+                        or dict(existing["criteria"]) != criteria_value
+                    ):
+                        raise ValueError(
+                            "research cohort version already exists with different "
+                            "selection inputs; use a new cohort version"
+                        )
+                    if existing["status"] != "ready":
+                        raise RuntimeError("research cohort transaction is not ready")
+                    return dict(existing)
+
+                cohort = await (
+                    await connection.execute(
+                        """
+                        INSERT INTO research_cohorts
+                            (exchange, version, seed, horizon_start, max_markets,
+                             criteria, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'selecting')
+                        RETURNING id, exchange, version, seed,
+                                  selection_timestamp, horizon_start,
+                                  max_markets, selected_count, criteria, status
+                        """,
+                        (
+                            exchange,
+                            version,
+                            seed,
+                            horizon_start,
+                            max_markets,
+                            _json(criteria_value),
+                        ),
+                    )
+                ).fetchone()
+                assert cohort is not None
+                cohort_id = int(cohort["id"])
+                selected = await (
+                    await connection.execute(
+                        """
+                        WITH eligible AS (
+                            SELECT m.id AS market_id, m.external_id,
+                                   COALESCE(e.category, 'unknown') AS category,
+                                   COALESCE(m.volume, 0) AS volume,
+                                   COALESCE(m.liquidity, 0) AS liquidity,
+                                   m.status, m.is_active, m.open_time, m.close_time,
+                                   COALESCE(
+                                       m.settlement_time, m.close_time, m.open_time
+                                   ) AS regime_time,
+                                   CASE
+                                     WHEN m.is_active THEN 'active'
+                                     WHEN m.status IN (
+                                         'resolved', 'closed', 'settled', 'finalized'
+                                     ) THEN 'resolved'
+                                     ELSE 'inactive'
+                                   END AS lifecycle_bucket,
+                                   CASE
+                                     WHEN COALESCE(m.volume, 0) = 0 THEN 'zero'
+                                     WHEN m.volume < 1000 THEN 'quiet'
+                                     WHEN m.volume < 100000 THEN 'medium'
+                                     ELSE 'high'
+                                   END AS volume_bucket,
+                                   CASE
+                                     WHEN COALESCE(m.liquidity, 0) = 0 THEN 'zero'
+                                     WHEN m.liquidity < 1000 THEN 'thin'
+                                     WHEN m.liquidity < 10000 THEN 'medium'
+                                     ELSE 'deep'
+                                   END AS liquidity_bucket,
+                                   CASE
+                                     WHEN m.open_time IS NULL OR m.close_time IS NULL
+                                       THEN 'unknown'
+                                     WHEN m.close_time - m.open_time <= interval '1 day'
+                                       THEN 'intraday'
+                                     WHEN m.close_time - m.open_time <= interval '7 days'
+                                       THEN 'short'
+                                     WHEN m.close_time - m.open_time <= interval '30 days'
+                                       THEN 'medium'
+                                     ELSE 'long'
+                                   END AS duration_bucket
+                            FROM markets m
+                            LEFT JOIN events e ON e.id = m.event_id
+                            WHERE m.exchange = %s
+                              AND (
+                                  m.is_active
+                                  OR COALESCE(
+                                      m.settlement_time, m.close_time, m.open_time
+                                  ) >= %s
+                              )
+                              AND EXISTS (
+                                  SELECT 1 FROM outcomes o
+                                  WHERE o.market_id = m.id
+                                    AND o.token_id IS NOT NULL
+                              )
+                        ), ranked AS (
+                            SELECT eligible.*,
+                                   to_char(
+                                       date_trunc('quarter', regime_time),
+                                       'YYYY-"Q"Q'
+                                   ) AS calendar_bucket,
+                                   md5(%s || ':' || external_id) AS stable_key,
+                                   row_number() OVER (
+                                       PARTITION BY category, volume_bucket,
+                                                    liquidity_bucket, duration_bucket,
+                                                    lifecycle_bucket,
+                                                    date_trunc('quarter', regime_time)
+                                       ORDER BY md5(%s || ':' || external_id),
+                                                external_id
+                                   ) AS stratum_depth
+                            FROM eligible
+                        ), chosen AS (
+                            SELECT *
+                            FROM ranked
+                            ORDER BY stratum_depth, stable_key, external_id
+                            LIMIT %s
+                        ), numbered AS (
+                            SELECT chosen.*,
+                                   row_number() OVER (
+                                       ORDER BY stratum_depth, stable_key, external_id
+                                   ) AS selection_rank
+                            FROM chosen
+                        )
+                        INSERT INTO research_cohort_markets
+                            (cohort_id, market_id, market_external_id,
+                             selection_rank, selection_reason, strata,
+                             selection_metrics)
+                        SELECT %s, market_id, external_id, selection_rank,
+                               'stratified_deterministic_sample',
+                               jsonb_build_object(
+                                   'category', category,
+                                   'volume_bucket', volume_bucket,
+                                   'liquidity_bucket', liquidity_bucket,
+                                   'duration_bucket', duration_bucket,
+                                   'lifecycle_bucket', lifecycle_bucket,
+                                   'calendar_bucket', calendar_bucket
+                               ),
+                               jsonb_build_object(
+                                   'volume', volume,
+                                   'liquidity', liquidity,
+                                   'status', status,
+                                   'active', is_active,
+                                   'open_time', open_time,
+                                   'close_time', close_time
+                               )
+                        FROM numbered
+                        ORDER BY selection_rank
+                        RETURNING market_id
+                        """,
+                        (
+                            exchange,
+                            horizon_start,
+                            seed,
+                            seed,
+                            max_markets,
+                            cohort_id,
+                        ),
+                    )
+                ).fetchall()
+                selected_count = len(selected)
+                if selected_count == 0:
+                    raise RuntimeError(
+                        "research cohort selection found no markets with outcome tokens"
+                    )
+                await connection.execute(
+                    """
+                    INSERT INTO research_market_coverage (cohort_id, market_id)
+                    SELECT cohort_id, market_id
+                    FROM research_cohort_markets
+                    WHERE cohort_id = %s
+                    """,
+                    (cohort_id,),
+                )
+                ready = await (
+                    await connection.execute(
+                        """
+                        UPDATE research_cohorts
+                        SET selected_count = %s, status = 'ready',
+                            updated_at = clock_timestamp()
+                        WHERE id = %s
+                        RETURNING id, exchange, version, seed,
+                                  selection_timestamp, horizon_start,
+                                  max_markets, selected_count, criteria, status
+                        """,
+                        (selected_count, cohort_id),
+                    )
+                ).fetchone()
+                assert ready is not None
+                return dict(ready)
+
+    async def iter_research_markets(
+        self,
+        *,
+        exchange: str,
+        cohort_version: str,
+        batch_size: int = 100,
+    ) -> AsyncIterator[ResearchMarket]:
+        """Stream persisted cohort members in immutable selection order."""
+        if batch_size <= 0:
+            raise ValueError("research candidate batch size must be positive")
+        after_rank = 0
+        while True:
+            async with self.pool.connection() as connection:
+                rows = await (
+                    await connection.execute(
+                        """
+                        SELECT c.id AS cohort_id, c.version AS cohort_version,
+                               cm.selection_rank, m.id AS market_id,
+                               m.external_id, m.question,
+                               COALESCE(e.category, 'unknown') AS category,
+                               m.status, m.is_active, m.open_time, m.close_time,
+                               m.settlement_time, m.result, m.volume, m.liquidity,
+                               m.fee_rate, m.raw_data,
+                               cov.price_status, cov.trade_status,
+                               cov.resolution_status, cov.economics_status,
+                               COALESCE(outcomes.values, '[]'::JSONB) AS outcomes
+                        FROM research_cohorts c
+                        JOIN research_cohort_markets cm ON cm.cohort_id = c.id
+                        JOIN markets m ON m.id = cm.market_id
+                        LEFT JOIN events e ON e.id = m.event_id
+                        JOIN research_market_coverage cov
+                          ON cov.cohort_id = cm.cohort_id
+                         AND cov.market_id = cm.market_id
+                        LEFT JOIN LATERAL (
+                            SELECT jsonb_agg(
+                                jsonb_build_object(
+                                    'external_id', o.external_id,
+                                    'token_id', o.token_id,
+                                    'name', o.name,
+                                    'outcome_index', o.outcome_index,
+                                    'last_price', o.last_price
+                                ) ORDER BY o.outcome_index NULLS LAST, o.id
+                            ) AS values
+                            FROM outcomes o
+                            WHERE o.market_id = m.id AND o.token_id IS NOT NULL
+                        ) outcomes ON TRUE
+                        WHERE c.exchange = %s AND c.version = %s
+                          AND c.status = 'ready' AND cm.selection_rank > %s
+                        ORDER BY cm.selection_rank
+                        LIMIT %s
+                        """,
+                        (exchange, cohort_version, after_rank, batch_size),
+                    )
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield _research_market_from_row(row)
+            after_rank = int(rows[-1]["selection_rank"])
+
+    async def set_research_phase_status(
+        self,
+        *,
+        cohort_id: int,
+        market_id: int,
+        phase: str,
+        status: str,
+        records: int = 0,
+        requests: int = 0,
+        partial_history: bool = False,
+        provenance: Mapping[str, Any] | None = None,
+        error_summary: str | None = None,
+    ) -> None:
+        phases = {"price", "trade", "resolution", "economics"}
+        statuses = {
+            "not_started", "in_progress", "completed", "partial",
+            "unavailable", "retryable_failed", "not_applicable",
+        }
+        if phase not in phases:
+            raise ValueError(f"unsupported research phase: {phase}")
+        if status not in statuses:
+            raise ValueError(f"unsupported research phase status: {status}")
+        if records < 0 or requests < 0:
+            raise ValueError("research progress counters cannot be negative")
+        status_column = f"{phase}_status"
+        record_assignment = ""
+        parameters: list[Any] = [status]
+        if phase == "price":
+            record_assignment = ", price_records = %s"
+            parameters.append(records)
+        elif phase == "trade":
+            record_assignment = ", trade_records = %s"
+            parameters.append(records)
+        parameters.extend(
+            [
+                requests,
+                partial_history,
+                _json(
+                    json.loads(
+                        canonical_json({phase: dict(provenance or {})})
+                    )
+                ),
+                error_summary,
+                status,
+                cohort_id,
+                market_id,
+            ]
+        )
+        terminal = ["completed", "partial", "unavailable", "not_applicable"]
+        async with self.pool.connection() as connection:
+            async with connection.transaction():
+                cursor = await connection.execute(
+                    f"""
+                    UPDATE research_market_coverage
+                    SET {status_column} = %s
+                        {record_assignment},
+                        request_count = request_count + %s,
+                        partial_history = partial_history OR %s,
+                        provenance = provenance || %s,
+                        error_summary = %s,
+                        started_at = CASE
+                            WHEN %s = 'in_progress'
+                            THEN COALESCE(started_at, clock_timestamp())
+                            ELSE started_at
+                        END,
+                        updated_at = clock_timestamp()
+                    WHERE cohort_id = %s AND market_id = %s
+                    """,
+                    tuple(parameters),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("research coverage row is missing")
+                await connection.execute(
+                    """
+                    UPDATE research_market_coverage
+                    SET completed_at = CASE
+                        WHEN price_status = ANY(%s)
+                         AND trade_status = ANY(%s)
+                         AND resolution_status = ANY(%s)
+                         AND economics_status = ANY(%s)
+                        THEN COALESCE(completed_at, clock_timestamp())
+                        ELSE NULL
+                    END
+                    WHERE cohort_id = %s AND market_id = %s
+                    """,
+                    (terminal, terminal, terminal, terminal, cohort_id, market_id),
+                )
+
+    async def research_cohort_status(
+        self, *, exchange: str, cohort_version: str
+    ) -> Mapping[str, Any]:
+        async with self.pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    SELECT c.id, c.version, c.selection_timestamp,
+                           c.horizon_start, c.max_markets, c.selected_count,
+                           c.criteria, c.status,
+                           count(*) FILTER (WHERE cov.completed_at IS NOT NULL)
+                               AS completed_markets,
+                           count(*) FILTER (WHERE cov.partial_history)
+                               AS partial_markets,
+                           COALESCE(sum(cov.price_records), 0) AS price_records,
+                           COALESCE(sum(cov.trade_records), 0) AS trade_records,
+                           COALESCE(sum(cov.request_count), 0) AS request_count,
+                           count(*) FILTER (
+                               WHERE cov.price_status = 'retryable_failed'
+                                  OR cov.trade_status = 'retryable_failed'
+                                  OR cov.resolution_status = 'retryable_failed'
+                                  OR cov.economics_status = 'retryable_failed'
+                           ) AS retryable_failed_markets
+                    FROM research_cohorts c
+                    LEFT JOIN research_market_coverage cov ON cov.cohort_id = c.id
+                    WHERE c.exchange = %s AND c.version = %s
+                    GROUP BY c.id
+                    """,
+                    (exchange, cohort_version),
+                )
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("research cohort does not exist")
+        return dict(row)
 
     async def iter_live_candidates(
         self,

@@ -147,6 +147,7 @@ class AsyncHttpClient:
         *,
         params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        json_body: Any = None,
         retryable_status_codes: Collection[int] = (),
     ) -> HttpResult:
         method = method.upper()
@@ -159,7 +160,11 @@ class AsyncHttpClient:
             try:
                 async with self._semaphore:
                     response = await self._client.request(
-                        method, url, params=params, headers=headers
+                        method,
+                        url,
+                        params=params,
+                        headers=headers,
+                        json=json_body,
                     )
                 explicitly_allowed = response.status_code in explicitly_retryable
                 if (

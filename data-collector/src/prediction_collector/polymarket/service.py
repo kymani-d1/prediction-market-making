@@ -110,7 +110,14 @@ class PolymarketService:
             "polymarket", job, checkpoint_key=checkpoint_key
         )
 
-    async def sync_metadata(self, *, include_closed: bool = True) -> dict[str, Any]:
+    async def sync_metadata(
+        self,
+        *,
+        include_closed: bool = True,
+        closed_since: datetime | None = None,
+        checkpoint_prefix: str = "",
+        archive_raw_rest: bool = True,
+    ) -> dict[str, Any]:
         counts: dict[str, Any] = {
             "series": 0,
             "events": 0,
@@ -126,7 +133,8 @@ class PolymarketService:
         diagnostics = MetadataSyncDiagnostics()
         try:
             async for items, result in self.rest.iter_series():
-                await self._raw_page("gamma", "/series", "series", items, result)
+                if archive_raw_rest:
+                    await self._raw_page("gamma", "/series", "series", items, result)
                 for raw in items:
                     await self.database.upsert_series(normalise_series(raw))
                     counts["series"] += 1
@@ -135,7 +143,8 @@ class PolymarketService:
 
         try:
             async for items, result in self.rest.iter_tags():
-                await self._raw_page("gamma", "/tags", "tags", items, result)
+                if archive_raw_rest:
+                    await self._raw_page("gamma", "/tags", "tags", items, result)
                 for raw in items:
                     await self.database.upsert_tag("polymarket", raw)
                     counts["tags"] += 1
@@ -145,8 +154,12 @@ class PolymarketService:
         states = [False, True] if include_closed else [False]
         for closed in states:
             checkpoint_key = f"closed={str(closed).lower()}"
+            if closed and closed_since is not None:
+                checkpoint_key += f";end_date_min={closed_since.date().isoformat()}"
+            event_job = f"{checkpoint_prefix}metadata_events"
+            market_job = f"{checkpoint_prefix}metadata_markets"
             event_complete, event_cursor = await self._metadata_checkpoint_state(
-                "metadata_events", checkpoint_key
+                event_job, checkpoint_key
             )
             if event_complete:
                 counts["completed_metadata_cohorts_skipped"] += 1
@@ -160,17 +173,24 @@ class PolymarketService:
                     extra={"closed": closed, "has_persisted_cursor": True},
                 )
             if not event_complete:
+                event_parameters: dict[str, Any] = {
+                    "closed": closed,
+                    "after_cursor": event_cursor,
+                }
+                if closed and closed_since is not None:
+                    event_parameters["end_date_min"] = closed_since
                 async for items, result, cursor in self.rest.iter_events(
-                    closed=closed, after_cursor=event_cursor
+                    **event_parameters
                 ):
-                    await self._raw_page(
-                        "gamma",
-                        "/events/keyset",
-                        "events",
-                        items,
-                        result,
-                        external_key=cursor,
-                    )
+                    if archive_raw_rest:
+                        await self._raw_page(
+                            "gamma",
+                            "/events/keyset",
+                            "events",
+                            items,
+                            result,
+                            external_key=cursor,
+                        )
                     for raw in items:
                         for series_raw in _as_dict_list(raw.get("series")):
                             await self.database.upsert_series(normalise_series(series_raw))
@@ -178,7 +198,7 @@ class PolymarketService:
                         counts["events"] += 1
                     await self.database.checkpoint(
                         "polymarket",
-                        "metadata_events",
+                        event_job,
                         checkpoint_key=checkpoint_key,
                         cursor=cursor,
                         timestamp=utc_now(),
@@ -186,7 +206,7 @@ class PolymarketService:
                     )
 
             market_complete, market_cursor = await self._metadata_checkpoint_state(
-                "metadata_markets", checkpoint_key
+                market_job, checkpoint_key
             )
             if market_complete:
                 counts["completed_metadata_cohorts_skipped"] += 1
@@ -207,17 +227,19 @@ class PolymarketService:
                     cursor,
                 ) in self._iter_markets_with_stale_checkpoint_replay(
                     closed=closed,
+                    closed_since=closed_since if closed else None,
                     checkpoint_key=checkpoint_key,
                     persisted_cursor=market_cursor,
                 ):
-                    await self._raw_page(
-                        "gamma",
-                        "/markets/keyset",
-                        "markets",
-                        items,
-                        result,
-                        external_key=cursor,
-                    )
+                    if archive_raw_rest:
+                        await self._raw_page(
+                            "gamma",
+                            "/markets/keyset",
+                            "markets",
+                            items,
+                            result,
+                            external_key=cursor,
+                        )
                     for raw in items:
                         event_external_id: str | None = None
                         nested_events = _as_dict_list(raw.get("events"))
@@ -252,7 +274,7 @@ class PolymarketService:
                             counts["outcomes"] += 1
                     await self.database.checkpoint(
                         "polymarket",
-                        "metadata_markets",
+                        market_job,
                         checkpoint_key=checkpoint_key,
                         cursor=cursor,
                         timestamp=utc_now(),
@@ -331,6 +353,7 @@ class PolymarketService:
         self,
         *,
         closed: bool,
+        closed_since: datetime | None = None,
         checkpoint_key: str,
         persisted_cursor: str | None,
     ) -> AsyncIterator[tuple[list[dict[str, Any]], Any, str | None]]:
@@ -346,9 +369,13 @@ class PolymarketService:
         completed_pages = 0
         while True:
             try:
-                async for page in self.rest.iter_markets(
-                    closed=closed, after_cursor=cursor
-                ):
+                market_parameters: dict[str, Any] = {
+                    "closed": closed,
+                    "after_cursor": cursor,
+                }
+                if closed_since is not None:
+                    market_parameters["end_date_min"] = closed_since
+                async for page in self.rest.iter_markets(**market_parameters):
                     yield page
                     completed_pages += 1
                 return

@@ -17,6 +17,9 @@ from prediction_collector.config import Settings
 from prediction_collector.database import Database
 from prediction_collector.jobs.backfill import run_polymarket_backfill
 from prediction_collector.jobs.live import LiveCollector
+from prediction_collector.jobs.research_backfill import (
+    run_polymarket_research_backfill,
+)
 from prediction_collector.logging_config import ThroughputMetrics, configure_logging
 from prediction_collector.polymarket.rest import PolymarketRestClient
 from prediction_collector.polymarket.service import PolymarketService
@@ -35,7 +38,27 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("migrate", help="Apply pending plain-SQL database migrations")
     commands.add_parser(
-        "backfill", help="Backfill public Polymarket metadata and historical data"
+        "backfill",
+        help="Legacy exhaustive Polymarket backfill (expensive; not recommended)",
+    )
+    research = commands.add_parser(
+        "research-backfill",
+        help="Bounded historical dataset bootstrap for quantitative research",
+    )
+    research.add_argument(
+        "--phase",
+        choices=("all", "catalogue", "cohort", "data"),
+        default="all",
+        help="Run all phases or one independently resumable phase",
+    )
+    research.add_argument(
+        "--cohort-version",
+        help="Override RESEARCH_BACKFILL_COHORT_VERSION",
+    )
+    research.add_argument(
+        "--max-markets",
+        type=int,
+        help="Override bounded cohort size; hard ceiling still applies",
     )
     commands.add_parser("run", help="Run continuous live Polymarket collection")
     commands.add_parser(
@@ -106,7 +129,11 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
         finally:
             await database.close()
 
-    settings.require_archive()
+    if (
+        args.command != "research-backfill"
+        or settings.research_backfill_archive_raw_rest
+    ):
+        settings.require_archive()
     # Run/backfill startup owns migration responsibility. A status/health probe
     # cannot mutate schema.
     await database.migrate()
@@ -114,6 +141,8 @@ async def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
     try:
         if args.command == "backfill":
             await _backfill(database, metrics, settings)
+        elif args.command == "research-backfill":
+            await _research_backfill(database, metrics, settings, args)
         elif args.command == "run":
             await _live(database, metrics, settings)
     finally:
@@ -143,9 +172,11 @@ def _tier_manager(settings: Settings) -> TierManager:
 def _writer(
     database: Database,
     settings: Settings,
-    tier_manager: TierManager,
+    tier_manager: TierManager | None,
+    *,
+    archive_enabled: bool = True,
 ) -> BatchWriter:
-    archive = ArchiveWriter(settings, database)
+    archive = ArchiveWriter(settings, database) if archive_enabled else None
     return BatchWriter(
         database,
         max_queue_size=settings.database_queue_size,
@@ -205,6 +236,60 @@ async def _backfill(
                 rows_written=result.rows_written,
             )
             LOGGER.info("Polymarket backfill complete", extra=asdict(result))
+        except Exception as exc:
+            await database.finish_run(
+                run_id,
+                status="failed",
+                records_processed=0,
+                rows_written=writer.rows_written,
+                error_summary=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+
+
+async def _research_backfill(
+    database: Database,
+    metrics: ThroughputMetrics,
+    settings: Settings,
+    args: argparse.Namespace,
+) -> None:
+    del metrics
+    async with AsyncHttpClient(
+        concurrency=settings.http_concurrency,
+        timeout_seconds=settings.http_timeout_seconds,
+        max_attempts=settings.http_max_attempts,
+    ) as http:
+        # Research backfill never evaluates or mutates live collection tiers.
+        writer = _writer(
+            database,
+            settings,
+            None,
+            archive_enabled=settings.research_backfill_archive_raw_rest,
+        )
+        service = _service(
+            settings=settings,
+            database=database,
+            writer=writer,
+            http=http,
+        )
+        run_id = await database.start_run("research_backfill", "polymarket")
+        writer.run_id = run_id
+        try:
+            result = await run_polymarket_research_backfill(
+                service,
+                writer,
+                settings,
+                phase=args.phase,
+                cohort_version=args.cohort_version,
+                max_markets=args.max_markets,
+            )
+            await database.finish_run(
+                run_id,
+                status=result.status,
+                records_processed=result.records_processed,
+                rows_written=result.rows_written,
+            )
+            LOGGER.info("Polymarket research backfill complete", extra=asdict(result))
         except Exception as exc:
             await database.finish_run(
                 run_id,

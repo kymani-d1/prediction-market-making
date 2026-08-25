@@ -51,6 +51,41 @@ class MarketCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class ResearchOutcome:
+    external_id: str | None
+    token_id: str
+    name: str
+    outcome_index: int | None
+    last_price: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchMarket:
+    cohort_id: int
+    cohort_version: str
+    selection_rank: int
+    market_id: int
+    external_id: str
+    question: str
+    category: str
+    status: str
+    active: bool
+    open_time: datetime | None
+    close_time: datetime | None
+    settlement_time: datetime | None
+    result: str | None
+    volume: Decimal | None
+    liquidity: Decimal | None
+    fee_rate: Decimal | None
+    raw_data: JsonObject
+    outcomes: tuple[ResearchOutcome, ...]
+    price_status: str
+    trade_status: str
+    resolution_status: str
+    economics_status: str
+
+
+@dataclass(frozen=True, slots=True)
 class MarketExclusion:
     exchange: str
     external_id: str
