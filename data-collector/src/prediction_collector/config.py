@@ -25,6 +25,7 @@ DEFAULT_POLYMARKET_EQUITY_SYMBOLS = frozenset(
     }
 )
 RESEARCH_BACKFILL_ABSOLUTE_MAX_MARKETS = 5_000
+RESEARCH_BACKFILL_ABSOLUTE_INCREMENTAL_MAX_MARKETS = 250
 
 
 class ConfigurationError(ValueError):
@@ -127,13 +128,15 @@ class Settings:
     # variable cannot fan expensive work out across the full catalogue.
     research_backfill_cohort_version: str = "v1"
     research_backfill_seed: str = "prediction-market-making-research-v1"
-    research_backfill_max_markets: int = 2_500
+    research_backfill_max_markets: int = 100
     research_backfill_hard_max_markets: int = 5_000
+    research_backfill_incremental_max_markets: int = 100
     research_backfill_catalogue_horizon_days: int = 730
     research_backfill_refresh_catalogue: bool = False
     research_backfill_request_concurrency: int = 4
     research_backfill_candidate_batch_size: int = 100
     research_backfill_price_fidelity_minutes: int = 60
+    research_backfill_price_fallback_fidelity_minutes: int = 720
     research_backfill_archive_raw_rest: bool = False
 
     # These are intentionally pilot limits. Raising them requires a measured
@@ -251,6 +254,9 @@ class Settings:
             "research_backfill_hard_max_markets": (
                 self.research_backfill_hard_max_markets
             ),
+            "research_backfill_incremental_max_markets": (
+                self.research_backfill_incremental_max_markets
+            ),
             "research_backfill_catalogue_horizon_days": (
                 self.research_backfill_catalogue_horizon_days
             ),
@@ -262,6 +268,9 @@ class Settings:
             ),
             "research_backfill_price_fidelity_minutes": (
                 self.research_backfill_price_fidelity_minutes
+            ),
+            "research_backfill_price_fallback_fidelity_minutes": (
+                self.research_backfill_price_fallback_fidelity_minutes
             ),
             "research_backfill_archive_raw_rest": (
                 self.research_backfill_archive_raw_rest
@@ -324,7 +333,7 @@ class Settings:
             ).strip(),
             research_backfill_max_markets=_int(
                 get("RESEARCH_BACKFILL_MAX_MARKETS"),
-                2_500,
+                100,
                 name="RESEARCH_BACKFILL_MAX_MARKETS",
                 minimum=1,
             ),
@@ -332,6 +341,12 @@ class Settings:
                 get("RESEARCH_BACKFILL_HARD_MAX_MARKETS"),
                 5_000,
                 name="RESEARCH_BACKFILL_HARD_MAX_MARKETS",
+                minimum=1,
+            ),
+            research_backfill_incremental_max_markets=_int(
+                get("RESEARCH_BACKFILL_INCREMENTAL_MAX_MARKETS"),
+                100,
+                name="RESEARCH_BACKFILL_INCREMENTAL_MAX_MARKETS",
                 minimum=1,
             ),
             research_backfill_catalogue_horizon_days=_int(
@@ -359,6 +374,12 @@ class Settings:
                 get("RESEARCH_BACKFILL_PRICE_FIDELITY_MINUTES"),
                 60,
                 name="RESEARCH_BACKFILL_PRICE_FIDELITY_MINUTES",
+                minimum=1,
+            ),
+            research_backfill_price_fallback_fidelity_minutes=_int(
+                get("RESEARCH_BACKFILL_PRICE_FALLBACK_FIDELITY_MINUTES"),
+                720,
+                name="RESEARCH_BACKFILL_PRICE_FALLBACK_FIDELITY_MINUTES",
                 minimum=1,
             ),
             research_backfill_archive_raw_rest=_bool(
@@ -462,6 +483,21 @@ class Settings:
             raise ConfigurationError(
                 "RESEARCH_BACKFILL_MAX_MARKETS cannot exceed "
                 "RESEARCH_BACKFILL_HARD_MAX_MARKETS"
+            )
+        if (
+            settings.research_backfill_incremental_max_markets
+            > RESEARCH_BACKFILL_ABSOLUTE_INCREMENTAL_MAX_MARKETS
+        ):
+            raise ConfigurationError(
+                "RESEARCH_BACKFILL_INCREMENTAL_MAX_MARKETS cannot exceed 250"
+            )
+        if (
+            settings.research_backfill_price_fallback_fidelity_minutes
+            <= settings.research_backfill_price_fidelity_minutes
+        ):
+            raise ConfigurationError(
+                "RESEARCH_BACKFILL_PRICE_FALLBACK_FIDELITY_MINUTES must be "
+                "greater than RESEARCH_BACKFILL_PRICE_FIDELITY_MINUTES"
             )
         if (
             settings.research_backfill_request_concurrency

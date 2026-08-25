@@ -2536,6 +2536,296 @@ class Database:
                 assert ready is not None
                 return dict(ready)
 
+    async def create_or_get_incremental_research_cohort(
+        self,
+        *,
+        exchange: str,
+        version: str,
+        seed: str,
+        max_markets: int,
+        horizon_start: datetime,
+        criteria: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Persist one bounded batch of newly resolved, previously unseen markets."""
+        if not 1 <= max_markets <= 250:
+            raise ValueError("incremental research batch size must be between 1 and 250")
+        criteria_value = dict(criteria)
+        if criteria_value.get("mode") != "incremental":
+            raise ValueError("incremental research criteria must declare its mode")
+        dynamic_criteria = {
+            "baseline_cutoff",
+            "baseline_source",
+            "cutoff_timestamp",
+        }
+        async with self.pool.connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"research_cohort:{exchange}:{version}",),
+                )
+                existing = await (
+                    await connection.execute(
+                        """
+                        SELECT id, exchange, version, seed, selection_timestamp,
+                               horizon_start, max_markets, selected_count,
+                               criteria, status
+                        FROM research_cohorts
+                        WHERE exchange = %s AND version = %s
+                        """,
+                        (exchange, version),
+                    )
+                ).fetchone()
+                if existing is not None:
+                    persisted = {
+                        key: value
+                        for key, value in dict(existing["criteria"]).items()
+                        if key not in dynamic_criteria
+                    }
+                    if (
+                        str(existing["seed"]) != seed
+                        or int(existing["max_markets"]) != max_markets
+                        or persisted != criteria_value
+                    ):
+                        raise ValueError(
+                            "research cohort version already exists with different "
+                            "selection inputs; use a new cohort version"
+                        )
+                    if existing["status"] != "ready":
+                        raise RuntimeError("research cohort transaction is not ready")
+                    return dict(existing)
+
+                baseline_row = await (
+                    await connection.execute(
+                        """
+                        SELECT max(selection_timestamp) AS cutoff
+                        FROM research_cohorts
+                        WHERE exchange = %s AND status = 'ready'
+                          AND COALESCE(criteria ->> 'mode', 'bootstrap')
+                              <> 'incremental'
+                        """,
+                        (exchange,),
+                    )
+                ).fetchone()
+                bootstrap_cutoff = (
+                    baseline_row["cutoff"] if baseline_row is not None else None
+                )
+                baseline_cutoff = bootstrap_cutoff or horizon_start
+                cutoff_row = await (
+                    await connection.execute(
+                        "SELECT clock_timestamp() AS cutoff"
+                    )
+                ).fetchone()
+                assert cutoff_row is not None
+                cutoff_timestamp = cutoff_row["cutoff"]
+                persisted_criteria = {
+                    **criteria_value,
+                    "baseline_cutoff": baseline_cutoff.isoformat(),
+                    "baseline_source": (
+                        "latest_bootstrap_selection"
+                        if bootstrap_cutoff is not None
+                        else "horizon_start_no_bootstrap"
+                    ),
+                    "cutoff_timestamp": cutoff_timestamp.isoformat(),
+                }
+                cohort = await (
+                    await connection.execute(
+                        """
+                        INSERT INTO research_cohorts
+                            (exchange, version, seed, selection_timestamp,
+                             horizon_start, max_markets, criteria, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'selecting')
+                        RETURNING id, exchange, version, seed,
+                                  selection_timestamp, horizon_start,
+                                  max_markets, selected_count, criteria, status
+                        """,
+                        (
+                            exchange,
+                            version,
+                            seed,
+                            cutoff_timestamp,
+                            horizon_start,
+                            max_markets,
+                            _json(persisted_criteria),
+                        ),
+                    )
+                ).fetchone()
+                assert cohort is not None
+                cohort_id = int(cohort["id"])
+                selected = await (
+                    await connection.execute(
+                        """
+                        WITH candidates AS (
+                            SELECT m.id AS market_id, m.external_id,
+                                   e.category AS event_category,
+                                   lower(concat_ws(
+                                       ' ', m.question, m.slug, e.title
+                                   )) AS search_text,
+                                   COALESCE(m.volume, 0) AS volume,
+                                   COALESCE(m.liquidity, 0) AS liquidity,
+                                   m.status, m.is_active, m.open_time, m.close_time,
+                                   COALESCE(m.settlement_time, m.close_time)
+                                       AS eligibility_time,
+                                   CASE
+                                     WHEN COALESCE(m.volume, 0) = 0 THEN 'zero'
+                                     WHEN m.volume < 1000 THEN 'quiet'
+                                     WHEN m.volume < 100000 THEN 'medium'
+                                     ELSE 'high'
+                                   END AS volume_bucket,
+                                   CASE
+                                     WHEN COALESCE(m.liquidity, 0) = 0 THEN 'zero'
+                                     WHEN m.liquidity < 1000 THEN 'thin'
+                                     WHEN m.liquidity < 10000 THEN 'medium'
+                                     ELSE 'deep'
+                                   END AS liquidity_bucket,
+                                   CASE
+                                     WHEN m.open_time IS NULL OR m.close_time IS NULL
+                                       THEN 'unknown'
+                                     WHEN m.close_time - m.open_time <= interval '1 day'
+                                       THEN 'intraday'
+                                     WHEN m.close_time - m.open_time <= interval '7 days'
+                                       THEN 'short'
+                                     WHEN m.close_time - m.open_time <= interval '30 days'
+                                       THEN 'medium'
+                                     ELSE 'long'
+                                   END AS duration_bucket
+                            FROM markets m
+                            LEFT JOIN events e ON e.id = m.event_id
+                            WHERE m.exchange = %s
+                              AND m.is_active IS NOT TRUE
+                              AND lower(m.status) IN (
+                                  'resolved', 'closed', 'settled', 'finalized'
+                              )
+                              AND COALESCE(m.settlement_time, m.close_time) > %s
+                              AND COALESCE(m.settlement_time, m.close_time) >= %s
+                              AND COALESCE(m.settlement_time, m.close_time) <= %s
+                              AND EXISTS (
+                                  SELECT 1 FROM outcomes o
+                                  WHERE o.market_id = m.id
+                                    AND o.token_id IS NOT NULL
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM research_cohort_markets prior
+                                  WHERE prior.market_id = m.id
+                              )
+                        ), categorized AS (
+                            SELECT candidates.*,
+                                   CASE
+                                     WHEN NULLIF(trim(event_category), '') IS NOT NULL
+                                       THEN lower(trim(event_category))
+                                     WHEN search_text ~
+                                       '(^|[^a-z0-9])(bitcoin|ethereum|solana|dogecoin|crypto|xrp|btc|eth)([^a-z0-9]|$)'
+                                       THEN 'crypto'
+                                     WHEN search_text ~
+                                       '(election|president|senate|congress|governor|parliament|democrat|republican|trump|biden|politic|prime minister|referendum)'
+                                       THEN 'politics'
+                                     WHEN search_text ~
+                                       '(temperature|weather|hurricane|climate|earthquake|wildfire|rainfall|snowfall)'
+                                       THEN 'weather_climate'
+                                     WHEN search_text ~
+                                       '(^|[^a-z0-9])(fc|nba|nfl|mlb|nhl|wnba|ncaa|ufc|fifa|dota|esports|soccer|football|basketball|baseball|hockey|tennis|golf|cricket|rugby)([^a-z0-9]|$)|[[:space:]]vs[.]?[[:space:]]|counter-strike|home runs|exact score|both teams|total kills|over/under|[[:space:]]o/u[[:space:]]|^spread:|set [0-9]+ winner|map [0-9]+'
+                                       THEN 'sports_esports'
+                                     WHEN search_text ~
+                                       '(federal reserve|interest rate|inflation|gdp|recession|unemployment|nasdaq|s&p|dow jones|stock|ipo|treasury|market cap)'
+                                       THEN 'macro_finance'
+                                     WHEN search_text ~
+                                       '(ceasefire|invasion|sanction|ukraine|russia|israel|iran|taiwan|nato|geopolit)'
+                                       THEN 'geopolitics'
+                                     WHEN search_text ~
+                                       '(artificial intelligence|openai|spacex|rocket launch|quantum|technology)'
+                                       THEN 'science_technology'
+                                     WHEN search_text ~
+                                       '(oscar|grammy|movie|film|album|box office|celebrity|television|music award)'
+                                       THEN 'entertainment'
+                                     ELSE 'other'
+                                   END AS category,
+                                   CASE
+                                     WHEN NULLIF(trim(event_category), '') IS NOT NULL
+                                       THEN 'event_metadata'
+                                     ELSE 'question_taxonomy_v1'
+                                   END AS category_source
+                            FROM candidates
+                        ), chosen AS (
+                            SELECT categorized.*,
+                                   row_number() OVER (
+                                       ORDER BY eligibility_time,
+                                                md5(%s || ':' || external_id),
+                                                external_id
+                                   ) AS selection_rank
+                            FROM categorized
+                            ORDER BY eligibility_time,
+                                     md5(%s || ':' || external_id), external_id
+                            LIMIT %s
+                        )
+                        INSERT INTO research_cohort_markets
+                            (cohort_id, market_id, market_external_id,
+                             selection_rank, selection_reason, strata,
+                             selection_metrics)
+                        SELECT %s, market_id, external_id, selection_rank,
+                               'incremental_newly_resolved',
+                               jsonb_build_object(
+                                   'category', category,
+                                   'volume_bucket', volume_bucket,
+                                   'liquidity_bucket', liquidity_bucket,
+                                   'duration_bucket', duration_bucket,
+                                   'lifecycle_bucket', 'resolved',
+                                   'calendar_bucket', to_char(
+                                       date_trunc('quarter', eligibility_time),
+                                       'YYYY-"Q"Q'
+                                   )
+                               ),
+                               jsonb_build_object(
+                                   'volume', volume,
+                                   'liquidity', liquidity,
+                                   'status', status,
+                                   'active', is_active,
+                                   'category_source', category_source,
+                                   'open_time', open_time,
+                                   'close_time', close_time,
+                                   'eligibility_time', eligibility_time
+                               )
+                        FROM chosen
+                        ORDER BY selection_rank
+                        RETURNING market_id
+                        """,
+                        (
+                            exchange,
+                            baseline_cutoff,
+                            horizon_start,
+                            cutoff_timestamp,
+                            seed,
+                            seed,
+                            max_markets,
+                            cohort_id,
+                        ),
+                    )
+                ).fetchall()
+                selected_count = len(selected)
+                await connection.execute(
+                    """
+                    INSERT INTO research_market_coverage (cohort_id, market_id)
+                    SELECT cohort_id, market_id
+                    FROM research_cohort_markets
+                    WHERE cohort_id = %s
+                    """,
+                    (cohort_id,),
+                )
+                ready = await (
+                    await connection.execute(
+                        """
+                        UPDATE research_cohorts
+                        SET selected_count = %s, status = 'ready',
+                            updated_at = clock_timestamp()
+                        WHERE id = %s
+                        RETURNING id, exchange, version, seed,
+                                  selection_timestamp, horizon_start,
+                                  max_markets, selected_count, criteria, status
+                        """,
+                        (selected_count, cohort_id),
+                    )
+                ).fetchone()
+                assert ready is not None
+                return dict(ready)
+
     async def iter_research_markets(
         self,
         *,
@@ -2683,6 +2973,31 @@ class Database:
                     """,
                     (terminal, terminal, terminal, terminal, cohort_id, market_id),
                 )
+
+    async def record_research_market_profile(
+        self,
+        *,
+        cohort_id: int,
+        market_id: int,
+        profile: Mapping[str, Any],
+    ) -> None:
+        """Persist one compact per-market timing/count profile."""
+        async with self.pool.connection() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE research_market_coverage
+                SET provenance = provenance || %s,
+                    updated_at = clock_timestamp()
+                WHERE cohort_id = %s AND market_id = %s
+                """,
+                (
+                    _json({"profile": dict(profile)}),
+                    cohort_id,
+                    market_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("research coverage row is missing")
 
     async def research_cohort_status(
         self, *, exchange: str, cohort_version: str

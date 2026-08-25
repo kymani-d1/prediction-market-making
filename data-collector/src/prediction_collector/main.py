@@ -43,7 +43,13 @@ def parser() -> argparse.ArgumentParser:
     )
     research = commands.add_parser(
         "research-backfill",
-        help="Bounded historical dataset bootstrap for quantitative research",
+        help="Bounded bootstrap or incremental historical research dataset",
+    )
+    research.add_argument(
+        "--mode",
+        choices=("bootstrap", "incremental"),
+        default="bootstrap",
+        help="Build a bounded bootstrap cohort or a new immutable incremental batch",
     )
     research.add_argument(
         "--phase",
@@ -280,6 +286,7 @@ async def _research_backfill(
                 writer,
                 settings,
                 phase=args.phase,
+                mode=args.mode,
                 cohort_version=args.cohort_version,
                 max_markets=args.max_markets,
             )

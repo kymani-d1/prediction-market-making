@@ -39,26 +39,41 @@ async def run_polymarket_research_backfill(
     writer: BatchWriter,
     settings: Settings,
     *,
+    mode: str = "bootstrap",
     phase: str = "all",
     cohort_version: str | None = None,
     max_markets: int | None = None,
 ) -> ResearchBackfillResult:
+    if mode not in {"bootstrap", "incremental"}:
+        raise ValueError(f"unsupported research backfill mode: {mode}")
     if phase not in {"all", "catalogue", "cohort", "data"}:
         raise ValueError(f"unsupported research backfill phase: {phase}")
     version = cohort_version or settings.research_backfill_cohort_version
-    limit = (
-        settings.research_backfill_max_markets
-        if max_markets is None
-        else max_markets
-    )
-    if not 1 <= limit <= settings.research_backfill_hard_max_markets:
-        raise ValueError(
-            "research cohort exceeds its configured safety bound "
-            f"({limit} > {settings.research_backfill_hard_max_markets})"
+    if mode == "bootstrap":
+        limit = (
+            settings.research_backfill_max_markets
+            if max_markets is None
+            else max_markets
         )
+        if not 1 <= limit <= settings.research_backfill_hard_max_markets:
+            raise ValueError(
+                "research cohort exceeds its configured safety bound "
+                f"({limit} > {settings.research_backfill_hard_max_markets})"
+            )
+    else:
+        limit = (
+            settings.research_backfill_incremental_max_markets
+            if max_markets is None
+            else max_markets
+        )
+        if not 1 <= limit <= settings.research_backfill_incremental_max_markets:
+            raise ValueError(
+                "incremental research batch exceeds its configured safety bound "
+                f"({limit} > {settings.research_backfill_incremental_max_markets})"
+            )
 
     details: dict[str, object] = {
-        "mode": "bounded_research_dataset_bootstrap",
+        "mode": f"bounded_research_dataset_{mode}",
         "cohort_version": version,
         "requested_max_markets": limit,
         "memory_start": process_memory_snapshot(),
@@ -91,28 +106,47 @@ async def run_polymarket_research_backfill(
                     "horizon_days": settings.research_backfill_catalogue_horizon_days,
                 }
         if phase in {"all", "cohort"}:
-            criteria = {
-                "method": "stratified_deterministic_sample",
-                "method_version": 2,
-                "horizon_days": settings.research_backfill_catalogue_horizon_days,
-                "dimensions": [
-                    "category",
-                    "volume_bucket",
-                    "liquidity_bucket",
-                    "duration_bucket",
-                    "lifecycle_bucket",
-                    "calendar_quarter",
-                ],
-                "volume_buckets_usdc": [0, 1_000, 100_000],
-                "liquidity_buckets_usdc": [0, 1_000, 10_000],
-                "duration_buckets_days": [1, 7, 30],
-                "category_source": "event_metadata_then_question_taxonomy_v1",
-                "category_balance": "round_robin_before_full_strata_depth",
-                "requires_outcome_token": True,
-                "active_markets_included": True,
-            }
+            dimensions = [
+                "category",
+                "volume_bucket",
+                "liquidity_bucket",
+                "duration_bucket",
+                "lifecycle_bucket",
+                "calendar_quarter",
+            ]
+            if mode == "bootstrap":
+                criteria = {
+                    "method": "stratified_deterministic_sample",
+                    "method_version": 2,
+                    "horizon_days": settings.research_backfill_catalogue_horizon_days,
+                    "dimensions": dimensions,
+                    "volume_buckets_usdc": [0, 1_000, 100_000],
+                    "liquidity_buckets_usdc": [0, 1_000, 10_000],
+                    "duration_buckets_days": [1, 7, 30],
+                    "category_source": "event_metadata_then_question_taxonomy_v1",
+                    "category_balance": "round_robin_before_full_strata_depth",
+                    "requires_outcome_token": True,
+                    "active_markets_included": True,
+                }
+                create_cohort = service.database.create_or_get_research_cohort
+            else:
+                criteria = {
+                    "mode": "incremental",
+                    "method": "newly_resolved_since_latest_bootstrap",
+                    "method_version": 1,
+                    "horizon_days": settings.research_backfill_catalogue_horizon_days,
+                    "dimensions": dimensions,
+                    "ordering": "eligibility_time_then_stable_seed",
+                    "eligibility": "resolved_or_closed_with_outcome_token",
+                    "prior_cohort_policy": "exclude_all_prior_memberships",
+                    "active_markets_included": False,
+                    "requires_outcome_token": True,
+                }
+                create_cohort = (
+                    service.database.create_or_get_incremental_research_cohort
+                )
             details["cohort"] = dict(
-                await service.database.create_or_get_research_cohort(
+                await create_cohort(
                     exchange="polymarket",
                     version=version,
                     seed=settings.research_backfill_seed,
@@ -238,6 +272,9 @@ async def _collect_cohort_data(
         "request_concurrency_bound": concurrency,
         "candidate_batch_size": settings.research_backfill_candidate_batch_size,
         "price_fidelity_minutes": settings.research_backfill_price_fidelity_minutes,
+        "price_fallback_fidelity_minutes": (
+            settings.research_backfill_price_fallback_fidelity_minutes
+        ),
         "raw_rest_archived": settings.research_backfill_archive_raw_rest,
     }
 
@@ -248,14 +285,80 @@ async def _collect_market(
     settings: Settings,
     market: ResearchMarket,
 ) -> None:
-    if market.price_status not in _TERMINAL:
-        await _collect_prices(service, writer, settings, market)
-    if market.trade_status not in _TERMINAL:
-        await _collect_trades(service, writer, settings, market)
-    if market.resolution_status not in _TERMINAL:
-        await _record_resolution(service, market)
-    if market.economics_status not in _TERMINAL:
-        await _record_economics(service, market)
+    started = time.perf_counter()
+    phases: dict[str, dict[str, Any]] = {}
+    error: Exception | None = None
+    try:
+        if market.price_status not in _TERMINAL:
+            phases["price"] = await _collect_prices(
+                service, writer, settings, market
+            )
+        else:
+            phases["price"] = {"status": market.price_status, "skipped": True}
+        if market.trade_status not in _TERMINAL:
+            phases["trade"] = await _collect_trades(
+                service, writer, settings, market
+            )
+        else:
+            phases["trade"] = {"status": market.trade_status, "skipped": True}
+        if market.resolution_status not in _TERMINAL:
+            phase_started = time.perf_counter()
+            status = await _record_resolution(service, market)
+            phases["resolution"] = {
+                "status": status,
+                "total_seconds": time.perf_counter() - phase_started,
+            }
+        else:
+            phases["resolution"] = {
+                "status": market.resolution_status,
+                "skipped": True,
+            }
+        if market.economics_status not in _TERMINAL:
+            phase_started = time.perf_counter()
+            status = await _record_economics(service, market)
+            phases["economics"] = {
+                "status": status,
+                "total_seconds": time.perf_counter() - phase_started,
+            }
+        else:
+            phases["economics"] = {
+                "status": market.economics_status,
+                "skipped": True,
+            }
+    except Exception as exc:
+        error = exc
+        raise
+    finally:
+        profile = {
+            "market_external_id": market.external_id,
+            "selection_rank": market.selection_rank,
+            "total_seconds": time.perf_counter() - started,
+            "price_records": int(phases.get("price", {}).get("records") or 0),
+            "trade_records": int(phases.get("trade", {}).get("records") or 0),
+            "rows_enqueued": sum(
+                int(value.get("records") or 0) for value in phases.values()
+            ),
+            "phase_states": {
+                name: value.get("status") for name, value in phases.items()
+            },
+            "phases": phases,
+            "error_type": type(error).__name__ if error is not None else None,
+            "completed": error is None,
+        }
+        try:
+            await service.database.record_research_market_profile(
+                cohort_id=market.cohort_id,
+                market_id=market.market_id,
+                profile=profile,
+            )
+        except Exception:
+            if error is None:
+                raise
+            LOGGER.exception(
+                "Failed to persist research market profile after market failure",
+                extra={"market_external_id": market.external_id},
+            )
+        LOGGER.info("Research market profile", extra=profile)
 
 
 async def _collect_prices(
@@ -263,7 +366,12 @@ async def _collect_prices(
     writer: BatchWriter,
     settings: Settings,
     market: ResearchMarket,
-) -> None:
+) -> dict[str, Any]:
+    phase_started = time.perf_counter()
+    api_seconds = 0.0
+    normalization_seconds = 0.0
+    writer_enqueue_seconds = 0.0
+    writer_drain_seconds = 0.0
     token_ids = [outcome.token_id for outcome in market.outcomes]
     if not token_ids:
         await _set_phase(
@@ -273,19 +381,28 @@ async def _collect_prices(
             "unavailable",
             provenance={"reason": "no_outcome_tokens"},
         )
-        return
+        return {
+            "status": "unavailable",
+            "records": 0,
+            "requests": 0,
+            "total_seconds": time.perf_counter() - phase_started,
+        }
     if len(token_ids) > 20:
         raise RuntimeError(
             f"market {market.external_id} exceeds the 20-token batch API bound"
         )
     await _set_phase(service, market, "price", "in_progress")
     result: Any = None
+    fallback_result: Any = None
+    request_count = 1
     try:
+        api_started = time.perf_counter()
         result = await service.rest.batch_price_history(
             token_ids,
             interval="max",
             fidelity_minutes=settings.research_backfill_price_fidelity_minutes,
         )
+        api_seconds += time.perf_counter() - api_started
         if settings.research_backfill_archive_raw_rest:
             await service._raw_result(
                 "clob",
@@ -298,24 +415,86 @@ async def _collect_prices(
         histories = payload.get("history")
         if not isinstance(histories, Mapping):
             raise RuntimeError("Polymarket batch price response omitted history map")
+        primary_histories = {
+            token_id: histories.get(token_id)
+            for token_id in token_ids
+            if isinstance(histories.get(token_id), list)
+        }
+        primary_token_counts = {
+            token_id: len(primary_histories.get(token_id, []))
+            for token_id in token_ids
+        }
+        fallback_tokens = [
+            token_id
+            for token_id, count in primary_token_counts.items()
+            if count == 0
+        ]
+        fallback_histories: dict[str, Any] = {}
+        if fallback_tokens:
+            request_count += 1
+            api_started = time.perf_counter()
+            fallback_result = await service.rest.batch_price_history(
+                fallback_tokens,
+                interval="max",
+                fidelity_minutes=(
+                    settings.research_backfill_price_fallback_fidelity_minutes
+                ),
+            )
+            api_seconds += time.perf_counter() - api_started
+            if settings.research_backfill_archive_raw_rest:
+                await service._raw_result(
+                    "clob",
+                    "/batch-prices-history",
+                    "research_price_history_fallback",
+                    fallback_result,
+                    market.external_id,
+                )
+            fallback_payload = (
+                fallback_result.data
+                if isinstance(fallback_result.data, Mapping)
+                else {}
+            )
+            raw_fallback_histories = fallback_payload.get("history")
+            if not isinstance(raw_fallback_histories, Mapping):
+                raise RuntimeError(
+                    "Polymarket fallback batch price response omitted history map"
+                )
+            fallback_histories = {
+                token_id: raw_fallback_histories.get(token_id)
+                for token_id in fallback_tokens
+                if isinstance(raw_fallback_histories.get(token_id), list)
+            }
         record_count = 0
         token_counts: dict[str, int] = {}
-        missing_tokens: list[str] = []
-        interval_seconds = settings.research_backfill_price_fidelity_minutes * 60
+        token_fidelities: dict[str, int] = {}
+        token_ranges: dict[str, dict[str, Any]] = {}
         retrieved_at = utc_now()
         for token_id in token_ids:
-            history = histories.get(token_id)
-            if not isinstance(history, list):
-                missing_tokens.append(token_id)
-                continue
+            primary_history = primary_histories.get(token_id, [])
+            history = (
+                primary_history
+                if primary_history
+                else fallback_histories.get(token_id, [])
+            )
+            fidelity_minutes = (
+                settings.research_backfill_price_fidelity_minutes
+                if primary_history
+                else settings.research_backfill_price_fallback_fidelity_minutes
+            )
+            interval_seconds = fidelity_minutes * 60
             token_count = 0
+            earliest = None
+            latest = None
             for point in history:
                 if not isinstance(point, Mapping):
                     continue
+                normalize_started = time.perf_counter()
                 timestamp = parse_timestamp(point.get("t"))
                 price = as_decimal(point.get("p"))
+                normalization_seconds += time.perf_counter() - normalize_started
                 if timestamp is None or price is None:
                     continue
+                enqueue_started = time.perf_counter()
                 await writer.put(
                     WriteItem(
                         "candlesticks",
@@ -345,19 +524,28 @@ async def _collect_prices(
                             "retrieved_at": retrieved_at,
                             "raw_data": {
                                 "source": "clob_batch_prices_history",
-                                "fidelity_minutes": (
-                                    settings.research_backfill_price_fidelity_minutes
-                                ),
+                                "fidelity_minutes": fidelity_minutes,
+                                "fallback": not bool(primary_history),
                             },
                         },
                     )
                 )
+                writer_enqueue_seconds += time.perf_counter() - enqueue_started
                 record_count += 1
                 token_count += 1
+                earliest = timestamp if earliest is None else min(earliest, timestamp)
+                latest = timestamp if latest is None else max(latest, timestamp)
             token_counts[token_id] = token_count
+            token_fidelities[token_id] = fidelity_minutes
+            token_ranges[token_id] = {"earliest": earliest, "latest": latest}
+        drain_started = time.perf_counter()
         await writer.queue.join()
         if writer.archive is not None:
             await writer.archive.join()
+        writer_drain_seconds = time.perf_counter() - drain_started
+        missing_tokens = [
+            token_id for token_id, count in token_counts.items() if count == 0
+        ]
         if record_count == 0:
             status = "unavailable"
         elif missing_tokens or any(count == 0 for count in token_counts.values()):
@@ -370,7 +558,7 @@ async def _collect_prices(
             "price",
             status,
             records=record_count,
-            requests=1,
+            requests=request_count,
             partial_history=status == "partial",
             provenance={
                 "endpoint": "/batch-prices-history",
@@ -378,21 +566,59 @@ async def _collect_prices(
                 "fidelity_minutes": (
                     settings.research_backfill_price_fidelity_minutes
                 ),
+                "fallback_fidelity_minutes": (
+                    settings.research_backfill_price_fallback_fidelity_minutes
+                ),
+                "original_token_counts": primary_token_counts,
+                "fallback_attempted_tokens": fallback_tokens,
+                "fallback_token_counts": {
+                    token_id: len(fallback_histories.get(token_id, []))
+                    for token_id in fallback_tokens
+                },
                 "token_counts": token_counts,
+                "token_fidelities_minutes": token_fidelities,
+                "token_ranges": token_ranges,
                 "missing_tokens": missing_tokens,
                 "http_status": result.status_code,
+                "fallback_http_status": (
+                    fallback_result.status_code
+                    if fallback_result is not None
+                    else None
+                ),
                 "parameters": request_parameters(result.url),
+                "api_seconds": api_seconds,
+                "normalization_seconds": normalization_seconds,
+                "writer_enqueue_seconds": writer_enqueue_seconds,
+                "writer_drain_seconds": writer_drain_seconds,
                 "retrieved_at": retrieved_at,
             },
         )
+        return {
+            "status": status,
+            "records": record_count,
+            "requests": request_count,
+            "api_seconds": api_seconds,
+            "normalization_seconds": normalization_seconds,
+            "writer_enqueue_seconds": writer_enqueue_seconds,
+            "writer_drain_seconds": writer_drain_seconds,
+            "fallback_attempted_tokens": len(fallback_tokens),
+            "total_seconds": time.perf_counter() - phase_started,
+        }
     except Exception as exc:
         await _set_phase(
             service,
             market,
             "price",
             "retryable_failed",
-            requests=1,
-            provenance={"endpoint": "/batch-prices-history"},
+            requests=request_count,
+            provenance={
+                "endpoint": "/batch-prices-history",
+                "api_seconds": api_seconds,
+                "normalization_seconds": normalization_seconds,
+                "writer_enqueue_seconds": writer_enqueue_seconds,
+                "writer_drain_seconds": writer_drain_seconds,
+                "total_seconds": time.perf_counter() - phase_started,
+            },
             error_summary=f"{type(exc).__name__}: {exc}",
         )
         raise
@@ -403,7 +629,12 @@ async def _collect_trades(
     writer: BatchWriter,
     settings: Settings,
     market: ResearchMarket,
-) -> None:
+) -> dict[str, Any]:
+    phase_started = time.perf_counter()
+    api_seconds = 0.0
+    normalization_seconds = 0.0
+    writer_enqueue_seconds = 0.0
+    writer_drain_seconds = 0.0
     await _set_phase(service, market, "trade", "in_progress")
     records = 0
     requests = 0
@@ -435,6 +666,7 @@ async def _collect_trades(
         while pending_windows:
             window_start, window_end = pending_windows.pop()
             pages: list[tuple[list[dict[str, Any]], Any]] = []
+            api_started = time.perf_counter()
             async for items, result in service.rest.iter_trades(
                 market=market.external_id,
                 start=window_start,
@@ -455,6 +687,7 @@ async def _collect_trades(
                             f"{market.external_id}:{window_start}:{window_end}"
                         ),
                     )
+            api_seconds += time.perf_counter() - api_started
             if not pages:
                 requests += 1
             else:
@@ -492,24 +725,31 @@ async def _collect_trades(
                 received_at = utc_now()
                 monotonic_ns = time.monotonic_ns()
                 for raw in items:
+                    normalize_started = time.perf_counter()
                     trade = parse_trade(
                         raw,
                         received_at=received_at,
                         received_monotonic_ns=monotonic_ns,
                     )
+                    normalization_seconds += time.perf_counter() - normalize_started
                     if trade is None:
                         continue
+                    enqueue_started = time.perf_counter()
                     await writer.put(trade_item(trade))
+                    writer_enqueue_seconds += time.perf_counter() - enqueue_started
                     records += 1
+        drain_started = time.perf_counter()
         await writer.queue.join()
         if writer.archive is not None:
             await writer.archive.join()
+        writer_drain_seconds = time.perf_counter() - drain_started
         partial = history_floor or saturated_windows > 0
+        status = "partial" if partial else "completed"
         await _set_phase(
             service,
             market,
             "trade",
-            "partial" if partial else "completed",
+            status,
             records=records,
             requests=requests,
             partial_history=partial,
@@ -522,8 +762,25 @@ async def _collect_trades(
                 "saturated_windows": saturated_windows,
                 "upstream_history_floor": history_floor,
                 "documented_max_offset": 10_000,
+                "api_seconds": api_seconds,
+                "normalization_seconds": normalization_seconds,
+                "writer_enqueue_seconds": writer_enqueue_seconds,
+                "writer_drain_seconds": writer_drain_seconds,
             },
         )
+        return {
+            "status": status,
+            "records": records,
+            "requests": requests,
+            "pages_fetched": pages_fetched,
+            "windows_completed": windows_completed,
+            "saturated_windows": saturated_windows,
+            "api_seconds": api_seconds,
+            "normalization_seconds": normalization_seconds,
+            "writer_enqueue_seconds": writer_enqueue_seconds,
+            "writer_drain_seconds": writer_drain_seconds,
+            "total_seconds": time.perf_counter() - phase_started,
+        }
     except Exception as exc:
         await _set_phase(
             service,
@@ -536,6 +793,11 @@ async def _collect_trades(
                 "endpoint": "/trades",
                 "pages_fetched": pages_fetched,
                 "windows_completed": windows_completed,
+                "api_seconds": api_seconds,
+                "normalization_seconds": normalization_seconds,
+                "writer_enqueue_seconds": writer_enqueue_seconds,
+                "writer_drain_seconds": writer_drain_seconds,
+                "total_seconds": time.perf_counter() - phase_started,
             },
             error_summary=f"{type(exc).__name__}: {exc}",
         )
@@ -544,7 +806,7 @@ async def _collect_trades(
 
 async def _record_resolution(
     service: PolymarketService, market: ResearchMarket
-) -> None:
+) -> str:
     winner = next(
         (
             outcome
@@ -576,11 +838,12 @@ async def _record_resolution(
             "winner_name": winner.name if winner else None,
         },
     )
+    return status
 
 
 async def _record_economics(
     service: PolymarketService, market: ResearchMarket
-) -> None:
+) -> str:
     raw = market.raw_data
     fees_enabled = raw.get("feesEnabled")
     fee_schedule = raw.get("feeSchedule") or raw.get("fee_schedule")
@@ -598,11 +861,12 @@ async def _record_economics(
             "rewards_max_spread",
         )
     )
+    status = "completed" if has_fee_evidence or has_reward_evidence else "unavailable"
     await _set_phase(
         service,
         market,
         "economics",
-        "completed" if has_fee_evidence or has_reward_evidence else "unavailable",
+        status,
         provenance={
             "source": "gamma_market_metadata",
             "historical_reconstruction": False,
@@ -628,6 +892,7 @@ async def _record_economics(
             "network_requests": 0,
         },
     )
+    return status
 
 
 async def _set_phase(
