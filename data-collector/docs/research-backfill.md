@@ -78,9 +78,12 @@ rerun verifies the static inputs and reuses the same membership. Any seed,
 method, policy, or bound drift under that version fails closed.
 
 The configured incremental per-run limit defaults to 100. Code enforces an
-independent absolute ceiling of 250 even if configuration is wrong. Every new
-scheduled period therefore requires a new cohort version; this repository does
-not create a schedule.
+independent absolute ceiling of 250 even if configuration is wrong. When
+`--cohort-version` is omitted, incremental mode derives a deterministic UTC ISO
+week version such as `research-incremental-2026-W35`. A rerun in the same week
+reuses that immutable version. Before using the current week's version, the job
+resumes the oldest incremental cohort whose markets are not all terminal. This
+prevents a failed weekly run from being stranded when the calendar advances.
 
 ## Historical outputs
 
@@ -134,8 +137,11 @@ exclusive SQL time.
 # Use existing catalogue, select a 100-market bootstrap, and fetch its data.
 python -m prediction_collector research-backfill --mode bootstrap --max-markets 100
 
-# Select a new bounded incremental batch. Always use a new version for a new run.
+# Explicit version for a bounded validation or manual batch.
 python -m prediction_collector research-backfill --mode incremental --cohort-version research-incremental-20260825-v1 --max-markets 5
+
+# Scheduled operation: automatic ISO-week version and unfinished-batch resume.
+python -m prediction_collector research-backfill --mode incremental
 
 # Independently resumable phases.
 python -m prediction_collector research-backfill --mode bootstrap --phase catalogue
@@ -144,9 +150,10 @@ python -m prediction_collector research-backfill --mode bootstrap --phase data
 ```
 
 The Railway research service must use `python -m prediction_collector
-research-backfill`, never the legacy `backfill` command. Use a new
-`RESEARCH_BACKFILL_COHORT_VERSION` for a changed sample; never clear or rewrite a
-completed cohort to repurpose its version.
+research-backfill --mode incremental` for scheduled operation, never bootstrap
+or the legacy `backfill` command. `RESEARCH_BACKFILL_COHORT_VERSION` applies to
+bootstrap; normal scheduled incremental runs use automatic ISO-week versions.
+Never clear or rewrite a completed cohort to repurpose its version.
 
 ## Research access
 

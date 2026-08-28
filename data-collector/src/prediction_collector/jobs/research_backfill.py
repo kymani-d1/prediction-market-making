@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
 
 from prediction_collector.common.diagnostics import process_memory_snapshot
@@ -34,6 +34,14 @@ class ResearchBackfillResult:
     status: str
 
 
+def incremental_cohort_version_for(scheduled_at: datetime) -> str:
+    """Return the immutable cohort version for one UTC ISO-week window."""
+    if scheduled_at.tzinfo is None:
+        raise ValueError("incremental schedule timestamp must be timezone-aware")
+    iso_year, iso_week, _ = scheduled_at.astimezone(UTC).isocalendar()
+    return f"research-incremental-{iso_year}-W{iso_week:02d}"
+
+
 async def run_polymarket_research_backfill(
     service: PolymarketService,
     writer: BatchWriter,
@@ -43,13 +51,18 @@ async def run_polymarket_research_backfill(
     phase: str = "all",
     cohort_version: str | None = None,
     max_markets: int | None = None,
+    scheduled_at: datetime | None = None,
 ) -> ResearchBackfillResult:
     if mode not in {"bootstrap", "incremental"}:
         raise ValueError(f"unsupported research backfill mode: {mode}")
     if phase not in {"all", "catalogue", "cohort", "data"}:
         raise ValueError(f"unsupported research backfill phase: {phase}")
-    version = cohort_version or settings.research_backfill_cohort_version
     if mode == "bootstrap":
+        version = cohort_version or settings.research_backfill_cohort_version
+        version_resolution: dict[str, object] = {
+            "source": "explicit" if cohort_version else "bootstrap_configuration",
+            "version": version,
+        }
         limit = (
             settings.research_backfill_max_markets
             if max_markets is None
@@ -61,6 +74,20 @@ async def run_polymarket_research_backfill(
                 f"({limit} > {settings.research_backfill_hard_max_markets})"
             )
     else:
+        if cohort_version:
+            version = cohort_version
+            version_resolution = {"source": "explicit", "version": version}
+        else:
+            scheduled_version = incremental_cohort_version_for(
+                scheduled_at or utc_now()
+            )
+            version_resolution = dict(
+                await service.database.resolve_incremental_research_cohort_version(
+                    exchange="polymarket",
+                    scheduled_version=scheduled_version,
+                )
+            )
+            version = str(version_resolution["version"])
         limit = (
             settings.research_backfill_incremental_max_markets
             if max_markets is None
@@ -75,6 +102,7 @@ async def run_polymarket_research_backfill(
     details: dict[str, object] = {
         "mode": f"bounded_research_dataset_{mode}",
         "cohort_version": version,
+        "cohort_version_resolution": version_resolution,
         "requested_max_markets": limit,
         "memory_start": process_memory_snapshot(),
         "excluded_legacy_stages": [

@@ -59,7 +59,10 @@ def parser() -> argparse.ArgumentParser:
     )
     research.add_argument(
         "--cohort-version",
-        help="Override RESEARCH_BACKFILL_COHORT_VERSION",
+        help=(
+            "Override the bootstrap version or automatic incremental ISO-week "
+            "version (normally omit for scheduled incremental runs)"
+        ),
     )
     research.add_argument(
         "--max-markets",

@@ -2826,6 +2826,49 @@ class Database:
                 assert ready is not None
                 return dict(ready)
 
+    async def resolve_incremental_research_cohort_version(
+        self,
+        *,
+        exchange: str,
+        scheduled_version: str,
+    ) -> Mapping[str, Any]:
+        """Resume the oldest unfinished incremental cohort or use this window."""
+        async with self.pool.connection() as connection:
+            unfinished = await (
+                await connection.execute(
+                    """
+                    SELECT c.id, c.version, c.selection_timestamp,
+                           c.selected_count
+                    FROM research_cohorts c
+                    WHERE c.exchange = %s
+                      AND c.status = 'ready'
+                      AND c.criteria ->> 'mode' = 'incremental'
+                      AND c.selected_count > (
+                          SELECT count(*)
+                          FROM research_market_coverage cov
+                          WHERE cov.cohort_id = c.id
+                            AND cov.completed_at IS NOT NULL
+                      )
+                    ORDER BY c.selection_timestamp, c.id
+                    LIMIT 1
+                    """,
+                    (exchange,),
+                )
+            ).fetchone()
+        if unfinished is not None:
+            return {
+                "version": str(unfinished["version"]),
+                "source": "unfinished_incremental",
+                "scheduled_version": scheduled_version,
+                "cohort_id": int(unfinished["id"]),
+                "selected_count": int(unfinished["selected_count"]),
+            }
+        return {
+            "version": scheduled_version,
+            "source": "scheduled_window",
+            "scheduled_version": scheduled_version,
+        }
+
     async def iter_research_markets(
         self,
         *,

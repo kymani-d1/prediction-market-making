@@ -419,6 +419,39 @@ async def test_research_schema_selection_resume_and_view_contract() -> None:
         assert set(first_incremental_members) <= set(new_market_ids)
         assert set(first_incremental_members).isdisjoint(inserted_market_ids)
 
+        unfinished_resolution = (
+            await database.resolve_incremental_research_cohort_version(
+                exchange="polymarket",
+                scheduled_version="integration-v3-scheduled",
+            )
+        )
+        assert unfinished_resolution["version"] == "integration-v2-incremental"
+        assert unfinished_resolution["source"] == "unfinished_incremental"
+
+        async with database.pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE research_market_coverage
+                SET price_status = 'completed', trade_status = 'completed',
+                    resolution_status = 'completed',
+                    economics_status = 'completed',
+                    completed_at = clock_timestamp()
+                WHERE cohort_id = %s
+                """,
+                (int(incremental["id"]),),
+            )
+        scheduled_resolution = (
+            await database.resolve_incremental_research_cohort_version(
+                exchange="polymarket",
+                scheduled_version="integration-v3-scheduled",
+            )
+        )
+        assert scheduled_resolution == {
+            "version": "integration-v3-scheduled",
+            "source": "scheduled_window",
+            "scheduled_version": "integration-v3-scheduled",
+        }
+
         second_incremental = (
             await database.create_or_get_incremental_research_cohort(
                 exchange="polymarket",

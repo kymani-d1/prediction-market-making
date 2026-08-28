@@ -14,6 +14,7 @@ from prediction_collector.database import Database, research_selection_key
 from prediction_collector.jobs.research_backfill import (
     _collect_trades,
     _record_economics,
+    incremental_cohort_version_for,
     run_polymarket_research_backfill,
 )
 from prediction_collector.main import _writer
@@ -125,6 +126,8 @@ class ResearchDatabase:
         self.markets = markets
         self.cohort_calls: list[dict[str, Any]] = []
         self.incremental_cohort_calls: list[dict[str, Any]] = []
+        self.version_resolution_calls: list[dict[str, Any]] = []
+        self.unfinished_incremental_version: str | None = None
         self.phase_updates: list[dict[str, Any]] = []
         self.profiles: list[dict[str, Any]] = []
         self.gaps: list[dict[str, Any]] = []
@@ -150,6 +153,23 @@ class ResearchDatabase:
             "selected_count": min(len(self.markets), kwargs["max_markets"]),
             "max_markets": kwargs["max_markets"],
             "status": "ready",
+        }
+
+    async def resolve_incremental_research_cohort_version(
+        self, **kwargs: Any
+    ) -> dict[str, Any]:
+        self.version_resolution_calls.append(kwargs)
+        version = (
+            self.unfinished_incremental_version or kwargs["scheduled_version"]
+        )
+        return {
+            "version": version,
+            "source": (
+                "unfinished_incremental"
+                if self.unfinished_incremental_version
+                else "scheduled_window"
+            ),
+            "scheduled_version": kwargs["scheduled_version"],
         }
 
     async def iter_research_markets(self, **kwargs: Any):  # type: ignore[no-untyped-def]
@@ -330,6 +350,19 @@ def test_cohort_selection_key_is_stable_and_seeded() -> None:
     assert first == research_selection_key("seed-a", "market-1")
     assert first != research_selection_key("seed-b", "market-1")
     assert first != research_selection_key("seed-a", "market-2")
+
+
+def test_incremental_cohort_version_is_deterministic_per_utc_iso_week() -> None:
+    sunday = datetime(2026, 8, 30, 4, tzinfo=UTC)
+    assert incremental_cohort_version_for(sunday) == "research-incremental-2026-W35"
+    assert incremental_cohort_version_for(
+        sunday + timedelta(days=1)
+    ) == "research-incremental-2026-W36"
+    assert incremental_cohort_version_for(
+        sunday + timedelta(days=6, hours=19)
+    ) == "research-incremental-2026-W36"
+    with pytest.raises(ValueError, match="timezone-aware"):
+        incremental_cohort_version_for(datetime(2026, 8, 30, 4))
 
 
 @pytest.mark.asyncio
@@ -548,6 +581,82 @@ async def test_incremental_mode_uses_new_immutable_batch_selector() -> None:
         "exclude_all_prior_memberships"
     )
     assert rest.price_calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_incremental_versions_are_stable_then_advance() -> None:
+    scheduled_at = datetime(2026, 8, 30, 4, tzinfo=UTC)
+    service, database, _rest, writer = service_for([])
+    settings = replace(Settings(), research_backfill_incremental_max_markets=5)
+
+    first = await run_polymarket_research_backfill(
+        service,
+        writer,
+        settings,
+        mode="incremental",
+        phase="cohort",
+        max_markets=5,
+        scheduled_at=scheduled_at,
+    )
+    second_writer = ResearchWriter()
+    second = await run_polymarket_research_backfill(
+        service,
+        second_writer,
+        settings,
+        mode="incremental",
+        phase="cohort",
+        max_markets=5,
+        scheduled_at=scheduled_at + timedelta(hours=2),
+    )
+    third_writer = ResearchWriter()
+    third = await run_polymarket_research_backfill(
+        service,
+        third_writer,
+        settings,
+        mode="incremental",
+        phase="cohort",
+        max_markets=5,
+        scheduled_at=scheduled_at + timedelta(days=7),
+    )
+
+    expected = "research-incremental-2026-W35"
+    assert first.details["cohort_version"] == expected
+    assert second.details["cohort_version"] == expected
+    assert third.details["cohort_version"] == "research-incremental-2026-W36"
+    assert [call["version"] for call in database.incremental_cohort_calls] == [
+        expected,
+        expected,
+        "research-incremental-2026-W36",
+    ]
+    assert database.cohort_calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_incremental_resumes_unfinished_before_later_window() -> None:
+    service, database, _rest, writer = service_for([])
+    database.unfinished_incremental_version = "research-incremental-2026-W34"
+    settings = replace(Settings(), research_backfill_incremental_max_markets=5)
+
+    result = await run_polymarket_research_backfill(
+        service,
+        writer,
+        settings,
+        mode="incremental",
+        phase="cohort",
+        max_markets=5,
+        scheduled_at=datetime(2026, 8, 30, 4, tzinfo=UTC),
+    )
+
+    assert result.details["cohort_version"] == "research-incremental-2026-W34"
+    assert result.details["cohort_version_resolution"] == {
+        "version": "research-incremental-2026-W34",
+        "source": "unfinished_incremental",
+        "scheduled_version": "research-incremental-2026-W35",
+    }
+    assert database.incremental_cohort_calls[0]["version"] == (
+        "research-incremental-2026-W34"
+    )
+    assert database.cohort_calls == []
 
 
 @pytest.mark.asyncio
