@@ -689,6 +689,7 @@ class LiveCollector:
                 recovery_gap_ids=tuple(recovery_gap_ids),
             ),
             name=f"polymarket-market-ws-{shard_id}",
+            expected_stop=planned_stop,
         )
         self.market_shards[shard_id] = MarketSocketShard(
             shard_id, dict(new_subscriptions), task, planned_stop
@@ -1012,18 +1013,33 @@ class LiveCollector:
             if any(deleted.values()):
                 LOGGER.info("PostgreSQL hot retention complete", extra={"deleted": deleted})
 
-    def _create_watched_task(self, coroutine: Any, *, name: str) -> asyncio.Task[None]:
+    def _create_watched_task(
+        self,
+        coroutine: Any,
+        *,
+        name: str,
+        expected_stop: asyncio.Event | None = None,
+    ) -> asyncio.Task[None]:
         task = asyncio.create_task(coroutine, name=name)
         LOGGER.info(
             "Live collector supervised task started",
             extra={"task_name": name},
         )
-        self._watch_task(task)
+        self._watch_task(task, expected_stop=expected_stop)
         return task
 
-    def _watch_task(self, task: asyncio.Task[None]) -> None:
+    def _watch_task(
+        self,
+        task: asyncio.Task[None],
+        *,
+        expected_stop: asyncio.Event | None = None,
+    ) -> None:
         def completed(done: asyncio.Task[None]) -> None:
-            expected = self.stop.is_set()
+            expected_shutdown = self.stop.is_set()
+            expected_replacement = (
+                expected_stop is not None and expected_stop.is_set()
+            )
+            expected = expected_shutdown or expected_replacement
             if done.cancelled():
                 LOGGER.info(
                     "Live collector supervised task exited",
@@ -1046,7 +1062,7 @@ class LiveCollector:
                     "process_memory": process_memory_snapshot(),
                 },
             )
-            if expected:
+            if expected_shutdown or (expected_replacement and error is None):
                 return
             if self._task_failure is not None and not self._task_failure.done():
                 self._task_failure.set_result((done.get_name(), error))

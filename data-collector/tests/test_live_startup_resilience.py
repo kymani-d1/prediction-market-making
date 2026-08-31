@@ -201,6 +201,31 @@ async def test_supervised_task_normal_return_is_reported_as_unexpected(
     assert "Live collector supervised task exited" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_planned_shard_stop_does_not_hide_task_failure() -> None:
+    collector = LiveCollector.__new__(LiveCollector)
+    collector.stop = asyncio.Event()
+    collector._task_failure = asyncio.get_running_loop().create_future()
+    planned_stop = asyncio.Event()
+    planned_stop.set()
+
+    async def fail() -> None:
+        raise ValueError("fatal shard invariant")
+
+    task = collector._create_watched_task(
+        fail(),
+        name="polymarket-market-ws-1",
+        expected_stop=planned_stop,
+    )
+    with pytest.raises(ValueError, match="fatal shard invariant"):
+        await task
+    await asyncio.sleep(0)
+
+    task_name, error = collector._task_failure.result()
+    assert task_name == "polymarket-market-ws-1"
+    assert isinstance(error, ValueError)
+
+
 def test_discovery_diagnostics_are_bounded_stage_aggregates() -> None:
     collector = LiveCollector.__new__(LiveCollector)
     collector._discovery_cycle = 3

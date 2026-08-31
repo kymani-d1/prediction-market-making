@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from prediction_collector.jobs.live import LiveCollector
 from prediction_collector.polymarket.rtds import (
     PolymarketRtdsWebSocket,
     RtdsApplicationSilenceError,
@@ -163,23 +164,30 @@ async def test_market_socket_planned_stop_survives_swallowed_cancellation(
     )
     stop = asyncio.Event()
     planned_stop = asyncio.Event()
-    task = asyncio.create_task(
+    collector = LiveCollector.__new__(LiveCollector)
+    collector.stop = stop
+    collector._task_failure = asyncio.get_running_loop().create_future()
+    task = collector._create_watched_task(
         market_socket.run(
             {"token": "market"},
             run_id=1,
             stop=stop,
             connection_label="shard-1",
             planned_stop=planned_stop,
-        )
+        ),
+        name="polymarket-market-ws-1",
+        expected_stop=planned_stop,
     )
     await asyncio.wait_for(receive_started.wait(), timeout=1)
 
     planned_stop.set()
     task.cancel()
     await asyncio.wait_for(task, timeout=1)
+    await asyncio.sleep(0)
 
     assert context_entries == 1
     assert database.close_reasons == ["planned_subscription_refresh"]
+    assert not collector._task_failure.done()
 
 
 @pytest.mark.asyncio
