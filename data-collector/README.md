@@ -221,7 +221,7 @@ python -m prediction_collector migrate   apply pending migrations
 python -m prediction_collector run       permanent live worker; migrates on startup
 python -m prediction_collector research-backfill --mode bootstrap    bounded bootstrap
 python -m prediction_collector research-backfill --mode incremental  immutable incremental batch
-python -m prediction_collector backfill  legacy exhaustive workflow; expensive
+python -m prediction_collector backfill  legacy exhaustive workflow; not recommended for routine research
 python -m prediction_collector status    strictly read-only health report
 python -m prediction_collector smoke     read-only public API shape check
 ```
@@ -236,7 +236,10 @@ The correct order after creating storage is:
 1. run `migrate`;
 2. start the permanent `run` worker immediately;
 3. verify live subscription and archive uploads;
-4. run a small `research-backfill` pilot in the backfill service.
+4. when historical initialization is needed, run an explicit bounded
+   `research-backfill --mode bootstrap` once;
+5. schedule `collector-backfill` with
+   `research-backfill --mode incremental` and restart policy `Never`.
 
 Do not reverse steps 2 and 4. Historical REST data is recoverable later;
 missed WebSocket microstructure generally is not.
@@ -427,8 +430,11 @@ Create two services from the same repository/Dockerfile:
 
 - `collector-live`: start command `python -m prediction_collector run`, restart
   on failure, one replica, health command `python -m prediction_collector status`.
-- `collector-backfill`: start command `python -m prediction_collector backfill`,
-  restart policy `Never`; deploy/run only after live is confirmed.
+- `collector-backfill`: scheduled start command
+  `python -m prediction_collector research-backfill --mode incremental`, restart
+  policy `Never`; enable it only after live is confirmed. Run bootstrap
+  separately and explicitly, with a bounded market limit, only when historical
+  initialization is needed.
 
 Use the conservative 10/50 defaults from `.env.example`; set `JSON_LOGS=true`
 and `LOG_LEVEL=INFO`. Start `collector-live` first. Do not let a one-shot
@@ -482,8 +488,8 @@ Do not wipe the current volume in place first. The safer reset is blue/green:
 
 1. Stop/disable the backfill worker. Keep the existing live worker stopped only
    for the shortest cutover window.
-2. Confirm the `pre-polymarket-only` tag exists and push it:
-   `git push origin pre-polymarket-only`.
+2. Confirm the historical `pre-polymarket-only` tag is available if it is part
+   of the rollback plan.
 3. Create and lock a manual backup of the old PostgreSQL volume. Export a
    `pg_dump -Fc` as an independent copy if any experimental data matters.
 4. Provision a new Railway PostgreSQL service named `PostgresV2`; do not delete
@@ -494,7 +500,7 @@ Do not wipe the current volume in place first. The safer reset is blue/green:
 6. Deploy `collector-live`. Startup applies migrations. Confirm migration
    version, live subscription, current books, manifest uploads, object count,
    queue depth, database size, and no open degradation events.
-7. Only then run `collector-backfill` once.
+7. Only then restore the scheduled `collector-backfill` service.
 8. Retain the old PostgreSQL service through a rollback window. Delete it only
    after the new live/archive path has been verified and the independent backup
    is restorable.

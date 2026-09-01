@@ -21,18 +21,15 @@ Polymarket REST + WebSockets
 The production system has two deliberately different jobs. `collector-live` is
 the permanent, high-value microstructure collector: it discovers all currently
 tradeable markets and assigns bounded `FULL_L2`, `SAMPLED`, or `METADATA_ONLY`
-tiers. `research-backfill` is a bounded historical dataset bootstrap: it
-persists a deterministic stratified cohort, then collects historical prices and
-trades only for that cohort. It is not an archival replica of Polymarket.
+tiers. `research-backfill` creates bounded historical datasets: an explicit
+bootstrap persists a deterministic stratified cohort, while scheduled
+incremental batches add newly eligible resolved markets without changing prior
+cohorts. It is not an archival replica of Polymarket.
 
 Start with [the collector runbook](data-collector/README.md). The critical
 operational rule is: protect the permanent live worker first; run bounded
 historical research separately afterward. REST history is partly recoverable;
 missed WebSocket L2 microstructure is not.
 
-Before the refactor, the repository state was preserved locally as the annotated
-Git tag `pre-polymarket-only`. Push it when you are ready:
-
-```powershell
-git push origin pre-polymarket-only
-```
+The pre-Polymarket-only repository state is preserved in the annotated Git tag
+`pre-polymarket-only`.
